@@ -1,4 +1,5 @@
 import {
+  EMPTY_USAGE,
   canTransitionRun,
   isRunTerminal,
   type AgentEvent,
@@ -14,7 +15,13 @@ import {
   type DispatchOptions,
   type DispatchResult,
 } from './dispatcher.js';
-import { planRun, synthesiseReport, type AssignmentReport } from './manager.js';
+import {
+  MANAGER_PLAN_ASSIGNMENT_ID,
+  MANAGER_SYNTHESIS_ASSIGNMENT_ID,
+  planRun,
+  synthesiseReport,
+  type AssignmentReport,
+} from './manager.js';
 
 /**
  * The end-to-end run (PLAN.md Phase 2).
@@ -56,6 +63,30 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
   const log = deps.logger ?? ((message: string) => console.log(message));
   const run = await deps.store.createRun(deps.task);
 
+  // Stamped before the first transition so every persisted state carries it,
+  // including a run that fails during planning. NFR-5 costing reads this.
+  run.provider = deps.provider.id;
+
+  /**
+   * The Manager's turns are not assignments, so nothing in the dispatcher
+   * records their token usage. Intercept it here — this is the only layer that
+   * sees both manager calls — so the run's true cost is persisted (NFR-5).
+   */
+  const onEvent = (event: AgentEvent): void => {
+    if (
+      event.t === 'usage' &&
+      (event.assignmentId === MANAGER_PLAN_ASSIGNMENT_ID ||
+        event.assignmentId === MANAGER_SYNTHESIS_ASSIGNMENT_ID)
+    ) {
+      const current = run.managerUsage ?? EMPTY_USAGE;
+      run.managerUsage = {
+        inputTokens: current.inputTokens + event.inputTokens,
+        outputTokens: current.outputTokens + event.outputTokens,
+      };
+    }
+    deps.onEvent?.(event);
+  };
+
   const setStatus = async (status: RunStatus): Promise<void> => {
     if (!canTransitionRun(run.status, status)) {
       throw new Error(`illegal run transition: ${run.status} -> ${status}`);
@@ -81,7 +112,7 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
       ...(deps.maxRepairAttempts === undefined
         ? {}
         : { maxRepairAttempts: deps.maxRepairAttempts }),
-      ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
+      onEvent,
       workspaceDir: await deps.store.workspaceDir(run.id),
     });
 
@@ -102,7 +133,7 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
       store: deps.store,
       signal,
       ...(deps.dispatch === undefined ? {} : { options: deps.dispatch }),
-      ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
+      onEvent,
       ...(deps.onStateChange === undefined ? {} : { onStateChange: deps.onStateChange }),
     });
 
@@ -144,7 +175,7 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
       reports,
       signal,
       task: run.task,
-      ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
+      onEvent,
       workspaceDir: await deps.store.workspaceDir(run.id),
     });
 

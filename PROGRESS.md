@@ -10,7 +10,7 @@ written, not executed) · **blocked** · **not started**.
 | 0 — Foundations (registry + contracts) | **done** | yes |
 | 1 — Provider layer + Claude Code adapter | not started — no longer blocked | — |
 | 2 — Orchestrator core (headless) | **done** | yes |
-| 3 — Web shell + live wiring | not started | — |
+| 3 — Web shell + live wiring | **done** | yes |
 | 4 — Pixel office sim | not started | — |
 | 5 — Designer step + PDF export | not started | — |
 | 6 — Domain breadth | not started | — |
@@ -312,3 +312,107 @@ New:
 Phase 1 is now unblocked and is the natural next step: capture a real
 `stream-json` fixture from the installed CLI, then build the parser against it.
 Phase 3 (web shell) is equally available and depends on nothing missing.
+
+---
+
+## Phase 3 — Web shell + live wiring
+
+**Status: done.** Every exit criterion was exercised in a real browser against
+the real orchestrator, not asserted from tests alone.
+
+### How it was built
+
+Two agents worked in parallel against a contract written first. `shared/wire.ts`
+pins the HTTP routes, both WebSocket message unions, the buffer limits and the
+cost helpers; it was read-only for both agents, and each was told to report
+contract friction rather than edit it. That constraint is what made the split
+safe — a silent contract edit from one side would have invalidated the other's
+work. Server and client were then integrated in one pass.
+
+### What was built
+
+**Server** (`packages/server/src/http/`) — `RunSupervisor` owns live runs:
+`startRun` returns as soon as the store allocates an id and leaves `executeRun`
+running detached, so `POST /api/runs` never blocks. Per-run `AbortController`,
+per-run ring buffers for events and log lines with a sticky truncation flag,
+subscriber fan-out, and in-memory state for live runs falling back to disk for
+finished ones. `buildServer` implements every route in the contract plus `/ws`,
+deriving Fastify's route patterns from the contract's URL builders rather than
+retyping them. Binds `127.0.0.1` with no override flag (NFR-6).
+
+**Client** (`packages/web/`) — Vite + React, deliberately plain. A `RunSocket`
+that validates every inbound frame, backs off on reconnect and re-subscribes on
+open; a hook that replaces state wholesale on `snapshot`/`state` and appends on
+`event`/`log`; task form, run list, assignment table, activity log, report
+viewer, cancel, cost counters.
+
+### Verified in the browser
+
+- Typed a task, watched statuses move `pending → briefing → working → done`.
+- **Refreshed mid-run**: the run was re-selected from `localStorage`, the
+  snapshot restored state *and* pre-refresh history, and the UI kept following
+  the run live to completion (NFR-2).
+- Cancelled mid-run: reached `cancelled` with the abort reason surfaced.
+- Read the synthesis and per-assignment reports in-app.
+
+### Two cost defects found by using it
+
+Unit tests missed both. Only running the thing exposed them.
+
+**1. Scripted runs reported money as spent.** Cost was derived by joining
+`agentName` → the agent's catalog `model:` → a price. But the catalog model says
+what an agent *would* cost through a real provider, not what the run spent, so a
+`scripted` run — which calls no model at all — priced itself off `sonnet` and
+displayed **$0.0052**. `RunState` recorded nothing about which provider ran.
+
+Fixed by persisting `RunState.provider`, stamped before the first transition so
+even a run that dies in planning carries it. The client had worked around this
+with a `localStorage` guess that only covered runs started in that same tab;
+that workaround is gone.
+
+**2. The run total excluded the Manager entirely.** `totalUsage` sums
+assignments, and the Manager's planning, repair and synthesis turns are not
+assignments — so nothing recorded them. A three-agent run displayed
+**1500 in / 750 out** when it had actually spent **4700 / 1750**. The Manager
+outspent the entire team, and it was invisible.
+
+Fixed with `RunState.managerUsage`, accumulated in `executeRun` — the only layer
+that sees both manager calls — plus a `runTotalUsage` helper. Deliberately kept
+separate from `totalUsage`, which scopes the dispatcher's token budget (FR-M8):
+changing that would have altered budget semantics as a side effect of a display
+fix. Four regression tests in `orchestrator/runner.test.ts`.
+
+### Decisions worth remembering
+
+- **`--step-delay` on `serve.ts`.** A scripted run finishes in under a second,
+  which makes live status and reattach impossible to observe or test by hand —
+  the run is over before a refresh lands. Slowing the fake provider is the only
+  way to exercise those paths without spending tokens, the same argument that
+  justifies the scripted provider itself. Both defects above were found through it.
+- **The client never merges deltas.** `snapshot` and `state` are whole
+  replacements. Reattach therefore needs no reconciliation logic in the browser.
+- **Buffered log lines are replayed as ordinary `log` messages after
+  `snapshot`**, because `snapshot` has no `logs` field. Functionally correct, but
+  the contract mandates `LOG_BUFFER_LIMIT` with no way to deliver it — a wart.
+
+### Known gaps carried forward
+
+- **The dispatch token budget still ignores manager usage.** A run can exceed its
+  real budget by the Manager's share. Deliberately not changed here; FR-M8 should
+  be revisited on its own terms.
+- `snapshot` has no `logs` field (above).
+- **SIGINT graceful shutdown is unverified.** Windows has no real signal delivery
+  to another process, so it could not be exercised end to end. The
+  `supervisor.shutdown()` logic beneath it *is* unit-tested.
+- Ring-buffer overflow is unit-tested but never hit by a real run: the limit is
+  2,000 events and a scripted run emits ~20.
+- The server does not serve the built client; `npm run web` is a separate Vite
+  process. Fine for development, wrong for a shipped local app.
+- The scripted provider's keyword routing sent "audit the payments service" to
+  the tax team. It is a demo stub, not a planner, and must not grow into one.
+
+### Next
+
+Phase 4 (pixel office) replaces the assignment table with the sim and changes
+nothing about the orchestrator. Phase 1 (real provider) remains unblocked and is
+what makes any of the cost display meaningful.

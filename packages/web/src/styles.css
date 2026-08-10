@@ -1,0 +1,339 @@
+/*
+ * Agent Office — Phase 3 styling.
+ *
+ * PLAN.md is explicit: Phase 3 is "deliberately ugly. Proves the data flow
+ * before any art exists." This is plain, readable CSS in one file — no
+ * design system, no component library. Phase 4 replaces this with the pixel
+ * office; nothing here should be precious.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  background: #f4f4f4;
+  color: #1a1a1a;
+}
+
+.app-shell {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  padding: 1rem;
+  border-right: 1px solid #ccc;
+  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  overflow-y: auto;
+}
+
+.main {
+  padding: 1rem 1.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+  min-width: 0;
+}
+
+h1 {
+  font-size: 1.1rem;
+  font-family: ui-monospace, monospace;
+  margin: 0;
+}
+
+h2 {
+  font-size: 1rem;
+  margin: 0 0 0.5rem;
+}
+
+.muted {
+  color: #777;
+}
+
+.form-error {
+  color: #b00020;
+  font-weight: 600;
+}
+
+/* --- Task form --- */
+
+.task-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.task-form textarea {
+  font-family: inherit;
+  font-size: 0.9rem;
+  padding: 0.4rem;
+  resize: vertical;
+}
+
+.task-form-row {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+
+.task-form-row select,
+.task-form-row input {
+  padding: 0.25rem;
+}
+
+.task-form-row input[type='number'] {
+  width: 5.5rem;
+}
+
+button {
+  cursor: pointer;
+  padding: 0.35rem 0.8rem;
+  border: 1px solid #888;
+  background: #fff;
+  border-radius: 3px;
+}
+
+button:hover:not(:disabled) {
+  background: #eee;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
+.cancel-button {
+  border-color: #b00020;
+  color: #b00020;
+}
+
+.link-button {
+  border: none;
+  background: none;
+  padding: 0;
+  text-decoration: underline;
+  color: #2255cc;
+}
+
+.link-button.selected {
+  font-weight: 700;
+}
+
+/* --- Run list --- */
+
+.run-list ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.run-list-item {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  width: 100%;
+  text-align: left;
+  padding: 0.4rem;
+  border: 1px solid #ddd;
+  background: #fff;
+  font-size: 0.85rem;
+}
+
+.run-list-item.selected {
+  border-color: #2255cc;
+  background: #eaf0ff;
+}
+
+.run-list-task {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.live-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #2fa84f;
+  flex-shrink: 0;
+}
+
+/* --- Run header --- */
+
+.run-header {
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid #ddd;
+}
+
+.run-header-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.run-task {
+  font-size: 0.9rem;
+  color: #333;
+}
+
+.run-cost {
+  font-family: ui-monospace, monospace;
+  font-size: 0.85rem;
+}
+
+/* --- Status badges: covers every RunStatus and AssignmentStatus in status.ts --- */
+
+.status-badge {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  color: #fff;
+  white-space: nowrap;
+}
+
+.status-queued,
+.status-pending {
+  background: #9aa0a6;
+}
+
+.status-planning,
+.status-briefing {
+  background: #8a5fd6;
+}
+
+.status-dispatching,
+.status-blocked {
+  background: #d68a00;
+}
+
+.status-running,
+.status-working {
+  background: #2255cc;
+}
+
+.status-synthesizing,
+.status-reporting {
+  background: #0f9d8c;
+}
+
+.status-designing {
+  background: #0f9d8c;
+}
+
+.status-report_ready {
+  background: #2fa84f;
+}
+
+.status-done {
+  background: #2fa84f;
+}
+
+.status-failed {
+  background: #b00020;
+}
+
+.status-cancelled,
+.status-skipped {
+  background: #555;
+}
+
+/* --- Assignment table --- */
+
+.assignment-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.assignment-table th,
+.assignment-table td {
+  border: 1px solid #ddd;
+  padding: 0.35rem 0.5rem;
+  text-align: left;
+}
+
+.assignment-table th {
+  background: #eee;
+}
+
+.assignment-table tr.row-failed {
+  background: #fdecec;
+}
+
+/* --- Log pane --- */
+
+.log-pane {
+  height: 260px;
+  overflow-y: auto;
+  background: #111;
+  color: #ddd;
+  font-family: ui-monospace, 'Consolas', monospace;
+  font-size: 0.8rem;
+  padding: 0.5rem;
+  border-radius: 3px;
+}
+
+.log-line {
+  display: flex;
+  gap: 0.5rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 0.05rem 0;
+}
+
+.log-ts {
+  color: #888;
+  flex-shrink: 0;
+}
+
+.log-line-log .log-text {
+  color: #7ec4ff;
+}
+
+.log-line-event .log-text {
+  color: #ddd;
+}
+
+/* --- Report viewer --- */
+
+.report-viewer {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.report-section-header {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.markdown {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #fff;
+  border: 1px solid #ddd;
+  padding: 0.75rem;
+  font-family: ui-monospace, 'Consolas', monospace;
+  font-size: 0.85rem;
+  max-height: 500px;
+  overflow-y: auto;
+}

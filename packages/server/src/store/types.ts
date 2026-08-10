@@ -14,6 +14,8 @@ export interface RunSummary {
   status: RunState['status'];
   createdAt: number;
   updatedAt: number;
+  /** Absent on runs persisted before `RunState.provider` existed. */
+  provider?: string;
 }
 
 export interface RunStore {

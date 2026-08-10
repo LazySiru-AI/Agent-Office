@@ -206,6 +206,7 @@ export class FileRunStore implements RunStore {
           status: run.status,
           createdAt: run.createdAt,
           updatedAt: run.updatedAt,
+          ...(run.provider === undefined ? {} : { provider: run.provider }),
         });
       } catch (error) {
         this.warn(`skipping run "${id}": ${describeError(error)}`, error);

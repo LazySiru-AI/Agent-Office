@@ -13,6 +13,9 @@
   "scripts": {
     "registry:dump": "npm run registry:dump --workspace @agent-office/server",
     "run": "npm run run --workspace @agent-office/server --",
+    "serve": "npm run serve --workspace @agent-office/server --",
+    "web": "npm run dev --workspace @agent-office/web",
+    "build:web": "npm run build --workspace @agent-office/web",
     "test": "vitest run",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },

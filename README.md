@@ -18,17 +18,18 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0 and 2 are done and verified.** 198 tests pass, typecheck is clean,
-the registry indexes 154 agents, and a task runs end to end on two domains with
-the no-cost scripted provider. See `PROGRESS.md` for what had to be repaired to
-get there.
+**Phases 0, 2 and 3 are done and verified.** 250 tests pass, typecheck is clean,
+the registry indexes 154 agents, and you can drive a run from the browser —
+watch it live, refresh mid-run without losing it, cancel it, and read the
+reports in-app. See `PROGRESS.md` for what had to be repaired to get there.
 
 | Phase | What | Status |
 |---|---|---|
 | 0 | Agent registry + shared contracts | done |
 | 1 | Provider layer + Claude Code adapter | not started |
 | 2 | Orchestrator core (headless) | done |
-| 3–7 | Web shell, pixel office, PDF export, domain breadth, more providers | not started |
+| 3 | Web shell + live wiring | done |
+| 4–7 | Pixel office, PDF export, domain breadth, more providers | not started |
 
 Nothing has called a real model yet — every run so far used the scripted
 provider. Phase 1 is what changes that.
@@ -63,6 +64,19 @@ Run a task end to end with the no-cost scripted provider:
 ```bash
 npm run run -- "Review our vendor NDA for unusual terms" --provider scripted
 ```
+
+Run the web app — the API server and the Vite client are two processes:
+
+```bash
+npm run serve
+```
+
+```bash
+npm run web
+```
+
+Then open the Vite URL. Add `--step-delay 2000` to `npm run serve` to slow the
+scripted provider down enough to watch statuses change and test refresh-mid-run.
 
 Run the tests:
 

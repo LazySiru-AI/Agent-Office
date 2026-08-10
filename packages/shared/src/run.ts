@@ -56,10 +56,36 @@ export const RunStateSchema = z.object({
   createdAt: z.number().int().nonnegative(),
   updatedAt: z.number().int().nonnegative(),
 
+  /**
+   * The provider that executed this run, e.g. `scripted` or `claude-code`.
+   *
+   * Recorded because cost (NFR-5) cannot be derived from the agents alone: an
+   * agent's catalog `model:` says what it *would* cost through a real provider,
+   * not what this run actually spent. Without this field a `scripted` run —
+   * which calls no model at all — prices itself off `sonnet` and reports money
+   * that was never spent.
+   *
+   * Optional so that `run.json` files written before this field existed still
+   * load; a run without it prices off the catalog model as before.
+   */
+  provider: z.string().min(1).optional(),
+
   /** Absent until planning succeeds. */
   plan: RunPlanSchema.optional(),
   /** Flattened across phases, in execution order. Empty before planning. */
   assignments: z.array(AssignmentStateSchema),
+
+  /**
+   * Tokens spent by the Manager's own turns — planning, repair retries and
+   * synthesis — which are not assignments and so appear nowhere in
+   * `assignments[].usage`.
+   *
+   * They are real spend, and on a small run they exceed the agents' combined
+   * usage, so a cost display built on `totalUsage` alone understates the run
+   * badly (NFR-5). Kept separate rather than folded into the assignment totals
+   * because the dispatcher's token budget (FR-M8) is scoped to dispatch.
+   */
+  managerUsage: UsageSchema.optional(),
 
   /** Run-relative path to the Manager's synthesis, once written. */
   reportPath: z.string().min(1).optional(),
@@ -71,7 +97,22 @@ export const RunStateSchema = z.object({
 
 export type RunState = z.infer<typeof RunStateSchema>;
 
-/** Sum of every assignment's usage. Drives the cost display (NFR-5). */
+/**
+ * Everything the run actually spent: assignments plus the Manager's own turns.
+ *
+ * This is the number to show a user (NFR-5). {@link totalUsage} deliberately
+ * excludes the Manager because the dispatcher's budget is about dispatch.
+ */
+export function runTotalUsage(run: RunState): Usage {
+  const assignments = totalUsage(run);
+  const manager = run.managerUsage ?? EMPTY_USAGE;
+  return {
+    inputTokens: assignments.inputTokens + manager.inputTokens,
+    outputTokens: assignments.outputTokens + manager.outputTokens,
+  };
+}
+
+/** Sum of every assignment's usage. Scopes the dispatch token budget (FR-M8). */
 export function totalUsage(run: RunState): Usage {
   return run.assignments.reduce<Usage>(
     (acc, assignment) => ({
