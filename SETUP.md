@@ -2,9 +2,11 @@
 
 Prerequisites and getting started. Read this before `PLAN.md`'s Phase 0.
 
-**Current status: both prerequisites are present, and Phases 0 and 2 have been
-run and verified on this machine.** The earlier revision of this file said Node
-was missing; that was wrong by the time it was checked again — see below.
+**Current status: Node and the Claude Code CLI are both present. The CLI is not
+signed in**, which is the one outstanding prerequisite and the only thing
+standing between Phase 1 and its exit criterion. Phases 0, 2 and 3 are verified
+on this machine. An earlier revision of this file said Node was missing; that
+was wrong by the time it was checked again — see below.
 
 ---
 
@@ -39,20 +41,61 @@ override such as `AGENT_OFFICE_CLAUDE_BIN` first, then fall back to `claude` on
 `PATH`, then to the newest versioned directory under `%APPDATA%\Claude\claude-code`.
 A provider that dies because the user updated Claude Code is not acceptable.
 
-Once resolved, the first Phase 1 task is *not* writing the parser. It is
-capturing a real session to a fixture file:
+## 3. Claude Code CLI — not authenticated (blocks the Phase 1 exit criterion)
 
-```bash
-claude -p "say hello" --output-format stream-json --verbose > fixtures/stream-json-sample.jsonl
+```
+claude auth status
+{ "loggedIn": false, "authMethod": "none", "apiProvider": "firstParty" }
 ```
 
-`--verbose` is included because print mode is believed to require it alongside
-`stream-json` — **still unverified**; nobody has run this yet. If it errors,
-drop it and check `claude -p --help` for the current spelling.
+The binary runs, but every model call fails. A `-p` invocation returns a
+fabricated assistant turn reading `Not logged in · Please run /login`, then a
+`result` frame with `is_error: true`, and exits **1**.
 
-Build the stream parser against that captured fixture. Do not build it against
-assumed flag names or an assumed event shape — flags and event schemas vary by
-installed version, and this remains the plan's largest single unknown.
+Fix it by signing in, in a normal interactive terminal:
+
+```bash
+claude auth login
+```
+
+That is deliberately not something this project does for you — it is an account
+credential flow, and it belongs to whoever owns the account. Until it is done,
+the `claude-code` provider reports itself unavailable with that reason, and the
+Phase 1 exit criterion cannot be closed. Everything else in Phase 1 is built and
+tested regardless; see `PROGRESS.md`.
+
+---
+
+## 4. Verified CLI surface (2.1.222)
+
+Checked against the installed binary, not assumed. Re-check after a CLI update.
+
+| Flag | Verified behaviour |
+|---|---|
+| `-p`, `--print` | Non-interactive. Required for everything below. |
+| `--output-format stream-json` | NDJSON frames on stdout. |
+| `--verbose` | **Mandatory** with `--print --output-format stream-json`. Without it the CLI exits 1: `--output-format=stream-json requires --verbose`, and emits no JSON at all. |
+| `--system-prompt-file <path>` | Accepted. **Not listed in `--help`** — confirmed by elimination, since an unknown flag errors with `unknown option`. |
+| `--append-system-prompt-file <path>` | Accepted, same caveat. |
+| stdin | With `--print` and no positional prompt, the prompt is read from stdin. With stdin closed and no prompt it exits cleanly with a usage error — it does **not** hang. |
+| `--allowedTools`, `--tools`, `--disallowedTools` | Variadic (`<tools...>`), so they greedily consume following argv entries. Comma-join into one token. |
+| `--permission-mode` | `acceptEdits`, `auto`, `bypassPermissions`, `manual`, `dontAsk`, `plan`. |
+| `--max-budget-usd` | Hard spend cap per invocation. Maps directly onto FR-M8. |
+| `--no-session-persistence` | Keeps headless runs out of the session store. |
+| exit code | 1 on failure. |
+
+Two traps worth naming, both of which cost real debugging time if hit later:
+
+- **`is_error`, not `subtype`, says whether a run succeeded.** A genuinely failed
+  run emits `{"is_error": true, ..., "subtype": "success"}` — both at once.
+- **Errors arrive dressed as assistant turns.** The CLI fabricates an assistant
+  message (`model: "<synthetic>"`) carrying the error text. An adapter that
+  trusts `type: "assistant"` will write the error into the agent's report as if
+  it were the agent's work.
+
+The captured bytes behind all of this are in
+`packages/server/src/providers/claude-code/fixtures/`, with provenance recorded
+per file in that directory's `README.md`.
 
 ---
 

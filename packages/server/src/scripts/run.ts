@@ -12,9 +12,9 @@ import { executeRun } from '../orchestrator/runner.js';
  *   npm run run -- "Review the auth module for security issues"
  *   npm run run -- "..." --provider scripted --concurrency 2
  *
- * Only the `scripted` provider exists today; the Claude Code adapter is Phase 1,
- * which is blocked on the CLI not being installed. Asking for it fails with an
- * explanation rather than a confusing stack trace.
+ * `scripted` costs nothing and is the default. `claude-code` calls the real CLI
+ * and spends real money; it reports itself unavailable, with the reason, if the
+ * CLI is missing or not signed in.
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -37,7 +37,7 @@ const USAGE = `
 Usage: npm run run -- "<task>" [options]
 
 Options:
-  --provider <id>      scripted (default). claude-code arrives in Phase 1.
+  --provider <id>      scripted (default, free) or claude-code (real spend).
   --concurrency <n>    Parallel assignments per phase (default 3).
   --timeout <ms>       Per-assignment timeout (default 600000).
   --budget <tokens>    Total run token budget. Unlimited when omitted.

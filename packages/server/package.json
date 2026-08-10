@@ -14,6 +14,7 @@
   "scripts": {
     "registry:dump": "tsx src/scripts/dump.ts",
     "run": "tsx src/scripts/run.ts",
+    "agent": "tsx src/scripts/agent.ts",
     "serve": "tsx src/scripts/serve.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"

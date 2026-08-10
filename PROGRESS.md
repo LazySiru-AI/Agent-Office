@@ -8,7 +8,7 @@ written, not executed) · **blocked** · **not started**.
 | Phase | Status | Committed |
 |---|---|---|
 | 0 — Foundations (registry + contracts) | **done** | yes |
-| 1 — Provider layer + Claude Code adapter | not started — no longer blocked | — |
+| 1 — Provider layer + Claude Code adapter | **built and verified against the real CLI, except the model call** — blocked on `claude auth login` | yes |
 | 2 — Orchestrator core (headless) | **done** | yes |
 | 3 — Web shell + live wiring | **done** | yes |
 | 4 — Pixel office sim | not started | — |
@@ -416,3 +416,141 @@ fix. Four regression tests in `orchestrator/runner.test.ts`.
 Phase 4 (pixel office) replaces the assignment table with the sim and changes
 nothing about the orchestrator. Phase 1 (real provider) remains unblocked and is
 what makes any of the cost display meaningful.
+
+---
+
+## Phase 1 — Provider layer + Claude Code adapter
+
+**Status: built, and verified against the real CLI up to the model call.** The
+exit criterion is *not* closed, for one reason: the installed CLI is not signed
+in. Everything either side of the model call has been exercised against the real
+binary; nothing has yet received a real model response.
+
+### The CLI was not what the plan assumed
+
+PLAN.md §3 insisted the flags and event shapes be captured rather than assumed,
+and that was the right instinct — the assumptions in the plan were wrong in ways
+that would each have cost a debugging session:
+
+- **`--verbose` is mandatory** with `--print --output-format stream-json`.
+  Without it the CLI exits 1 with a usage error and emits no JSON at all.
+- **`--system-prompt-file` and `--append-system-prompt-file` exist** but appear
+  nowhere in `--help`. They matter: they avoid Windows' ~32k command-line limit
+  and all the quoting that comes with passing a markdown document through argv.
+- **`--tools` and `--allowedTools` are variadic** (`<tools...>`), so they consume
+  following argv entries. Each must be given exactly one comma-joined token or
+  the flag eats whatever comes next.
+- **`--max-budget-usd` exists**, which gives FR-M8 something it never had: a
+  spend ceiling enforced *during* an assignment rather than checked after it.
+- The prompt can arrive on **stdin**, and with stdin closed and no prompt the CLI
+  exits cleanly instead of hanging.
+
+Two traps are worth naming because both are silent:
+
+- **`is_error`, not `subtype`, says whether a run succeeded.** A genuinely failed
+  run emits `{"is_error": true, "subtype": "success"}` — both, together.
+- **Errors arrive dressed as assistant turns.** The CLI fabricates an assistant
+  message (`model: "<synthetic>"`) carrying the error text. An adapter that
+  trusts `type: "assistant"` writes `Not logged in · Please run /login` into the
+  agent's report as though the agent had written it.
+
+### How it was built
+
+Same shape as Phase 3: the contract first, then parallel work against it.
+`protocol.ts` (raw frame schemas) and `fixtures/` were written first from a real
+capture and made read-only for three agents working simultaneously on the
+parser, binary resolution and tool mapping. All three reported zero contract
+friction; two independently caught an error in their own brief, which is the
+behaviour the read-only rule is meant to produce.
+
+### What was built
+
+- `protocol.ts` — frame schemas, every one `.passthrough()` with only the
+  discriminant required. A strict schema would turn each CLI release into an
+  outage.
+- `parse.ts` — line splitter and normaliser, separable so the adapter can drive
+  both. Chunk boundaries have no relationship to line boundaries, so the splitter
+  is the load-bearing piece; it is tested by feeding identical fixtures at 1-byte,
+  7-byte and whole-file chunk sizes and asserting the event sequences match.
+- `resolveBinary.ts` — versioned-install discovery with a numeric version compare
+  (a string sort puts `2.1.99` above `2.1.222`), plus a preflight distinguishing
+  *not installed* from *not signed in* with different, actionable messages.
+- `tools.ts` — catalog `tools:` → CLI flags.
+- `childProcess.ts` — spawn, and a tree kill that actually works on Windows.
+- `provider.ts` — the adapter.
+- `scripts/agent.ts` — the exit-criterion CLI.
+
+### Findings worth keeping
+
+**1. 114 of the 154 agents request `Bash`, which does not exist on Windows.** The
+real `system/init` capture lists `PowerShell` and no `Bash` at all. Left alone,
+three-quarters of the catalog would have been handed a shell tool the session
+does not have. `Bash` is remapped per platform and every remap is reported rather
+than silent.
+
+**2. `child.kill()` does not kill descendants on Windows.** The CLI shells out,
+and those grandchildren keep the pipes open — so a cancelled assignment hangs
+instead of ending, while the model call carries on billing. `taskkill /T` walks
+the tree; POSIX gets the same guarantee from a process group.
+
+**3. Omitting `--tools` means "all tools", not "no tools".** For an agent whose
+requested tools were all unmappable, the natural implementation — skip the flag
+when the list is empty — grants everything. It is now always passed, empty if
+need be, so the failure mode is a useless agent rather than an unsandboxed one.
+
+**4. One failure was reported twice.** Found by testing, not by reading: a fatal
+error arrives once as the fabricated assistant turn and again in the terminal
+`result` frame, restated verbatim. The parser sees one frame at a time and cannot
+tell the second from a new problem, so de-duplication lives in the adapter, keyed
+on the message — a genuinely *different* second failure still shows.
+
+### Verified against the real binary
+
+With only the preflight bypassed, the adapter drove the installed CLI end to end:
+real argv, real spawn, real chunked stdout, real stream-json. It produced exactly
+one fatal error carrying the CLI's own message, no leaked error text, no hang,
+and a clean stream end. That covers every part of the path except a successful
+model response.
+
+`npm run agent -- "..."` today prints:
+
+```
+provider unavailable: Claude Code CLI is installed (…\2.1.222\claude.exe)
+but not authenticated. Run "claude auth login" to sign in, then retry.
+```
+
+368 tests pass; typecheck is clean across all three workspaces.
+
+### Blocker
+
+**`claude auth login` has not been run.** Signing in is an account credential
+action and belongs to whoever owns the account, so it is not something this
+project does on the user's behalf. Until then the Phase 1 exit criterion — one
+agent streaming normalised events from a real model — cannot be closed.
+
+### Known gaps carried forward
+
+- **The successful-path fixture is derived, not captured.** `synthetic-success.jsonl`
+  reproduces content-block shapes confirmed from local session transcripts inside
+  an envelope the real capture proves, but frames unique to a *successful* run
+  have never been observed on this wire format. Capture a real one immediately
+  after signing in; the exit-criterion script prints unrecognised frames rather
+  than dropping them, so a mismatch surfaces at once.
+- **Per-agent model selection does not reach the adapter.** `AgentRunRequest`
+  carries no `model`, so the catalog's `model:` frontmatter — which the Phase 3
+  cost display already joins on — cannot be honoured. `--model` is provider-wide
+  today. Closing this means adding a field to the provider seam and passing it
+  through the dispatcher.
+- **The system prompt is appended, not replaced,** so the agent also receives
+  Claude Code's default prompt. A deviation from FR-M5's "nothing else", taken
+  because replacing it discards the runtime's own operating instructions while
+  keeping the tools. `--replace-prompt` switches it; which is better is an open
+  question that only a real run can answer.
+- **Cache tokens are summed into the input count.** Cache reads are cheaper than
+  fresh input and cache writes are dearer, so the total is an approximation.
+  Dropping them would be worse — a run reading 40k cached tokens would display
+  200 — but NFR-5's cost figure is not exact until pricing is per-counter.
+- The `permission_denials` array in the result frame is parsed but not surfaced
+  as events, so a denied tool is currently invisible to the UI.
+- Nothing has measured what a real run costs, so FR-M8's budget defaults remain
+  guesses.

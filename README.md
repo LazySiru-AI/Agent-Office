@@ -18,7 +18,7 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2 and 3 are done and verified.** 250 tests pass, typecheck is clean,
+**Phases 0, 2 and 3 are done and verified.** 368 tests pass, typecheck is clean,
 the registry indexes 154 agents, and you can drive a run from the browser —
 watch it live, refresh mid-run without losing it, cancel it, and read the
 reports in-app. See `PROGRESS.md` for what had to be repaired to get there.
@@ -26,13 +26,22 @@ reports in-app. See `PROGRESS.md` for what had to be repaired to get there.
 | Phase | What | Status |
 |---|---|---|
 | 0 | Agent registry + shared contracts | done |
-| 1 | Provider layer + Claude Code adapter | not started |
+| 1 | Provider layer + Claude Code adapter | built; needs `claude auth login` |
 | 2 | Orchestrator core (headless) | done |
 | 3 | Web shell + live wiring | done |
 | 4–7 | Pixel office, PDF export, domain breadth, more providers | not started |
 
-Nothing has called a real model yet — every run so far used the scripted
-provider. Phase 1 is what changes that.
+**Nothing has called a real model yet.** The Claude Code adapter is written and
+has been driven against the real CLI — real spawn, real argv, real stream-json —
+but the installed CLI is not signed in, so no model has answered. One command
+closes that gap:
+
+```bash
+claude auth login
+```
+
+Then `npm run agent -- "<task>"` runs a single agent for real. That is the first
+thing in this project that spends money.
 
 ## Layout
 
@@ -63,6 +72,13 @@ Run a task end to end with the no-cost scripted provider:
 
 ```bash
 npm run run -- "Review our vendor NDA for unusual terms" --provider scripted
+```
+
+Run a single agent through the real Claude Code CLI (needs `claude auth login`,
+and spends real money):
+
+```bash
+npm run agent -- "Review the registry parser for edge cases" --max-cost 0.25
 ```
 
 Run the web app — the API server and the Vite client are two processes:

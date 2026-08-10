@@ -2,6 +2,7 @@ import {
   MANAGER_PLAN_ASSIGNMENT_ID,
   MANAGER_SYNTHESIS_ASSIGNMENT_ID,
 } from '../orchestrator/manager.js';
+import { ClaudeCodeProvider } from './claude-code/provider.js';
 import { ScriptedProvider } from './scripted.js';
 import type { AgentProvider } from './types.js';
 
@@ -139,7 +140,7 @@ export function scriptedPlanJson(task: string, known: ReadonlySet<string>): stri
  * The HTTP layer quotes this list when it rejects a request, so a user who asks
  * for `anthropic` is told what is available instead of what is conceivable.
  */
-export const AVAILABLE_PROVIDER_IDS = ['scripted'] as const;
+export const AVAILABLE_PROVIDER_IDS = ['scripted', 'claude-code'] as const;
 
 /**
  * Build the provider for one run.
@@ -161,6 +162,25 @@ export interface MakeProviderOptions {
    * scripted provider itself. Ignored by real providers.
    */
   stepDelayMs?: number;
+
+  /**
+   * Per-assignment spend ceiling handed to the Claude Code CLI's own
+   * `--max-budget-usd` (FR-M8). Ignored by the scripted provider, which spends
+   * nothing. Unset means no cap, which is the CLI's own default.
+   */
+  maxCostUsd?: number;
+
+  /**
+   * Passed to `--model`. Unset means the CLI's configured default.
+   *
+   * Provider-wide rather than per-agent: `AgentRunRequest` carries no model, so
+   * the catalog's per-agent `model:` frontmatter cannot reach the adapter yet.
+   * See the note in `claude-code/provider.ts`.
+   */
+  model?: string;
+
+  /** Surface for adapter-level diagnostics that are not agent events. */
+  onDiagnostic?: (message: string) => void;
 }
 
 export function makeProvider(
@@ -211,10 +231,17 @@ export function makeProvider(
   }
 
   if (id === 'claude-code') {
-    throw new UnknownProviderError(
-      'the claude-code provider is not implemented yet (Phase 1).\n' +
-        'It is blocked on the Claude Code CLI not being installed — see SETUP.md.',
-    );
+    // Availability is deliberately not checked here. Construction must stay
+    // synchronous and cheap — the HTTP layer builds a provider inside a request
+    // handler — and the preflight is an async probe that spawns the CLI. The
+    // orchestrator calls `isAvailable()` before dispatching, which is where an
+    // unauthenticated CLI surfaces as a clear reason rather than a mid-run
+    // failure (NFR-8).
+    return new ClaudeCodeProvider({
+      ...(options.model === undefined ? {} : { model: options.model }),
+      ...(options.maxCostUsd === undefined ? {} : { maxCostUsd: options.maxCostUsd }),
+      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+    });
   }
 
   throw new UnknownProviderError(
