@@ -337,3 +337,164 @@ button:disabled {
   max-height: 500px;
   overflow-y: auto;
 }
+
+/* --- Phase 4: office sim --- */
+
+/* The canvas host. The renderer sizes its canvas from this element's client
+   box, so this MUST establish a bounded height — a host with only `min-height`
+   and no upper bound lets the canvas grow to the document's height, which is
+   how it first rendered at 118x8918. */
+.office-canvas {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: #2b2b33;
+  border: 1px solid #ddd;
+  overflow: hidden;
+  width: 100%;
+  /* Sized against the integer-scale rule, not picked by eye. The renderer uses
+     the largest whole-number scale that fits, so the host height decides how
+     big the pixel art is allowed to be: a three-agent office is 15 tiles
+     (240px) tall, and at 420px only 1x fits — visibly tiny in a wide pane.
+     520px clears 2x for the common one- and two-row layouts. A three-row team
+     (19 tiles, 608px at 2x) falls back to 1x rather than being cropped, which
+     is the right way round. */
+  height: 520px;
+}
+
+.office-canvas canvas {
+  display: block;
+  /* Upscaled pixel art must not be smoothed by the browser on top of whatever
+     the renderer already did, or the sprites blur at non-integer sizes. */
+  image-rendering: pixelated;
+}
+
+.office-empty {
+  color: #bbb;
+  font-size: 0.85rem;
+  padding: 2rem;
+  text-align: center;
+}
+
+.view-toggle {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.view-toggle button[aria-pressed='true'] {
+  background: #333;
+  color: #fff;
+}
+
+/* --- Inspect panel (FR-S5) --- */
+
+.inspect-panel {
+  border: 1px solid #ccc;
+  background: #fafafa;
+  padding: 0.75rem 0.9rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.inspect-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.inspect-head h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.inspect-category {
+  margin: 0;
+  font-size: 0.75rem;
+  color: #777;
+}
+
+.inspect-description {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #444;
+}
+
+.inspect-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.25rem;
+  margin: 0;
+}
+
+.inspect-stats dt {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #777;
+}
+
+.inspect-stats dd {
+  margin: 0;
+  font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.inspect-objective h4,
+.inspect-activity h4 {
+  margin: 0 0 0.3rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #777;
+}
+
+.inspect-objective p {
+  margin: 0;
+  font-size: 0.85rem;
+}
+
+.inspect-activity ul {
+  margin: 0;
+  padding-left: 1rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, 'Consolas', monospace;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.error-fatal { color: #a3271c; }
+.error-warn { color: #8a6d1f; }
+
+/* --- Replay controls (NFR-7) --- */
+
+.replay-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid #ddd;
+  background: #f5f5f5;
+  font-size: 0.85rem;
+}
+
+.replay-controls input[type='range'] {
+  flex: 1;
+  min-width: 140px;
+}
+
+.replay-elapsed {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, 'Consolas', monospace;
+  font-size: 0.8rem;
+}
+
+.replay-partial {
+  color: #8a6d1f;
+  font-size: 0.75rem;
+}

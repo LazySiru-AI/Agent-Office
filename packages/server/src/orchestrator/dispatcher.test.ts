@@ -123,6 +123,35 @@ describe('dispatchRun — happy path', () => {
     expect(reports.get('reports/03-gamma.md')).toBe('Findings.');
   });
 
+  it('persists status transitions, not just broadcasts them (NFR-7)', async () => {
+    // Provider events were always written to the log; status transitions were
+    // broadcast to live subscribers only. Replay reads the log and nothing
+    // else, so without this the office replays with every character stuck in
+    // `pending` — a renderer bug that is not in the renderer.
+    const { store, provider, run } = await setup({
+      fallback: { text: 'ok', usage: { inputTokens: 1, outputTokens: 1 } },
+    });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const logged = await store.readEvents(run.id, 'a');
+    const statuses = logged
+      .map((entry) => entry.event)
+      .filter((event) => event.t === 'status')
+      .map((event) => (event.t === 'status' ? event.status : ''));
+
+    expect(statuses).toContain('working');
+    expect(statuses).toContain('done');
+    // The order on disk is what replay folds, so it has to be the real order.
+    expect(statuses.indexOf('working')).toBeLessThan(statuses.indexOf('done'));
+  });
+
   it('accumulates usage per assignment', async () => {
     const { store, provider, run } = await setup({
       fallback: { text: 'ok', usage: { inputTokens: 7, outputTokens: 3 } },

@@ -324,7 +324,19 @@ async function setStatus(
 
   Object.assign(assignment, patch, { status });
   await persist(ctx);
-  ctx.onEvent?.({ t: 'status', assignmentId, status });
+
+  // Persisted as well as broadcast (NFR-7).
+  //
+  // Provider events go to both the store and the live stream, but status
+  // transitions used to be broadcast only — so a live viewer saw characters
+  // move while the on-disk log, which is the *only* source replay has, held
+  // nothing but `text` and `usage`. Replaying a real run therefore rebuilt an
+  // office where every assignment sat in `pending` for ever, which looks like a
+  // renderer bug and is not one. Status is the single most important thing the
+  // sim reads; it has to survive the run that produced it.
+  const event: AgentEvent = { t: 'status', assignmentId, status };
+  await ctx.store.appendEvent(ctx.run.id, assignmentId, event);
+  ctx.onEvent?.(event);
 }
 
 /** Update fields without a status transition. */

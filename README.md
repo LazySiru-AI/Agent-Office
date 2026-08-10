@@ -18,10 +18,12 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2 and 3 are done and verified.** 368 tests pass, typecheck is clean,
-the registry indexes 154 agents, and you can drive a run from the browser —
-watch it live, refresh mid-run without losing it, cancel it, and read the
-reports in-app. See `PROGRESS.md` for what had to be repaired to get there.
+**Phases 0, 2, 3 and 4 are done and verified.** 467 tests pass, typecheck is
+clean, the registry indexes 154 agents, and you can drive a run from the browser
+— watch the team work in a pixel office, click a character to inspect it,
+refresh mid-run without losing it, cancel it, read the reports in-app, and
+replay a finished run offline. See `PROGRESS.md` for what had to be repaired to
+get there.
 
 | Phase | What | Status |
 |---|---|---|
@@ -29,7 +31,8 @@ reports in-app. See `PROGRESS.md` for what had to be repaired to get there.
 | 1 | Provider layer + Claude Code adapter | built; needs `claude auth login` |
 | 2 | Orchestrator core (headless) | done |
 | 3 | Web shell + live wiring | done |
-| 4–7 | Pixel office, PDF export, domain breadth, more providers | not started |
+| 4 | Pixel office sim | done |
+| 5–7 | PDF export, domain breadth, more providers | not started |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
 has been driven against the real CLI — real spawn, real argv, real stream-json —
@@ -93,6 +96,10 @@ npm run web
 
 Then open the Vite URL. Add `--step-delay 2000` to `npm run serve` to slow the
 scripted provider down enough to watch statuses change and test refresh-mid-run.
+
+The office is the default view. Click a character to inspect that agent; the
+`Table` toggle brings back the plain assignment table, and `Replay` re-runs a
+finished run from its saved event log — no provider, no tokens, no cost.
 
 Run the tests:
 

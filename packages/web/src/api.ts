@@ -1,14 +1,17 @@
+import { z } from 'zod';
 import {
   API,
   AgentListResponseSchema,
   CreateRunRequestSchema,
   CreateRunResponseSchema,
   ReportResponseSchema,
+  RunEventsResponseSchema,
   RunListResponseSchema,
   RunStateSchema,
   type AgentSummary,
   type CreateRunRequest,
   type ReportResponse,
+  type RunEventsResponse,
   type RunState,
   type RunSummary,
 } from '@agent-office/shared';
@@ -96,4 +99,16 @@ export async function cancelRun(runId: string): Promise<void> {
   if (!res.ok) {
     throw new Error(`cancel run failed (${res.status}): ${await readErrorMessage(res)}`);
   }
+}
+
+/**
+ * `GET /api/runs/:id/events` — the full event log, for replay (NFR-7).
+ *
+ * Uses the canonical schema from `wire.ts`. This briefly carried a hand-kept
+ * local copy, because the shared barrel did not re-export it — a second
+ * definition of a wire shape is precisely the drift `wire.ts` exists to
+ * prevent, so the barrel was fixed rather than the mirror maintained.
+ */
+export function fetchRunEvents(runId: string): Promise<RunEventsResponse> {
+  return getJson(API.runEvents(runId), RunEventsResponseSchema);
 }

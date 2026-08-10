@@ -11,7 +11,7 @@ written, not executed) · **blocked** · **not started**.
 | 1 — Provider layer + Claude Code adapter | **built and verified against the real CLI, except the model call** — blocked on `claude auth login` | yes |
 | 2 — Orchestrator core (headless) | **done** | yes |
 | 3 — Web shell + live wiring | **done** | yes |
-| 4 — Pixel office sim | not started | — |
+| 4 — Pixel office sim | **done** | yes |
 | 5 — Designer step + PDF export | not started | — |
 | 6 — Domain breadth | not started | — |
 | 7 — Provider expansion + polish | not started | — |
@@ -554,3 +554,118 @@ agent streaming normalised events from a real model — cannot be closed.
   as events, so a denied tool is currently invisible to the UI.
 - Nothing has measured what a real run costs, so FR-M8's budget defaults remain
   guesses.
+
+---
+
+## Phase 4 — Pixel office sim
+
+**Status: done.** Both exit criteria were exercised in a real browser against the
+real orchestrator: a run is watchable as an office scene, and a saved run
+replays offline with no provider involved.
+
+### How it was built
+
+Contract first, then four agents in parallel — the same discipline as Phases 3
+and 1, but with two contracts rather than one, because Phase 4 had two places
+where parallel work would otherwise have deadlocked.
+
+`sim/model.ts` is the spine: desk layout with reflow, deterministic
+agent→appearance, and behaviour read straight from `ASSIGNMENT_BEHAVIOUR`. It
+imports nothing from Pixi, React or the DOM, so the entire sim is testable
+without a canvas — 18 tests before a single pixel existed. `sim/spriteContract.ts`
+is the second contract, pinning the seam between sprite *generation* and sprite
+*rendering* so those two could be built at the same time instead of in sequence.
+
+Four agents then worked on the events endpoint, the procedural sprites, the Pixi
+renderer and replay. All four reported zero friction against the contracts.
+
+### The defect that mattered
+
+**Status transitions were never written to disk.** Checking what the event logs
+actually contained, across every run in `runs/`, returned
+`{ usage: 38, text: 38 }` — and not one `status` event. The dispatcher emits
+them, but through a different path than provider events: provider events called
+both `appendEvent` (persist) and `onEvent` (broadcast), while `setStatus` called
+`onEvent` alone.
+
+Live viewers therefore saw characters move, while the on-disk log — replay's
+only source — recorded nothing about status. Replay would have shipped rendering
+every character frozen in `pending`, looking exactly like a renderer bug and
+being nothing of the kind.
+
+This is a change to the orchestrator, which the phase brief said not to touch. It
+is a persistence bug that made a required feature impossible, not a behaviour
+change: nothing about dispatch, ordering or run outcomes moved. Fixed in
+`dispatcher.ts`, with a regression test asserting both that transitions reach
+disk and that `working` precedes `done`, since the on-disk order is what the fold
+consumes. A fresh run now persists 12 transitions where it persisted none.
+
+### Other findings
+
+- **Pixi v8 `Application` is a bare shell until `await app.init()` resolves** —
+  `app.ticker` does not exist before then. React StrictMode makes tearing down a
+  half-initialised app the *common* path, not an edge case, since it mounts and
+  unmounts synchronously in development. The first browser load crashed on
+  exactly this. The in-flight init was already guarded; `destroy()` simply
+  reached past the guard.
+- **The canvas host must have a bounded height.** The renderer sizes its canvas
+  from the host's client box, and a host with no upper bound produced a
+  118×8918 canvas on first render.
+- **Host height decides sprite size**, because scaling is integer-only. A
+  three-agent office is 240px tall, so a 420px host allowed only 1× — visibly
+  tiny in a wide pane. 520px clears 2× for one- and two-row teams; a three-row
+  team falls back to 1× rather than being cropped.
+- **The shared barrel did not re-export `RunEventsResponseSchema`**, so the
+  client briefly carried a hand-kept copy of a wire shape — the exact drift
+  `wire.ts` exists to prevent. The barrel was fixed and the copy deleted.
+- **The sprite contract did not name the concrete export.** A mismatched export
+  name typechecks fine on both sides in isolation and only fails where they
+  meet; the convention is now stated in the contract.
+
+### Verified in the browser
+
+- The office renders: tiled floor, Manager's desk, one desk per agent, distinct
+  characters with nameplates.
+- **Click-to-inspect (FR-S5)** — clicking a character hit-tests to the right
+  assignment and opens its panel with category, description, status, tokens and
+  cost. A scripted run still reads **$0.00**, so the Phase 3 cost fix holds
+  through the new path.
+- **Replay (NFR-7)** — playing a saved run reconstructs
+  `briefing → working → done` for the lead, and only then both reviewers moving
+  in parallel. That is the real run's dependency shape, rebuilt from the log
+  alone.
+- **Seeking backwards is exact**: returning to 0 reproduces the same state as
+  arriving there the first time, because every position re-folds from scratch.
+- Token totals accumulate mid-replay (3200 → 3700 → 4700).
+- Toggling views four times leaves zero errors and exactly one canvas — no
+  teardown crash, no leaked renderer.
+
+467 tests pass; typecheck is clean; the client builds.
+
+### Deliberate deviations
+
+- **Sprites are generated, not sourced.** PLAN.md §2.3 assumed a CC0 pack. The
+  reasoning for generating instead — and its cost — is recorded in `ASSETS.md`.
+  FR-S9's manifest abstraction is real, so a pack can still be dropped in by
+  implementing one interface.
+- **The table stays, behind a toggle.** The plan says replace it. It remains the
+  only view showing every assignment's numbers at once, and it is what made
+  Phase 3's cost defects visible; deleting a working diagnostic to honour the
+  letter of a plan is a bad trade.
+
+### Known gaps carried forward
+
+- **Manager usage does not replay incrementally.** It is a run-level field with
+  no event representation, so it is carried from the base run and a replay at
+  0% already shows the Manager's full spend. Making this exact means the event
+  log carrying manager usage.
+- **`reportPath` and `error` are approximated during replay.** The dispatcher
+  patches them onto persisted state, but the emitted `status` event carries no
+  patch, so the fold infers them.
+- **The bundle grew from 64.5 kB to 159.7 kB gzipped**, almost entirely Pixi.
+  Fine for a local app; worth code-splitting if it is ever served remotely.
+- Walking is a straight-line interpolation, not pathfinding — characters pass
+  through desks rather than around them (FR-S6 is satisfied, elegantly it is not).
+- Hover nameplates show the name only; category and description are in the
+  inspect panel rather than a hover tooltip (FR-S4 partially).
+- `permission_denials` from Phase 1 is still not surfaced as events.

@@ -16,6 +16,7 @@ import { UnknownProviderError } from '../providers/factory.js';
 import { ProviderUnavailableError } from '../providers/types.js';
 import { UnsafePathError, type RunStore } from '../store/types.js';
 import { assertValidRunId } from '../store/util.js';
+import { collectRunEvents } from './runEvents.js';
 import type { RunSupervisor } from './supervisor.js';
 
 /**
@@ -72,6 +73,7 @@ const ROUTES = {
   cancelRun: toPattern(API.cancelRun(RUN_ID_PLACEHOLDER)),
   runReport: toPattern(API.runReport(RUN_ID_PLACEHOLDER)),
   assignmentReport: toPattern(API.assignmentReport(RUN_ID_PLACEHOLDER, 'x')),
+  runEvents: toPattern(API.runEvents(RUN_ID_PLACEHOLDER)),
   socket: API.socket(),
 } as const;
 
@@ -229,6 +231,18 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // the path against the run directory and rejects anything that escapes it,
     // which is the check that actually matters here (NFR-1).
     return readReport(deps, runId, query.data.path);
+  });
+
+  // --- Event history (NFR-7 replay) ----------------------------------------
+  app.get(ROUTES.runEvents, async (request) => {
+    const runId = parseRunId(request.params);
+    // Established purely to get the 404 right: a run id that is well-formed
+    // but was never created must not be reported as "zero events", which is
+    // indistinguishable from a run that simply has not produced any yet.
+    await loadRun(deps, runId);
+
+    const { events, partial } = await collectRunEvents(deps.store, runId);
+    return { runId, events, partial };
   });
 
   // --- WebSocket (NFR-2, NFR-3) -------------------------------------------

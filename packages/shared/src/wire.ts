@@ -42,6 +42,15 @@ export const API = {
    */
   assignmentReport: (runId: string, reportPath: string) =>
     `/api/runs/${encodeURIComponent(runId)}/report-file?path=${encodeURIComponent(reportPath)}`,
+  /**
+   * The run's full event history, read from `runs/<id>/logs/*.jsonl` (NFR-7).
+   *
+   * Distinct from the WebSocket `snapshot`, which serves a *live* reattach from
+   * a bounded ring buffer and therefore truncates. Replay needs the whole run,
+   * including runs that finished before this server process started, so it has
+   * to come off disk rather than out of memory.
+   */
+  runEvents: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/events`,
   /** WebSocket endpoint (NFR-3: push, never polling). */
   socket: () => '/ws',
 } as const;
@@ -112,6 +121,31 @@ export const ReportResponseSchema = z.object({
 });
 
 export type ReportResponse = z.infer<typeof ReportResponseSchema>;
+
+/**
+ * `GET /api/runs/:id/events` — the whole run, for replay (NFR-7).
+ *
+ * Ordered by `ts` across every assignment, because the per-assignment `.jsonl`
+ * files are written concurrently and interleaving them is the only way to
+ * reconstruct what the office actually looked like moment to moment.
+ *
+ * The replay's value is that it costs nothing: iterating the office sim against
+ * a real run must not mean re-running the agents. That is the requirement, not
+ * a convenience — PLAN.md §4 lists "sim iteration burns tokens" as a risk whose
+ * mitigation is this endpoint existing.
+ */
+export const RunEventsResponseSchema = z.object({
+  runId: z.string().min(1),
+  events: z.array(LoggedAgentEventSchema),
+  /**
+   * True when at least one log file could not be read. The replay is still
+   * usable — it is simply missing an agent — and saying so beats presenting a
+   * hole as the truth.
+   */
+  partial: z.boolean().default(false),
+});
+
+export type RunEventsResponse = z.infer<typeof RunEventsResponseSchema>;
 
 /** Every error response body, so the client has exactly one shape to handle. */
 export const ApiErrorSchema = z.object({
