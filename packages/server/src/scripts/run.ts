@@ -1,0 +1,224 @@
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import type { AgentEvent } from '@agent-office/shared';
+import { loadRegistry } from '../registry/index.js';
+import { ScriptedProvider } from '../providers/scripted.js';
+import type { AgentProvider } from '../providers/types.js';
+import { FileRunStore, defaultRunsRoot } from '../store/fileStore.js';
+import { executeRun } from '../orchestrator/runner.js';
+
+/**
+ * Phase 2 exit-criterion CLI: run one task end to end.
+ *
+ *   npm run run -- "Review the auth module for security issues"
+ *   npm run run -- "..." --provider scripted --concurrency 2
+ *
+ * Only the `scripted` provider exists today; the Claude Code adapter is Phase 1,
+ * which is blocked on the CLI not being installed. Asking for it fails with an
+ * explanation rather than a confusing stack trace.
+ */
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+/** `src/scripts` -> src -> server -> packages -> project root, which holds `categories/`. */
+const DEFAULT_REPO_ROOT = path.resolve(HERE, '..', '..', '..', '..');
+
+interface CliOptions {
+  task: string;
+  provider: string;
+  repoRoot: string;
+  runsRoot: string;
+  concurrency?: number;
+  timeoutMs?: number;
+  tokenBudget?: number;
+  quiet: boolean;
+}
+
+const USAGE = `
+Usage: npm run run -- "<task>" [options]
+
+Options:
+  --provider <id>      scripted (default). claude-code arrives in Phase 1.
+  --concurrency <n>    Parallel assignments per phase (default 3).
+  --timeout <ms>       Per-assignment timeout (default 600000).
+  --budget <tokens>    Total run token budget. Unlimited when omitted.
+  --repo-root <path>   Subagent catalog root (default: this repository).
+  --runs-root <path>   Where run artifacts are written.
+  --quiet              Only print the final summary.
+  -h, --help           Show this message.
+`.trim();
+
+function parseArgs(argv: string[]): CliOptions {
+  const positional: string[] = [];
+  const flags = new Map<string, string>();
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === undefined) continue;
+
+    if (arg === '-h' || arg === '--help') {
+      process.stdout.write(`${USAGE}\n`);
+      process.exit(0);
+    }
+    if (arg === '--quiet') {
+      flags.set('quiet', 'true');
+      continue;
+    }
+    if (arg.startsWith('--')) {
+      const value = argv[i + 1];
+      if (value === undefined || value.startsWith('--')) {
+        throw new Error(`option ${arg} needs a value`);
+      }
+      flags.set(arg.slice(2), value);
+      i += 1;
+      continue;
+    }
+    positional.push(arg);
+  }
+
+  const task = positional.join(' ').trim();
+  if (task === '') {
+    throw new Error(`no task given.\n\n${USAGE}`);
+  }
+
+  const numeric = (key: string): number | undefined => {
+    const raw = flags.get(key);
+    if (raw === undefined) return undefined;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(`--${key} must be a positive number, got "${raw}"`);
+    }
+    return value;
+  };
+
+  const concurrency = numeric('concurrency');
+  const timeoutMs = numeric('timeout');
+  const tokenBudget = numeric('budget');
+
+  return {
+    task,
+    provider: flags.get('provider') ?? 'scripted',
+    repoRoot: path.resolve(flags.get('repo-root') ?? process.env['AGENT_OFFICE_REPO_ROOT'] ?? DEFAULT_REPO_ROOT),
+    runsRoot: path.resolve(flags.get('runs-root') ?? defaultRunsRoot()),
+    quiet: flags.get('quiet') === 'true',
+    ...(concurrency === undefined ? {} : { concurrency }),
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    ...(tokenBudget === undefined ? {} : { tokenBudget }),
+  };
+}
+
+function makeProvider(id: string): AgentProvider {
+  if (id === 'scripted') {
+    // Every agent returns a placeholder report. Enough to prove the pipeline
+    // end to end without a model, which is exactly what Phase 2 needs.
+    return new ScriptedProvider({
+      fallback: {
+        text: [
+          '## Findings',
+          '',
+          'Placeholder report from the scripted provider. No model was called.',
+          '',
+          'Replace `--provider scripted` with a real provider once Phase 1 lands.',
+        ].join('\n'),
+        usage: { inputTokens: 500, outputTokens: 250 },
+      },
+    });
+  }
+
+  if (id === 'claude-code') {
+    throw new Error(
+      'the claude-code provider is not implemented yet (Phase 1).\n' +
+        'It is blocked on the Claude Code CLI not being installed — see SETUP.md.',
+    );
+  }
+
+  throw new Error(`unknown provider "${id}". Known: scripted.`);
+}
+
+async function main(): Promise<void> {
+  const options = parseArgs(process.argv.slice(2));
+  const provider = makeProvider(options.provider);
+
+  const availability = await provider.isAvailable();
+  if (!availability.ok) {
+    throw new Error(`provider "${options.provider}" unavailable: ${availability.reason ?? 'unknown'}`);
+  }
+
+  const registry = await loadRegistry(options.repoRoot);
+  const store = new FileRunStore(options.runsRoot);
+
+  // Ctrl+C cancels the run rather than killing the process mid-write, so the
+  // persisted state stays consistent (FR-M9, NFR-2).
+  const controller = new AbortController();
+  let interrupted = false;
+  process.on('SIGINT', () => {
+    if (interrupted) process.exit(130);
+    interrupted = true;
+    process.stderr.write('\ncancelling run (Ctrl+C again to force quit)...\n');
+    controller.abort();
+  });
+
+  const log = (message: string): void => {
+    if (!options.quiet) process.stdout.write(`${message}\n`);
+  };
+
+  const onEvent = (event: AgentEvent): void => {
+    if (options.quiet) return;
+    if (event.t === 'status') {
+      log(`  ${event.assignmentId.padEnd(24)} ${event.status}`);
+    } else if (event.t === 'error') {
+      log(`  ${event.assignmentId.padEnd(24)} ${event.fatal ? 'ERROR' : 'warn'}: ${event.message}`);
+    }
+  };
+
+  log(`registry: ${registry.agents.length} agents from ${options.repoRoot}`);
+  log(`provider: ${options.provider}`);
+  log('');
+
+  const result = await executeRun({
+    registry,
+    provider,
+    store,
+    task: options.task,
+    signal: controller.signal,
+    onEvent,
+    logger: log,
+    dispatch: {
+      ...(options.concurrency === undefined ? {} : { maxConcurrency: options.concurrency }),
+      ...(options.timeoutMs === undefined ? {} : { assignmentTimeoutMs: options.timeoutMs }),
+      ...(options.tokenBudget === undefined ? {} : { runTokenBudget: options.tokenBudget }),
+    },
+  });
+
+  const { run } = result;
+  const runDir = store.runDir(run.id);
+
+  process.stdout.write('\n');
+  process.stdout.write(`${'='.repeat(60)}\n`);
+  process.stdout.write(`run ${run.id} — ${run.status}\n`);
+  process.stdout.write(`${'='.repeat(60)}\n`);
+
+  if (run.plan !== undefined) {
+    process.stdout.write(`  domain:      ${run.plan.domain}\n`);
+    process.stdout.write(`  team:        ${[...new Set(run.assignments.map((a) => a.agentName))].join(', ')}\n`);
+  }
+  if (result.dispatch !== undefined) {
+    const { completed, failed, skipped } = result.dispatch;
+    process.stdout.write(`  assignments: ${completed} done, ${failed} failed, ${skipped} skipped\n`);
+  }
+  if (run.error !== undefined) {
+    process.stdout.write(`  error:       ${run.error}\n`);
+  }
+  process.stdout.write(`  artifacts:   ${runDir}\n`);
+  if (run.reportPath !== undefined) {
+    process.stdout.write(`  report:      ${path.join(runDir, run.reportPath)}\n`);
+  }
+
+  if (run.status !== 'done') process.exitCode = 1;
+}
+
+main().catch((error: unknown) => {
+  const message = error instanceof Error ? error.message : String(error);
+  process.stderr.write(`\nrun failed.\n\n${message}\n`);
+  process.exitCode = 1;
+});

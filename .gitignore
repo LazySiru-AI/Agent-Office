@@ -1,0 +1,13 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Per-run artifacts: workspaces, logs, reports, generated PDFs.
+runs/
+
+# Secrets. NFR-4: keys never land in the repo or in run artifacts.
+.env
+.env.*
+!.env.example
+
+.DS_Store
