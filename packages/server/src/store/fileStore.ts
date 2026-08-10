@@ -48,6 +48,18 @@ export const RUN_SUBDIRS = ['workspace', 'logs', 'reports'] as const;
  */
 export type StoreWarning = (message: string, cause?: unknown) => void;
 
+/**
+ * Backoff between `rename` retries, in milliseconds. One entry per retry, so
+ * this also sets the retry count. Totals ~330ms — long enough to outlast a
+ * virus scanner opening a small JSON file, short enough that a genuinely stuck
+ * handle still surfaces as an error rather than a hang.
+ */
+const RENAME_RETRY_DELAYS_MS = [10, 20, 50, 100, 150] as const;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 /**
@@ -71,8 +83,8 @@ export class FileRunStore implements RunStore {
   private readonly warn: StoreWarning;
 
   /**
-   * Tail of the in-flight append chain for each log file, keyed by absolute
-   * path. See {@link enqueue}.
+   * Tail of the in-flight write chain for each file, keyed by absolute path.
+   * Covers log appends, `run.json` saves and reports. See {@link enqueue}.
    */
   private readonly appendChains = new Map<string, Promise<void>>();
 
@@ -127,13 +139,19 @@ export class FileRunStore implements RunStore {
     const validated = RunStateSchema.parse({ ...run, updatedAt: this.now() });
 
     const dir = this.runDir(id);
-    // Cheap, and it means a run directory removed underneath us fails at the
-    // write rather than silently losing every later transition.
-    await mkdir(dir, { recursive: true });
-    await this.writeFileAtomic(
-      path.join(dir, RUN_STATE_FILE),
-      `${JSON.stringify(validated, null, 2)}\n`,
-    );
+    const target = path.join(dir, RUN_STATE_FILE);
+    const body = `${JSON.stringify(validated, null, 2)}\n`;
+
+    // Serialised per path. Assignments in a parallel phase transition
+    // concurrently and each transition saves, so without this two renames race
+    // onto the same `run.json` — which on Windows is an outright EPERM, not
+    // merely a last-writer-wins.
+    return this.enqueue(target, async () => {
+      // Cheap, and it means a run directory removed underneath us fails at the
+      // write rather than silently losing every later transition.
+      await mkdir(dir, { recursive: true });
+      await this.writeFileAtomic(target, body);
+    });
   }
 
   /**
@@ -212,8 +230,12 @@ export class FileRunStore implements RunStore {
 
   async writeReport(runId: string, relativePath: string, content: string): Promise<void> {
     const target = resolveWithin(this.runDir(runId), relativePath);
-    await mkdir(path.dirname(target), { recursive: true });
-    await this.writeFileAtomic(target, content);
+    // Same serialisation as saveRun: two assignments given the same deliverable
+    // path by the Manager would otherwise race onto one file.
+    return this.enqueue(target, async () => {
+      await mkdir(path.dirname(target), { recursive: true });
+      await this.writeFileAtomic(target, content);
+    });
   }
 
   async readReport(runId: string, relativePath: string): Promise<string> {
@@ -353,6 +375,9 @@ export class FileRunStore implements RunStore {
    * temp file in the OS temp dir may well be on a different one. A reader
    * therefore sees either the old file or the complete new one, never a
    * half-written one (NFR-2).
+   *
+   * Callers reach this through {@link enqueue}, so writes to one path never
+   * overlap. The retry below is for handles this process does not own.
    */
   private async writeFileAtomic(target: string, contents: string): Promise<void> {
     const dir = path.dirname(target);
@@ -373,10 +398,39 @@ export class FileRunStore implements RunStore {
       } finally {
         await handle.close();
       }
-      await rename(tmp, target);
+      await this.renameWithRetry(tmp, target);
     } catch (error) {
       await rm(tmp, { force: true }).catch(() => undefined);
       throw new Error(`cannot write ${target}: ${describeError(error)}`, { cause: error });
+    }
+  }
+
+  /**
+   * `rename` over an existing file fails on Windows with `EPERM`/`EBUSY`/
+   * `EACCES` whenever anything else holds a handle to the target — antivirus
+   * mid-scan, a file watcher, an editor with `run.json` open. The handle is
+   * released within milliseconds, so a short backoff converts a hard run failure
+   * into a pause nobody notices.
+   *
+   * This is the app's highest-frequency filesystem operation (NFR-2 saves after
+   * every state transition), so leaving it un-retried means a long run is
+   * near-certain to hit it. POSIX does not need this, but the retry is harmless
+   * there — those codes do not arise for this operation.
+   */
+  private async renameWithRetry(tmp: string, target: string): Promise<void> {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await rename(tmp, target);
+        if (attempt > 0) {
+          this.warn(`rename onto ${target} succeeded after ${attempt} retr${attempt === 1 ? 'y' : 'ies'}`);
+        }
+        return;
+      } catch (error) {
+        const code = errorCode(error);
+        const contended = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
+        if (!contended || attempt >= RENAME_RETRY_DELAYS_MS.length) throw error;
+        await delay(RENAME_RETRY_DELAYS_MS[attempt] ?? 0);
+      }
     }
   }
 

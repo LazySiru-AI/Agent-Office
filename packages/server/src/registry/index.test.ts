@@ -16,9 +16,12 @@ import {
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * `src/registry` -> src -> server -> packages -> agent-office -> output -> repo root.
+ * `src/registry` -> src -> server -> packages -> repo root.
+ *
+ * Must stay in step with `scripts/dump.ts`, which derives the same root from
+ * `src/scripts` at the identical depth.
  */
-const REPO_ROOT = path.resolve(HERE, '..', '..', '..', '..', '..', '..');
+const REPO_ROOT = path.resolve(HERE, '..', '..', '..', '..');
 
 /**
  * Every category directory the repo currently ships. Taken from the shared

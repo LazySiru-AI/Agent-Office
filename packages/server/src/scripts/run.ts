@@ -6,6 +6,10 @@ import { ScriptedProvider } from '../providers/scripted.js';
 import type { AgentProvider } from '../providers/types.js';
 import { FileRunStore, defaultRunsRoot } from '../store/fileStore.js';
 import { executeRun } from '../orchestrator/runner.js';
+import {
+  MANAGER_PLAN_ASSIGNMENT_ID,
+  MANAGER_SYNTHESIS_ASSIGNMENT_ID,
+} from '../orchestrator/manager.js';
 
 /**
  * Phase 2 exit-criterion CLI: run one task end to end.
@@ -107,11 +111,145 @@ function parseArgs(argv: string[]): CliOptions {
   };
 }
 
-function makeProvider(id: string): AgentProvider {
+/**
+ * Domain presets for the scripted provider's canned plan.
+ *
+ * The scripted provider cannot reason, so the "Manager" has to be told which
+ * team to field. Keyword matching is crude on purpose — its only job is to make
+ * the no-cost dry run exercise more than one domain, which is the Phase 2 exit
+ * criterion. A real provider ignores all of this.
+ *
+ * Every `lead`/`reviewers` name is checked against the registry before use.
+ */
+interface ScriptedDomain {
+  domain: string;
+  reportStyle: string;
+  keywords: string[];
+  lead: string;
+  reviewers: string[];
+}
+
+const SCRIPTED_DOMAINS: ScriptedDomain[] = [
+  {
+    domain: 'legal',
+    reportStyle: 'legal-memo',
+    keywords: ['nda', 'contract', 'legal', 'clause', 'agreement', 'vendor', 'liability', 'terms'],
+    lead: 'legal-advisor',
+    reviewers: ['compliance-auditor', 'risk-manager'],
+  },
+  {
+    domain: 'tax',
+    reportStyle: 'advisory',
+    keywords: ['tax', 'vat', 'deduction', 'filing', 'audit', 'accounting'],
+    lead: 'business-analyst',
+    reviewers: ['risk-manager', 'research-analyst'],
+  },
+  {
+    domain: 'software',
+    reportStyle: 'engineering',
+    keywords: ['code', 'api', 'bug', 'refactor', 'auth', 'service', 'module', 'performance'],
+    lead: 'backend-developer',
+    reviewers: ['security-auditor', 'code-reviewer'],
+  },
+];
+
+/** Used when the task matches no preset, and as the shape of every preset. */
+const SCRIPTED_FALLBACK_DOMAIN: ScriptedDomain = {
+  domain: 'general',
+  reportStyle: 'briefing',
+  keywords: [],
+  lead: 'research-analyst',
+  reviewers: ['business-analyst', 'technical-writer'],
+};
+
+function chooseScriptedDomain(task: string, known: ReadonlySet<string>): ScriptedDomain {
+  const haystack = task.toLowerCase();
+  const matched = SCRIPTED_DOMAINS.find((candidate) =>
+    candidate.keywords.some((keyword) => haystack.includes(keyword)),
+  );
+
+  for (const candidate of [matched, SCRIPTED_FALLBACK_DOMAIN]) {
+    if (candidate === undefined) continue;
+    const team = [candidate.lead, ...candidate.reviewers];
+    if (team.every((name) => known.has(name))) return candidate;
+  }
+
+  throw new Error(
+    'the scripted provider\'s canned teams reference agents that are not in the registry. ' +
+      'Update SCRIPTED_DOMAINS in src/scripts/run.ts.',
+  );
+}
+
+/**
+ * The plan the scripted "Manager" returns. Two phases with a real dependency
+ * edge, so the dry run covers phase sequencing, `dependsOn` briefing and
+ * intra-phase parallelism rather than just a flat fan-out.
+ */
+function scriptedPlanJson(task: string, known: ReadonlySet<string>): string {
+  const choice = chooseScriptedDomain(task, known);
+
+  const plan = {
+    summary: `Scripted dry run for: ${task}`,
+    domain: choice.domain,
+    reportStyle: choice.reportStyle,
+    phases: [
+      {
+        id: 'analysis',
+        name: 'Analysis',
+        parallel: false,
+        assignments: [
+          {
+            id: 'lead-analysis',
+            agentName: choice.lead,
+            objective: `Produce the primary analysis for: ${task}`,
+            deliverable: `reports/01-${choice.lead}.md`,
+            dependsOn: [],
+          },
+        ],
+      },
+      {
+        id: 'review',
+        name: 'Review',
+        parallel: true,
+        assignments: choice.reviewers.map((agentName, index) => ({
+          id: `review-${index + 1}`,
+          agentName,
+          objective: `Review the primary analysis from a ${agentName} perspective.`,
+          deliverable: `reports/0${index + 2}-${agentName}.md`,
+          dependsOn: ['lead-analysis'],
+        })),
+      },
+    ],
+  };
+
+  return JSON.stringify(plan, null, 2);
+}
+
+function makeProvider(id: string, task: string, knownAgentNames: ReadonlySet<string>): AgentProvider {
   if (id === 'scripted') {
-    // Every agent returns a placeholder report. Enough to prove the pipeline
-    // end to end without a model, which is exactly what Phase 2 needs.
+    // The Manager's planning and synthesis turns go through the provider too, so
+    // a single placeholder for everything can never complete a run: planning
+    // would get prose where it requires JSON and burn the whole repair budget.
+    // Both manager turns are scripted by assignment id; agents get the fallback.
     return new ScriptedProvider({
+      byAssignment: {
+        [MANAGER_PLAN_ASSIGNMENT_ID]: {
+          text: scriptedPlanJson(task, knownAgentNames),
+          usage: { inputTokens: 1200, outputTokens: 400 },
+        },
+        [MANAGER_SYNTHESIS_ASSIGNMENT_ID]: {
+          text: [
+            '# Scripted synthesis',
+            '',
+            'This document was assembled by the scripted provider. No model was',
+            'called, so the section below is structural proof only — it shows the',
+            'orchestrator collected every report and reached the synthesis step.',
+            '',
+            'Replace `--provider scripted` with a real provider once Phase 1 lands.',
+          ].join('\n'),
+          usage: { inputTokens: 2000, outputTokens: 600 },
+        },
+      },
       fallback: {
         text: [
           '## Findings',
@@ -137,14 +275,19 @@ function makeProvider(id: string): AgentProvider {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
-  const provider = makeProvider(options.provider);
+
+  // The registry loads first: the scripted provider's canned plan has to name
+  // agents that actually exist, and is validated against these names.
+  const registry = await loadRegistry(options.repoRoot);
+  const knownAgentNames = new Set(registry.agents.map((agent) => agent.name));
+
+  const provider = makeProvider(options.provider, options.task, knownAgentNames);
 
   const availability = await provider.isAvailable();
   if (!availability.ok) {
     throw new Error(`provider "${options.provider}" unavailable: ${availability.reason ?? 'unknown'}`);
   }
 
-  const registry = await loadRegistry(options.repoRoot);
   const store = new FileRunStore(options.runsRoot);
 
   // Ctrl+C cancels the run rather than killing the process mid-write, so the

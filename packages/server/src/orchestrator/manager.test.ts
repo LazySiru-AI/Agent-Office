@@ -252,7 +252,17 @@ describe('extractPlanJson', () => {
   });
 
   it('rejects a top-level array', () => {
-    expect(() => extractPlanJson('[{"a": 1}]')).toThrow(PlanParseError);
+    expect(() => extractPlanJson('[1, 2, 3]')).toThrow(PlanParseError);
+  });
+
+  /**
+   * Salvage is deliberately greedy: an array wrapping an object is treated as
+   * noise around the object, exactly like the prose cases above. The array is
+   * still never itself accepted as a plan — the recovered object goes on to
+   * face `RunPlanSchema`, which is the real gate.
+   */
+  it('salvages the inner object from an array wrapper', () => {
+    expect(extractPlanJson('[{"a": 1}]')).toEqual({ a: 1 });
   });
 
   it('rejects a bare scalar', () => {

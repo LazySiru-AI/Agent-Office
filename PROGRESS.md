@@ -7,9 +7,9 @@ written, not executed) · **blocked** · **not started**.
 
 | Phase | Status | Committed |
 |---|---|---|
-| 0 — Foundations (registry + contracts) | built, unverified | yes |
-| 1 — Provider layer + Claude Code adapter | blocked — needs `claude` CLI | — |
-| 2 — Orchestrator core (headless) | built, unverified | yes |
+| 0 — Foundations (registry + contracts) | **done** | yes |
+| 1 — Provider layer + Claude Code adapter | not started — no longer blocked | — |
+| 2 — Orchestrator core (headless) | **done** | yes |
 | 3 — Web shell + live wiring | not started | — |
 | 4 — Pixel office sim | not started | — |
 | 5 — Designer step + PDF export | not started | — |
@@ -191,3 +191,124 @@ on PATH** blocks Phase 1.
 Phase 3 (web shell) needs Node to be useful, so the honest next step is
 installing Node and running `npm test` + `npm run run -- "..." --provider
 scripted` to close out Phases 0 and 2 for real.
+
+---
+
+## Verification pass — Phases 0 and 2 closed out
+
+**Status: both phases are now done.** The "Blockers" section directly above is
+obsolete and is left in place only as the record of what the previous entry
+believed.
+
+### The blockers were not real
+
+Node **v24.19.0** and npm **11.17.0** were already installed at
+`C:\Program Files\nodejs`, on the machine `PATH`. The shell that reported them
+missing had been open since before the install and was holding a stale
+environment. The Claude Code CLI was likewise present, at
+`%APPDATA%\Claude\claude-code\2.1.222\claude.exe` — genuinely not on `PATH`, but
+installed. Nothing had to be installed to close these phases.
+
+Lesson worth keeping: "not installed" was inferred from a `PATH` lookup in one
+long-lived shell. That is not the same check, and it cost the project two phases
+of assumed-blocked time.
+
+### Results
+
+- `npm run registry:dump` — **154 agents across 10 categories.** Phase 0 exit
+  criterion met.
+- `npm test` — **198 passing.** (196 after repairs, plus 2 new regression tests.)
+- `npm run typecheck` — clean, both packages. This also retires the carried-forward
+  risk that `yaml` v2's `YAMLParseError.linePos` shape might not typecheck. It does.
+- `npm run run -- "..." --provider scripted` — end to end on **two domains**,
+  legal and software, each producing three agent reports, three event logs, a
+  synthesis and a `done` run state. Phase 2 exit criterion met.
+
+### What was broken
+
+**1. The registry test resolved the repo root two levels too high.**
+`index.test.ts` walked six directories up from `src/registry`, landing on
+`C:\Users\KD-AI` instead of the project. Its own comment gave it away —
+`packages -> agent-office -> output -> repo root` describes the old nesting
+inside the catalog repo, which the initial commit moved out of. Ten tests were
+failing on a path that stopped existing when the project moved. `scripts/dump.ts`
+had the correct depth all along, which is why the dump worked and the tests did
+not.
+
+**2. `extractPlanJson`'s array test did not test what it claimed.**
+`rejects a top-level array` used `[{"a": 1}]`, which contains a salvageable
+object, so greedy brace extraction recovered `{"a": 1}` and the call did not
+throw. The implementation is right — `tryParseJsonObject` explicitly refuses
+arrays, and salvaging an object out of surrounding noise is the documented
+behaviour of every neighbouring test. The fixture was wrong. Now `[1, 2, 3]`,
+with the array-wrapper salvage documented as its own test.
+
+**3. The scripted provider could never complete a run.** The CLI gave every
+provider call the same markdown placeholder — but the Manager's planning turn
+goes through the provider too, and it requires JSON. Planning got prose, burned
+all three repair attempts, and the run failed. So the "no-cost end-to-end dry
+run" had never once run end to end.
+
+This is the interesting one: the orchestrator's 191 unit tests all passed,
+because they drive their own fakes. The registered `ScriptedProvider` — the one
+the CLI actually uses — was never exercised against the real Manager. A seam
+tested only from one side.
+
+Fixed in `scripts/run.ts` by scripting both manager turns via `byAssignment`
+(`manager-plan`, `manager-synthesis`) and leaving `fallback` for agents. The
+canned plan picks a team by keyword — legal, tax, software, or a general
+fallback — and every name in it is validated against the registry before use, so
+a renamed agent fails loudly at startup instead of as a mystery repair loop. The
+plan is two phases with a real dependency edge, so the dry run covers phase
+sequencing, `dependsOn` briefing and intra-phase parallelism.
+
+**4. Concurrent `run.json` writes fail on Windows with `EPERM`.** Predicted in
+the Phase 2 risk list as something that "may need a retry loop". It is worse
+than that: it was a hard run failure, hit on the first real run, and the cause is
+self-inflicted rather than environmental. Assignments in a parallel phase each
+save on every transition, so two `rename` calls target one `run.json` at once —
+and on Windows the loser gets `EPERM`, not last-writer-wins.
+
+Measured directly: **13 of 40** unserialised concurrent atomic writes to one path
+fail on this machine.
+
+Fixed with both halves, because they address different causes:
+
+- `saveRun` and `writeReport` now go through the existing `enqueue` chain, keyed
+  by absolute path. That removes the self-inflicted race entirely — this is the
+  actual fix, and the reason the risk list's "retry loop" alone would have been
+  the wrong answer.
+- `renameWithRetry` backs off over ~330ms on `EPERM`/`EBUSY`/`EACCES`, for
+  handles this process does not own: antivirus mid-scan, a file watcher, an
+  editor with `run.json` open. Serialisation cannot help with those.
+
+Two regression tests cover it.
+
+### Risks retired
+
+- `YAMLParseError.linePos` — typecheck is clean.
+- Windows `rename` contention — fixed and tested, no longer a carried risk.
+- "154 agents" as an unverified snapshot — the dump confirms 154.
+
+### Risks still carried forward
+
+Unchanged from Phase 2: the planning prompt's software-trio worked example will
+bias the first real legal or tax run; synthesis truncates at 24k chars per
+report; `JSON.parse` strictness costs a repair attempt on trailing commas;
+`listRuns` reads every `run.json`.
+
+New:
+
+- **Phase 1 must resolve the `claude` binary at run time.** The install path
+  contains the version (`...\claude-code\2.1.222\...`) and there is no shim on
+  `PATH`. Hardcoding it means the provider breaks on the next Claude Code update.
+  See `SETUP.md` for the suggested resolution order.
+- **The scripted provider's keyword routing is deliberately crude.** It exists so
+  the dry run touches more than one domain. It is not a planner and must not grow
+  into one.
+
+### Next
+
+Phase 1 is now unblocked and is the natural next step: capture a real
+`stream-json` fixture from the installed CLI, then build the parser against it.
+Phase 3 (web shell) is equally available and depends on nothing missing.

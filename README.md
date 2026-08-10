@@ -18,16 +18,20 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0 and 2 are built but unverified.** Node.js is not yet installed on
-this machine, so nothing in the repository has been compiled, tested, or run.
-See `SETUP.md` for what is missing and `PROGRESS.md` for where each phase stands.
+**Phases 0 and 2 are done and verified.** 198 tests pass, typecheck is clean,
+the registry indexes 154 agents, and a task runs end to end on two domains with
+the no-cost scripted provider. See `PROGRESS.md` for what had to be repaired to
+get there.
 
 | Phase | What | Status |
 |---|---|---|
-| 0 | Agent registry + shared contracts | built, unverified |
-| 1 | Provider layer + Claude Code adapter | blocked — needs the `claude` CLI |
-| 2 | Orchestrator core (headless) | built, unverified |
+| 0 | Agent registry + shared contracts | done |
+| 1 | Provider layer + Claude Code adapter | not started |
+| 2 | Orchestrator core (headless) | done |
 | 3–7 | Web shell, pixel office, PDF export, domain breadth, more providers | not started |
+
+Nothing has called a real model yet — every run so far used the scripted
+provider. Phase 1 is what changes that.
 
 ## Layout
 
@@ -42,7 +46,7 @@ runs/<id>/      per-run artifacts — reports, logs, workspace (gitignored)
 
 ## Getting started
 
-Requires Node.js 20+, which is **not currently installed** — see `SETUP.md`.
+Requires Node.js 20+ (v24.19.0 is installed here — see `SETUP.md`).
 
 ```bash
 npm install

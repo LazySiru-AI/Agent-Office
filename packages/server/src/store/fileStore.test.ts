@@ -154,6 +154,42 @@ describe('FileRunStore.saveRun', () => {
     expect(reloaded.createdAt).toBe(FIXED_CLOCK);
     expect(reloaded.updatedAt).toBe(FIXED_CLOCK + 5_000);
   });
+
+  /**
+   * Regression: assignments in a parallel phase each save on every transition,
+   * so concurrent saves are the normal case, not an edge case. Unserialised,
+   * these race onto one `run.json` — on Windows the losing `rename` fails with
+   * EPERM and takes the whole run down.
+   */
+  it('survives concurrent saves of the same run', async () => {
+    const run = await store.createRun('parallel phase');
+
+    await Promise.all(
+      Array.from({ length: 25 }, (_, i) =>
+        store.saveRun({ ...run, status: 'running', assignments: [assignment(`a${i}`)] }),
+      ),
+    );
+
+    const dir = store.runDir(run.id);
+    expect((await readdir(dir)).filter((name) => name.endsWith('.tmp'))).toEqual([]);
+
+    // Whichever save landed last, the file must be complete and re-loadable —
+    // never a half-written or interleaved document.
+    const reloaded = await store.loadRun(run.id);
+    expect(reloaded.status).toBe('running');
+    expect(reloaded.assignments).toHaveLength(1);
+  });
+
+  it('serialises concurrent saves in call order', async () => {
+    const run = await store.createRun('ordered');
+    const statuses = ['planning', 'dispatching', 'running'] as const;
+
+    await Promise.all(statuses.map((status) => store.saveRun({ ...run, status })));
+
+    // The chain preserves submission order, so the last caller wins rather than
+    // whichever write happened to finish last.
+    expect((await store.loadRun(run.id)).status).toBe('running');
+  });
 });
 
 describe('FileRunStore.loadRun', () => {
