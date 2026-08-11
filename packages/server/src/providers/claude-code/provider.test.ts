@@ -309,4 +309,28 @@ describe('buildArgs', () => {
     const args = buildArgs({ systemPromptPath: 'sp.md', tools, options: { maxCostUsd: 0.5 } });
     expect(args[args.indexOf('--max-budget-usd') + 1]).toBe('0.5');
   });
+
+  it('omits --max-budget-usd entirely when no cap is set', () => {
+    const args = buildArgs({ systemPromptPath: 'sp.md', tools, options: {} });
+    expect(args).not.toContain('--max-budget-usd');
+  });
+
+  describe('refuses a spend cap that cannot mean "protected" (FR-M8)', () => {
+    // DEFECT FIXED: this used to forward whatever it was handed straight to
+    // `--max-budget-usd` — `String(-5)`, `String(0)`, `String(Infinity)` — so
+    // a caller that got a bad value here (accidentally or otherwise) shipped
+    // a run that read as budget-capped and was not. `CreateRunRequestSchema`
+    // and `scripts/run.ts` both reject these before `buildArgs` is ever
+    // reached in the real app, but `buildArgs` is the one place every caller
+    // funnels through, so it is the backstop.
+    const invalidCaps = [0, -1, -0.01, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
+
+    for (const maxCostUsd of invalidCaps) {
+      it(`throws for a maxCostUsd of ${String(maxCostUsd)}`, () => {
+        expect(() => buildArgs({ systemPromptPath: 'sp.md', tools, options: { maxCostUsd } })).toThrow(
+          /positive.*finite/,
+        );
+      });
+    }
+  });
 });

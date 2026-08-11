@@ -13,7 +13,49 @@ import { AssignmentStatusSchema } from './status.js';
 const base = { assignmentId: z.string().min(1) };
 
 export const AgentEventSchema = z.discriminatedUnion('t', [
-  z.object({ ...base, t: z.literal('status'), status: AssignmentStatusSchema }),
+  z.object({
+    ...base,
+    t: z.literal('status'),
+    status: AssignmentStatusSchema,
+    /**
+     * Fields `dispatcher.ts`'s `setStatus` sets on `AssignmentState` in the
+     * same breath as this status change — `reportPath`/`endedAt` on `done`,
+     * `error`/`endedAt` on `skipped` or `failed`. Carrying them here is what
+     * lets replay's fold (`useReplay.ts`, NFR-7) apply the real values instead
+     * of guessing: before this, the event carried only `{ status }`, so a
+     * replayed `reportPath` was inferred from `deliverable` (wrong for a
+     * revised assignment whose report moved) and a replayed `error` was
+     * whatever fatal `error` event happened to precede it (wrong for
+     * `skipped`, which never emits one).
+     *
+     * ALL THREE ARE OPTIONAL, and must stay that way: every `.jsonl` line
+     * already on disk was written before this field existed, so it parses as
+     * `{ status }` with these absent. Absent has to keep meaning "this status
+     * change carried no such field" — not "clear it" — or an old log would
+     * replay differently than it did the day it was recorded, which is
+     * exactly what NFR-7 promises will not happen.
+     */
+    reportPath: z.string().min(1).optional(),
+    error: z.string().optional(),
+    endedAt: z.number().int().nonnegative().optional(),
+    /**
+     * FR-M10's `done -> briefing` revision re-dispatch clears the target's
+     * `endedAt` (the work is not finished any more), and that clearing has to
+     * reach the log too, or a replayed revision shows `briefing` next to the
+     * STALE `endedAt` from the assignment's earlier completion — appearing to
+     * finish before it restarted.
+     *
+     * This cannot reuse the `endedAt` field above by simply omitting it:
+     * omission already means "unchanged" for every other field on every other
+     * event (see the constraint above), so an absent `endedAt` on a
+     * `briefing` event is indistinguishable from "nothing to say about
+     * `endedAt`" and the fold would leave the old value sitting there. A
+     * distinct, explicit signal is the only honest way to say "this field had
+     * a value, and now it does not" rather than "this field was never
+     * mentioned".
+     */
+    endedAtCleared: z.literal(true).optional(),
+  }),
   z.object({ ...base, t: z.literal('text'), chunk: z.string() }),
   z.object({
     ...base,

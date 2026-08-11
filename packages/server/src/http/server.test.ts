@@ -76,7 +76,18 @@ function expectApiError(body: string): string {
  * cannot hang, and `RUN_POLL_TIMEOUT_MS` still fires first with a message
  * naming the status a stuck run was in.
  */
-vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS });
+// `hookTimeout` as well as `testTimeout`, and the second is not decoration.
+// `testTimeout` does not cover hooks, so the `afterEach` above kept vitest's
+// 10s default — and that hook is where every still-running supervisor is
+// drained. A test that asserted in milliseconds and left a run executing could
+// therefore fail at 10s in its TEARDOWN under load, reported against the test
+// body, which is where it was first mistaken for a slow assertion.
+//
+// Third time this pattern has bitten in this file's history: an explicit
+// budget was set in one place while a tighter, unstated one governed
+// elsewhere. `waitForTerminal`'s own ceiling was the first, `waitFor`'s the
+// second. Setting both here from one constant is the point.
+vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS, hookTimeout: SLOW_RUN_TIMEOUT_MS });
 
 describe('GET /api/health', () => {
   it('answers without touching the store, so it works as a readiness probe', async () => {
@@ -188,6 +199,55 @@ describe('POST /api/runs', () => {
 
     expect(response.statusCode).toBe(400);
     expect(expectApiError(response.body)).toMatch(/unknown provider/);
+  });
+
+  it('rejects a non-positive maxCostUsd, so a caller cannot mistake "0" for "no cap" (FR-M8)', async () => {
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.', maxCostUsd: 0 },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(expectApiError(response.body)).toMatch(/invalid request body/);
+  });
+
+  it('threads maxCostUsd from the request body into the provider factory (FR-M8)', async () => {
+    // DEFECT FIXED: `startRun` used to call `makeProvider` with no options at
+    // all, so a settings-panel cost budget could never reach the Claude Code
+    // adapter's `--max-budget-usd` no matter what the client sent. The
+    // supervisor's injectable `makeProvider` is the seam that proves the
+    // fix without spawning a real CLI: it stands in for
+    // `providers/factory.ts` and records what it was called with.
+    const registry = testRegistry();
+    const store = new MemoryRunStore();
+    const received: unknown[] = [];
+    const supervisor = new RunSupervisor({
+      registry,
+      store,
+      makeProvider: (_id, _task, _known, options) => {
+        received.push(options);
+        // `testProviderFactory()` returns a zero-argument stub — it ignores
+        // id/task/known — so nothing is lost by not forwarding them.
+        return testProviderFactory()();
+      },
+      onWarning: () => undefined,
+      produceDeliverable: stubDeliverable(),
+    });
+    const app = await buildServer({ registry, store, supervisor });
+    await app.ready();
+    started.push({ app, supervisor });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.', maxCostUsd: 3.5 },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(received).toContainEqual(expect.objectContaining({ maxCostUsd: 3.5 }));
   });
 });
 

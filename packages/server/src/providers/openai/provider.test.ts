@@ -685,3 +685,153 @@ describe('run() when no key is configured', () => {
     await expect(collect(provider.run(makeRequest()))).rejects.toThrow(ProviderUnavailableError);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The cost cap (FR-M8, `maxCostUsd`) — see `pricing.ts` for the tier join and
+// `OpenAiProviderOptions.maxCostUsd` for what precision this can promise.
+//
+// No real OpenAI or DeepSeek model id is ever priced (`pricing.ts`'s
+// `priceFor` only recognises Anthropic's tier words) — that is the whole
+// point of the "unpriced + cap => unavailable" case below. To exercise the
+// cap *machinery* this adapter shares with the Anthropic one (accumulate
+// between rounds, stop on overshoot), the "cap not reached" and "cap
+// exceeded" tests configure `model` to an id that happens to contain a
+// recognised tier word. That proves the shared mechanism works identically
+// in this adapter; it claims nothing about real OpenAI/DeepSeek pricing.
+// ---------------------------------------------------------------------------
+
+describe('OpenAiCompatibleProvider — the cost cap (maxCostUsd)', () => {
+  function providerWithCap(
+    server: FakeOpenAiServer,
+    overrides: { model?: string; maxCostUsd?: number; tools?: SandboxedTools } = {},
+  ): OpenAiCompatibleProvider {
+    return new OpenAiCompatibleProvider('openai', {
+      model: overrides.model ?? 'claude-sonnet-5-compatible-proxy',
+      ...(overrides.maxCostUsd === undefined ? {} : { maxCostUsd: overrides.maxCostUsd }),
+      deps: {
+        env: { OPENAI_API_KEY: 'test-openai-key', OPENAI_BASE_URL: server.url },
+        tools: () => overrides.tools ?? stubTools({ catalog: [] }),
+      },
+    });
+  }
+
+  it('lets a run finish normally when the estimated spend stays under the cap', async () => {
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'well within budget' }, finish_reason: 'stop' }] }),
+          chunkLine({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 500 } }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = providerWithCap(server, { maxCostUsd: 10 });
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'well within budget')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+      expect(server.requests).toHaveLength(1);
+    });
+  });
+
+  it('produces exactly one fatal error naming the cap and the estimate, after the text already streamed', async () => {
+    // Priced (via the tier word in `model`) at sonnet's $3/$15 per million
+    // input/output tokens, so this round's 1M+1M tokens cost an estimated
+    // $18 — comfortably over the $1 cap.
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'spent' }, finish_reason: 'stop' }] }),
+          chunkLine({ choices: [], usage: { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 } }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = providerWithCap(server, { maxCostUsd: 1 });
+      const events = await collect(provider.run(makeRequest()));
+
+      const textIndex = events.findIndex((e) => e.t === 'text' && e.chunk === 'spent');
+      expect(textIndex).toBeGreaterThanOrEqual(0);
+
+      const fatal = events.filter((e) => e.t === 'error' && e.fatal);
+      expect(fatal).toHaveLength(1);
+      // The text this round produced reached the caller before the cap
+      // check ran — FR-M8's "fails cleanly with partial results preserved".
+      expect(events.indexOf(fatal[0]!)).toBeGreaterThan(textIndex);
+
+      const message = fatal[0]?.t === 'error' ? fatal[0].message : '';
+      expect(message).toContain('$1.00');
+      expect(message).toContain('$18.00');
+    });
+  });
+
+  it('stops before starting a further tool-call round it would otherwise have made, once the cap would be exceeded', async () => {
+    const round1: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: { tool_calls: [{ index: 0, id: 'call_x', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        chunkLine({ choices: [], usage: { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 } }),
+        DONE_LINE,
+      ],
+    };
+
+    // Exactly one scripted round: if the adapter ever asked for a second
+    // round after the cap tripped, the fake server's own "no scripted step"
+    // guard would fail the request loudly rather than let it pass.
+    await withServer([round1], async (server) => {
+      const tools = stubTools({ catalog: ['Read'] });
+      const provider = providerWithCap(server, { maxCostUsd: 1, tools });
+      const events = await collect(provider.run(makeRequest({ allowedTools: ['Read'] })));
+
+      const fatal = events.filter((e) => e.t === 'error' && e.fatal);
+      expect(fatal).toHaveLength(1);
+      expect(server.requests).toHaveLength(1);
+      // The cap check runs before this round's tool calls are dispatched, so
+      // this round's tool was never executed or reported.
+      expect(tools.calls).toHaveLength(0);
+    });
+  });
+
+  it('reports unavailable, naming the model, when a cost cap is requested for a model with no known price', async () => {
+    const provider = new OpenAiCompatibleProvider('openai', {
+      maxCostUsd: 5, // the default OpenAI model (gpt-4o) is never priced
+      deps: { env: { OPENAI_API_KEY: 'test-openai-key' } },
+    });
+
+    const availability = await provider.isAvailable();
+    expect(availability.ok).toBe(false);
+    expect(availability.reason).toContain('gpt-4o');
+    expect(availability.reason?.toLowerCase()).toContain('price');
+
+    await expect(collect(provider.run(makeRequest()))).rejects.toBeInstanceOf(ProviderUnavailableError);
+  });
+
+  it('runs normally against an unpriced model when no cost cap is set at all', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'fine' }, finish_reason: 'stop' }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProvider(server); // default gpt-4o, no cap
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'fine')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+    });
+  });
+});

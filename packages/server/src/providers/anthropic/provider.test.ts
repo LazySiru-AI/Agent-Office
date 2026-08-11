@@ -541,3 +541,115 @@ describe('AnthropicProvider — cancellation (FR-M9)', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// The cost cap (FR-M8, `maxCostUsd`) — see `pricing.ts` for the tier join and
+// `AnthropicProviderOptions.maxCostUsd` for what precision this can promise.
+// ---------------------------------------------------------------------------
+
+describe('AnthropicProvider — the cost cap (maxCostUsd)', () => {
+  it('lets a run finish normally when the estimated spend stays under the cap', async () => {
+    const fake = await startFakeAnthropic([
+      sseResponse(plainTurnSse(['well within budget'], { input: 1000, output: 500 })),
+    ]);
+    try {
+      const provider = providerAgainst(fake.url, NO_TOOLS, { maxCostUsd: 10 });
+      const events = await collect(provider, makeRequest());
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'well within budget')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it('produces exactly one fatal error naming the cap and the estimate, after the text already streamed', async () => {
+    // claude-sonnet-5 (the default model) prices at $3/$15 per million input/
+    // output tokens, so this turn's 1M+1M tokens cost an estimated $18 —
+    // comfortably over the $1 cap.
+    const fake = await startFakeAnthropic([
+      sseResponse(plainTurnSse(['spent'], { input: 1_000_000, output: 1_000_000 })),
+    ]);
+    try {
+      const provider = providerAgainst(fake.url, NO_TOOLS, { maxCostUsd: 1 });
+      const events = await collect(provider, makeRequest());
+
+      const textIndex = events.findIndex((e) => e.t === 'text' && e.chunk === 'spent');
+      expect(textIndex).toBeGreaterThanOrEqual(0);
+
+      const fatal = events.filter((e) => e.t === 'error' && e.fatal);
+      expect(fatal).toHaveLength(1);
+      // The text this round produced reached the caller before the cap check
+      // ran — FR-M8's "fails cleanly with partial results preserved".
+      expect(events.indexOf(fatal[0]!)).toBeGreaterThan(textIndex);
+
+      const message = fatal[0]?.t === 'error' ? fatal[0].message : '';
+      expect(message).toContain('$1.00');
+      expect(message).toContain('$18.00');
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it('stops before starting a further tool-use round it would otherwise have made, once the cap would be exceeded', async () => {
+    const { factory } = stubTools(
+      [{ name: 'Read', description: 'Reads a file.', inputSchema: { type: 'object' } }],
+      () => ({ content: 'contents', isError: false }),
+    );
+    // Exactly one scripted response: if the adapter ever asked for a second
+    // round after the cap tripped, the fake server's own "more requests than
+    // scripted" guard would fail the request loudly rather than let it pass.
+    const fake = await startFakeAnthropic([
+      sseResponse(toolUseTurnSse('toolu_1', 'Read', ['{"path":"a.txt"}'], { input: 1_000_000, output: 1_000_000 })),
+    ]);
+    try {
+      const provider = providerAgainst(fake.url, factory, { maxCostUsd: 1 });
+      const events = await collect(provider, makeRequest({ allowedTools: ['Read'] }));
+
+      expect(events.some((e) => e.t === 'tool')).toBe(true);
+      const fatal = events.filter((e) => e.t === 'error' && e.fatal);
+      expect(fatal).toHaveLength(1);
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it('reports unavailable, naming the model, when a cost cap is requested for a model with no known price', async () => {
+    const provider = new AnthropicProvider({
+      model: 'claude-3-legacy-id', // no recognised tier word — see pricing.ts
+      maxCostUsd: 5,
+      deps: {
+        createTools: NO_TOOLS,
+        env: { ANTHROPIC_API_KEY: 'sk-ant-test-key-not-a-real-secret' },
+      },
+    });
+
+    const availability = await provider.isAvailable();
+    expect(availability.ok).toBe(false);
+    expect(availability.reason).toContain('claude-3-legacy-id');
+    expect(availability.reason?.toLowerCase()).toContain('price');
+
+    await expect(collect(provider, makeRequest())).rejects.toBeInstanceOf(ProviderUnavailableError);
+  });
+
+  it('runs normally against an unpriced model when no cost cap is set at all', async () => {
+    const fake = await startFakeAnthropic([sseResponse(plainTurnSse(['fine'], { input: 5, output: 1 }))]);
+    try {
+      const provider = new AnthropicProvider({
+        model: 'claude-3-legacy-id',
+        deps: {
+          createTools: NO_TOOLS,
+          env: { ANTHROPIC_API_KEY: 'sk-ant-test-key-not-a-real-secret', ANTHROPIC_BASE_URL: fake.url },
+        },
+      });
+      const events = await collect(provider, makeRequest());
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'fine')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+    } finally {
+      await fake.close();
+    }
+  });
+});

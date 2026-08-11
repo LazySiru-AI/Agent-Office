@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { ReportDocument } from '@agent-office/shared';
+import { formatCostUsd, type ReportDocument } from '@agent-office/shared';
 import { buildReportHtml, coerceThemeId, escapeHtml } from './document.js';
 
 /**
@@ -11,6 +11,17 @@ import { buildReportHtml, coerceThemeId, escapeHtml } from './document.js';
  * no caller-supplied figure exists); this file pins what `document.ts`
  * itself does with whatever number it is handed — the three cases a cover
  * page can be in: a real cost, a genuine zero, and a genuine unknown.
+ *
+ * A second, later defect lived in the same handful of lines: the cover
+ * formatted `costUsd` with its own unconditional `toFixed(4)`, while
+ * `formatCostUsd` (shared/src/wire.ts) — what the live UI calls for the same
+ * number — switches to two decimals above one cent. A run costing $123.456
+ * therefore read as `$123.4560` on its own cover page and `$123.46` on
+ * screen: the same run disagreeing with itself. `document.ts` now calls
+ * `formatCostUsd` directly instead of re-implementing its rule, so the tests
+ * below pin the cover's cost cell against that shared function's actual
+ * output rather than a hand-picked expectation that could drift from it
+ * again the same way.
  */
 
 function makeDocument(overrides: Partial<ReportDocument> = {}): ReportDocument {
@@ -29,9 +40,13 @@ function makeDocument(overrides: Partial<ReportDocument> = {}): ReportDocument {
 }
 
 describe('buildReportHtml — cover cost display', () => {
-  it('shows a real cost, formatted to four decimal places', () => {
+  it('formats a real cost exactly as formatCostUsd does — the same figure the live UI shows', () => {
+    // Pinned against the shared function's actual output, not a hand-picked
+    // string: that is the guard against the cover and the UI drifting apart
+    // again the way `toFixed(4)` vs `formatCostUsd` once did.
     const html = buildReportHtml(makeDocument({ costUsd: 1.05 }));
-    expect(html).toContain('<dt>Estimated cost</dt><dd>$1.0500</dd>');
+    expect(html).toContain(`<dt>Estimated cost</dt><dd>${formatCostUsd(1.05)}</dd>`);
+    expect(html).toContain('<dt>Estimated cost</dt><dd>$1.05</dd>');
   });
 
   it('shows $0.00 for a genuinely free run, not "—"', () => {
@@ -50,9 +65,22 @@ describe('buildReportHtml — cover cost display', () => {
     expect(html).toContain('<dt>Estimated cost</dt><dd>—</dd>');
   });
 
-  it('escapes nothing extra into the cost cell — it is always a fixed, safe format', () => {
+  it('matches the live UI on a real run: two decimals above a cent, not four', () => {
+    // The exact defect: a run costing $123.456 used to read `$123.4560` on
+    // its own cover page and `$123.46` (formatCostUsd's two-decimal rule
+    // above one cent) on screen — the same run disagreeing with itself.
     const html = buildReportHtml(makeDocument({ costUsd: 123.456 }));
-    expect(html).toContain('<dt>Estimated cost</dt><dd>$123.4560</dd>');
+    expect(html).toContain('<dt>Estimated cost</dt><dd>$123.46</dd>');
+    expect(html).not.toContain('$123.4560');
+  });
+
+  it('still shows four decimal places for a sub-cent cost, matching formatCostUsd', () => {
+    // formatCostUsd's own below-a-cent rule (shared/src/wire.ts) must survive
+    // the switch to calling it — this is not a blanket "always two decimals"
+    // regression in the other direction.
+    const html = buildReportHtml(makeDocument({ costUsd: 0.0042 }));
+    expect(html).toContain(`<dt>Estimated cost</dt><dd>${formatCostUsd(0.0042)}</dd>`);
+    expect(html).toContain('<dt>Estimated cost</dt><dd>$0.0042</dd>');
   });
 });
 

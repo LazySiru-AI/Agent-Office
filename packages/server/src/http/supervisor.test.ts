@@ -58,7 +58,10 @@ function makeSupervisor(
  * the status the run was stuck in, which is a far more useful failure than a
  * bare vitest timeout ever was.
  */
-vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS });
+// `hookTimeout` too — `testTimeout` does not cover hooks, which kept vitest's
+// 10s default for any teardown that drains a still-running supervisor. See the
+// fuller note in `server.test.ts`.
+vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS, hookTimeout: SLOW_RUN_TIMEOUT_MS });
 describe('RingBuffer', () => {
   it('keeps the newest entries and reports that it dropped the rest', () => {
     // The dropped flag is what `snapshot.truncated` is built from. Without it a
@@ -123,6 +126,58 @@ describe('RunSupervisor.startRun', () => {
     expect(run.reportPath).toBe('report.md');
     expect(supervisor.liveRunIds()).not.toContain(runId);
   }, SLOW_RUN_TIMEOUT_MS);
+
+  it('passes request.maxCostUsd through to makeProvider as an options object (FR-M8)', async () => {
+    // DEFECT FIXED: `startRun` used to call `this.deps.makeProvider(id, task,
+    // knownAgentNames)` with no fourth argument at all, so `maxCostUsd` had no
+    // path off the request even though the schema now accepts it. This pins
+    // the shape it travels in: the same `MakeProviderOptions` object
+    // `providers/factory.ts` already declares, not a second bespoke shape.
+    const store = new MemoryRunStore();
+    const received: unknown[] = [];
+    const supervisor = new RunSupervisor({
+      registry: testRegistry(),
+      store,
+      makeProvider: (_id, _task, _known, options) => {
+        received.push(options);
+        // `testProviderFactory()` returns a zero-argument stub — it ignores
+        // id/task/known — so nothing is lost by not forwarding them.
+        return testProviderFactory()();
+      },
+      produceDeliverable: stubDeliverable(),
+    });
+
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.', maxCostUsd: 1.25 });
+    await waitForTerminal(supervisor, runId);
+
+    // One provider is built per run, up front, and reused for the Manager's
+    // planning and synthesis turns as well as every agent's — so one call is
+    // the whole contract here.
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({ maxCostUsd: 1.25 });
+  });
+
+  it('omits maxCostUsd from the options object when the request does not set it', async () => {
+    const store = new MemoryRunStore();
+    const received: unknown[] = [];
+    const supervisor = new RunSupervisor({
+      registry: testRegistry(),
+      store,
+      makeProvider: (_id, _task, _known, options) => {
+        received.push(options);
+        // `testProviderFactory()` returns a zero-argument stub — it ignores
+        // id/task/known — so nothing is lost by not forwarding them.
+        return testProviderFactory()();
+      },
+      produceDeliverable: stubDeliverable(),
+    });
+
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.' });
+    await waitForTerminal(supervisor, runId);
+
+    expect(received).toHaveLength(1);
+    expect(received[0]).not.toHaveProperty('maxCostUsd');
+  });
 
   it('rejects an unknown provider without creating a run', async () => {
     const store = new MemoryRunStore();

@@ -1,4 +1,4 @@
-import type { AgentEvent } from '@agent-office/shared';
+import { formatCostUsd, type AgentEvent, type Usage } from '@agent-office/shared';
 import { createSandboxedTools, type SandboxedTools } from '../apiTools.js';
 import {
   apiKeyVariable,
@@ -7,6 +7,7 @@ import {
   type ApiProviderConfig,
   type ResolveConfigOptions,
 } from '../apiConfig.js';
+import { estimateRunCostUsd, priceFor } from '../pricing.js';
 import { readSse } from '../sse.js';
 import {
   ProviderUnavailableError,
@@ -69,8 +70,9 @@ import {
  * while still guaranteeing that a model stuck calling a no-op tool (or a tool
  * whose result it keeps misreading) hits a hard, cheap stop rather than
  * burning the FR-M8 budget one HTTP round trip at a time. This is a loop
- * bound, not a cost bound — `--max-budget-usd`'s equivalent for this
- * provider does not exist yet; see PROGRESS.md.
+ * bound, not a cost bound — see {@link AnthropicProviderOptions.maxCostUsd}
+ * for this provider's (now-existing) equivalent of the CLI adapter's
+ * `--max-budget-usd`.
  */
 export const MAX_TOOL_ITERATIONS = 30;
 
@@ -90,6 +92,31 @@ export interface AnthropicProviderOptions {
   apiVersion?: string;
   /** Overrides {@link MAX_TOOL_ITERATIONS} for one provider instance (tests only, in practice). */
   maxToolIterations?: number;
+  /**
+   * Per-assignment spend ceiling in USD (FR-M8). The name and shape match
+   * `factory.ts`'s `MakeProviderOptions.maxCostUsd`, which is how a run
+   * actually sets this — construction always goes through `makeProvider`.
+   *
+   * Unlike the Claude Code adapter, which hands this straight to the CLI's own
+   * `--max-budget-usd` and lets it enforce the cap mid-response, this adapter
+   * has no such primitive: a `/v1/messages` call is billed in full once it
+   * returns, with no way to stop part-way through one. The cap is therefore
+   * checked *between* tool-use rounds, using `pricing.ts`'s estimate of what
+   * has been spent so far — not during a round. That makes the guarantee
+   * weaker than the CLI's: the worst-case overshoot is bounded by one round's
+   * `max_tokens` (`config.maxOutputTokens`), not by zero. Say so plainly in
+   * the fatal error this produces rather than implying a precision this
+   * adapter cannot deliver.
+   *
+   * If this is set and the resolved model has no known price (`pricing.ts`'s
+   * `priceFor` returns `undefined` — every OpenAI/DeepSeek id, and any
+   * Anthropic id whose tier this repo does not recognise), the adapter
+   * refuses to run at all rather than run uncapped: see `isAvailable()`. A
+   * cap that silently does not apply is the exact defect this option exists
+   * to close, and a run that never starts costs nothing, unlike one that
+   * ignores its cap.
+   */
+  maxCostUsd?: number;
   /** Surface for adapter-level diagnostics that are not agent events — same contract as `claude-code`'s. */
   onDiagnostic?: (message: string) => void;
   /**
@@ -133,6 +160,13 @@ interface TurnOutcome {
    * produced text — see the guard where it is used.
    */
   sawText: boolean;
+  /**
+   * This turn's own token usage, mirroring the `usage` event already yielded
+   * (not accumulated across turns — `run`'s `maxCostUsd` check does that).
+   * `undefined` when the turn never reported usage at all, the same
+   * condition `sawUsage` guards for the event.
+   */
+  usage: Usage | undefined;
 }
 
 /** Accumulates one content block across `content_block_delta` events keyed by `index`. */
@@ -171,13 +205,32 @@ export class AnthropicProvider implements AgentProvider {
 
   /**
    * No network call, by design (the brief is explicit: "a preflight that
-   * costs money or hangs is worse than no preflight"). A missing key is the
-   * only thing checkable for free, so it is the only thing checked.
+   * costs money or hangs is worse than no preflight"). A missing key is one
+   * thing checkable for free; whether a requested cost cap can even be
+   * enforced is another, and both are cheap enough to check here.
+   *
+   * The model checked against `priceFor` is `config.model` — the run-wide
+   * resolved model, before any per-agent catalog override — because that is
+   * all this preflight knows: `AgentRunRequest.model` only exists once a run
+   * starts. `run()` cannot fully substitute for that gap either (a catalog
+   * agent could in principle name an unpriced model literal directly), but a
+   * provider-wide cap paired with a provider-wide unpriced model is the case
+   * that matters in practice, and is exactly what `makeProvider` constructs.
    */
   async isAvailable(): Promise<ProviderAvailability> {
     const config = this.resolveConfig();
     if (config.apiKey === '') {
       return { ok: false, reason: `${apiKeyVariable('anthropic')} is not set` };
+    }
+    if (this.options.maxCostUsd !== undefined && priceFor(config.model) === undefined) {
+      return {
+        ok: false,
+        reason:
+          `a cost cap of ${formatCostUsd(this.options.maxCostUsd)} was requested, but model "${config.model}" ` +
+          'has no known price, so that cap cannot be enforced. Running uncapped would defeat the point of ' +
+          'asking for one, so this run does not start — either drop the cost cap or use a model this repo ' +
+          'has a price for (a "sonnet", "haiku" or "opus" tier id).',
+      };
     }
     return { ok: true };
   }
@@ -216,8 +269,31 @@ export class AnthropicProvider implements AgentProvider {
       };
     }
 
+    // `isAvailable()` (above) already refused a cap paired with an unpriced
+    // *provider-wide* model. `modelChoice.model` can still diverge from that
+    // — an agent's catalog frontmatter can name a literal, unrecognised model
+    // id that `resolveAgentModel` passes through unchanged (see
+    // `apiConfig.ts`). Re-checking here closes that gap for the model this
+    // specific assignment actually runs on, before a single request is sent.
+    if (this.options.maxCostUsd !== undefined && priceFor(modelChoice.model) === undefined) {
+      yield {
+        assignmentId: request.assignmentId,
+        t: 'error',
+        fatal: true,
+        message:
+          `a cost cap of ${formatCostUsd(this.options.maxCostUsd)} was requested, but this assignment's model ` +
+          `"${modelChoice.model}" has no known price, so that cap cannot be enforced. Refusing to run it ` +
+          'uncapped rather than silently ignoring the cap.',
+      };
+      return;
+    }
+
     const messages: AnthropicMessageParam[] = [{ role: 'user', content: request.task }];
     const maxIterations = this.options.maxToolIterations ?? MAX_TOOL_ITERATIONS;
+    // FR-M8's spend cap, estimated turn by turn as the tool-use loop runs.
+    // See `AnthropicProviderOptions.maxCostUsd` for what precision this can
+    // and cannot promise.
+    let spentUsd = 0;
 
     // The interface contract (`types.ts`) is "must emit at least one `text`
     // event carrying the agent's final answer". Tracked across the whole
@@ -292,6 +368,38 @@ export class AnthropicProvider implements AgentProvider {
           message: 'the Anthropic API stream ended before a terminal "message_stop" event arrived',
         };
         return;
+      }
+
+      if (this.options.maxCostUsd !== undefined) {
+        // `priceFor(modelChoice.model)` was already confirmed defined above,
+        // so `estimateRunCostUsd` only returns `undefined` here if a turn
+        // never reported usage at all (`outcome.usage === undefined`) — rare,
+        // but not a reason to under-count: `?? 0` treats an unpriceable turn
+        // as free rather than silently skipping the cap check altogether.
+        if (outcome.usage !== undefined) {
+          spentUsd += estimateRunCostUsd(outcome.usage, modelChoice.model) ?? 0;
+        }
+        if (spentUsd > this.options.maxCostUsd) {
+          // A round that has already returned has already been billed for —
+          // there is no way to claw back tokens the API already generated.
+          // What this check bounds is the *next* round: stopping here means
+          // the overshoot is capped at one round's `max_tokens`
+          // (`config.maxOutputTokens`), not zero. FR-M8's "fails cleanly with
+          // partial results preserved" is satisfied because every `text`
+          // event this run has yielded so far has already reached the
+          // caller — stopping the generator here loses nothing already sent.
+          yield {
+            assignmentId: request.assignmentId,
+            t: 'error',
+            fatal: true,
+            message:
+              `stopping: estimated spend so far (${formatCostUsd(spentUsd)}) exceeds this assignment's cost ` +
+              `cap of ${formatCostUsd(this.options.maxCostUsd)}. This estimate is checked between tool-use ` +
+              `rounds, not mid-round, so the overshoot can be as large as one round's max_tokens ` +
+              `(${String(config.maxOutputTokens)} tokens) rather than exactly zero.`,
+          };
+          return;
+        }
       }
 
       if (outcome.pendingToolUses.length === 0) {
@@ -476,7 +584,14 @@ export class AnthropicProvider implements AgentProvider {
           fatal: true,
           message: `the Anthropic API reported an error mid-stream: ${detail}`,
         };
-        return { fatal: true, assistantContent: [], pendingToolUses: [], sawMessageStop: false, sawText };
+        return {
+          fatal: true,
+          assistantContent: [],
+          pendingToolUses: [],
+          sawMessageStop: false,
+          sawText,
+          usage: sawUsage ? { inputTokens, outputTokens } : undefined,
+        };
       }
 
       // Reachable only for a future SSE event type this file has never heard
@@ -492,7 +607,14 @@ export class AnthropicProvider implements AgentProvider {
     // did not finish, and it is not this method's place to report a partial
     // one as though it completed.
     if (request.signal.aborted) {
-      return { fatal: false, assistantContent: [], pendingToolUses: [], sawMessageStop: false, sawText };
+      return {
+        fatal: false,
+        assistantContent: [],
+        pendingToolUses: [],
+        sawMessageStop: false,
+        sawText,
+        usage: undefined,
+      };
     }
 
     if (sawUsage) {
@@ -512,7 +634,14 @@ export class AnthropicProvider implements AgentProvider {
       // 'other' (thinking, unknown): dropped from the echo — see protocol.ts.
     }
 
-    return { fatal: false, assistantContent, pendingToolUses, sawMessageStop, sawText };
+    return {
+      fatal: false,
+      assistantContent,
+      pendingToolUses,
+      sawMessageStop,
+      sawText,
+      usage: sawUsage ? { inputTokens, outputTokens } : undefined,
+    };
   }
 
   /** Parse and validate one SSE frame's `data:` payload. `undefined` means "skip it", with a diagnostic already filed. */

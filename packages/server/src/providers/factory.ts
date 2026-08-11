@@ -277,9 +277,15 @@ export interface MakeProviderOptions {
   stepDelayMs?: number;
 
   /**
-   * Per-assignment spend ceiling handed to the Claude Code CLI's own
-   * `--max-budget-usd` (FR-M8). Ignored by the scripted provider, which spends
-   * nothing. Unset means no cap, which is the CLI's own default.
+   * Per-assignment spend ceiling (FR-M8). Ignored by the scripted provider,
+   * which spends nothing. Unset means no cap.
+   *
+   * Forwarded to every real provider below, but only the Claude Code adapter
+   * currently acts on it — the CLI has `--max-budget-usd`, the API-based
+   * adapters have no equivalent yet and bound spend only via
+   * `maxOutputTokens` and the tool-round limit. Still passed to `anthropic`
+   * and the OpenAI-compatible adapter so that the day their own options type
+   * accepts it, the value is already reaching them.
    */
   maxCostUsd?: number;
 
@@ -362,34 +368,38 @@ export function makeProvider(
     // and everything that differs between them — key variable, base URL, model
     // — is already absorbed by `resolveApiConfig`. A second near-identical file
     // would be two places to fix the next streaming bug.
-    return new OpenAiCompatibleProvider(id, {
+    //
+    // Built as a variable rather than inline so `maxCostUsd` below type-checks
+    // against `OpenAiCompatibleProvider`'s current constructor without an `as`
+    // cast: see the note on `maxCostUsd` a few lines down.
+    const providerOptions = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
-    });
+      // FR-M8's spend cap reaches this adapter only once its own options type
+      // accepts `maxCostUsd` — a change owned by another fixer, landing in
+      // parallel with this one. Forwarding it now, unconditionally on the
+      // option being set here, means the day that lands nothing needs to
+      // change in `factory.ts`: the value is already on the wire.
+      ...(options.maxCostUsd === undefined ? {} : { maxCostUsd: options.maxCostUsd }),
+    };
+    return new OpenAiCompatibleProvider(id, providerOptions);
   }
 
   if (id === 'anthropic') {
-    return new AnthropicProvider({
+    // Same reasoning as the OpenAI-compatible branch above: `maxCostUsd` is
+    // forwarded ahead of `AnthropicProviderOptions` declaring it.
+    const providerOptions = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
-    });
+      ...(options.maxCostUsd === undefined ? {} : { maxCostUsd: options.maxCostUsd }),
+    };
+    return new AnthropicProvider(providerOptions);
   }
 
   throw new UnknownProviderError(
     `unknown provider "${id}". Known: ${AVAILABLE_PROVIDER_IDS.join(', ')}.`,
   );
 }
-
-/**
- * `maxCostUsd` reaches only the Claude Code adapter.
- *
- * The CLI has `--max-budget-usd`; a raw API call has no equivalent, so for the
- * HTTP providers spend is bounded only by `maxOutputTokens` per call and the
- * tool-round limit. That is a real gap rather than an oversight, and it is
- * recorded here because the option is accepted by `makeProvider` for every
- * provider and silently ignored by three of them — which is exactly the sort of
- * thing that reads as working until the bill arrives.
- */
 
 /**
  * Raised when the requested provider id cannot be constructed.

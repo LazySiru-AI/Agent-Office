@@ -518,7 +518,7 @@ export async function chooseTheme(deps: ChooseThemeDeps): Promise<DesignChoice> 
         allowedTools: deps.allowedTools ?? [],
         workspaceDir: deps.workspaceDir ?? process.cwd(),
         signal,
-        onEvent: deps.onEvent,
+        ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
       });
     } catch (error) {
       // FR-M8/FR-M9: an abort surfaced as a thrown error is still an abort, not

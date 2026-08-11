@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { AgentEvent, AssignmentState, LoggedAgentEvent, RunState } from '@agent-office/shared';
+import type { AgentDef, AgentEvent, AssignmentState, LoggedAgentEvent, RunPlan, RunState } from '@agent-office/shared';
+import { RunPlanSchema } from '@agent-office/shared';
 import {
   advancePositionMs,
   buildTimelineMapping,
@@ -8,6 +9,25 @@ import {
   resetAssignmentsForReplay,
   type ManualReplayClock,
 } from './useReplay.js';
+// `@agent-office/server` is not in `web`'s declared dependencies — deliberately
+// imported anyway, from a test file only, for the one thing this package
+// cannot otherwise prove: that a real `dispatchRun` and this package's
+// `foldEvents` agree, field for field, on the `RunState` a run ends up in.
+// Confirmed before writing this: `npx tsc -p packages/web` type-checks this
+// import cleanly (server's barrel re-exports plain data-shaped functions, no
+// DOM/React leakage the other way), and it resolves at runtime the same way
+// every workspace package does. The reverse import (server test -> web's
+// `useReplay.ts`) does NOT type-check — `useReplay.ts` references `window`,
+// which server's DOM-less `lib` cannot see — which is *why* this end-to-end
+// proof lives here, in the web package's tests, and not in
+// `dispatcher.test.ts`.
+import {
+  buildRegistry,
+  dispatchRun,
+  materialiseAssignments,
+  MemoryRunStore,
+  ScriptedProvider,
+} from '@agent-office/server';
 
 /**
  * `foldEvents` is the heart of NFR-7 replay (see the design notes atop
@@ -49,6 +69,24 @@ function logged(ts: number, event: AgentEvent): LoggedAgentEvent {
 
 function statusEvent(ts: number, assignmentId: string, status: AssignmentState['status']): LoggedAgentEvent {
   return logged(ts, { t: 'status', assignmentId, status });
+}
+
+/**
+ * A `status` event carrying the optional patch fields `setStatus`
+ * (dispatcher.ts) now attaches — `reportPath`/`error`/`endedAt`/
+ * `endedAtCleared`. Kept separate from {@link statusEvent} rather than adding
+ * optional parameters to it: most tests want the bare, no-carried-fields
+ * shape (which is also what every pre-existing `.jsonl` line looks like), and
+ * conflating the two shapes at one call site would blur exactly the
+ * old-log-vs-carried distinction these tests exist to pin.
+ */
+function carriedStatusEvent(
+  ts: number,
+  assignmentId: string,
+  status: AssignmentState['status'],
+  carried: Partial<Pick<Extract<AgentEvent, { t: 'status' }>, 'reportPath' | 'error' | 'endedAt' | 'endedAtCleared'>>,
+): LoggedAgentEvent {
+  return logged(ts, { t: 'status', assignmentId, status, ...carried });
 }
 
 function usageEvent(ts: number, assignmentId: string, inputTokens: number, outputTokens: number): LoggedAgentEvent {
@@ -282,6 +320,279 @@ describe('foldEvents (NFR-7 replay, NFR-5 cost mid-replay)', () => {
     expect(foldEvents(run, withFatal, 999).assignments[0]?.error).toBe('boom');
     expect(foldEvents(run, withoutFatal, 999).assignments[0]?.error).toBeUndefined();
     expect(foldEvents(run, withNonFatal, 999).assignments[0]?.error).toBeUndefined();
+  });
+
+  it('applies a carried reportPath and endedAt directly, not the deliverable/ts approximation', () => {
+    // The point of carrying these on the event at all: the fold no longer has
+    // to guess. `reportPath` is deliberately given a value that differs from
+    // `assignment.deliverable` ('reports/a1.md') so this test fails loudly if
+    // the code silently fell back to the old approximation instead of reading
+    // the carried field; `endedAt` is likewise given a value that differs
+    // from the event's own `ts`, for the same reason.
+    const run = baseRun([assignment('a1')]);
+    const events: LoggedAgentEvent[] = [
+      statusEvent(50, 'a1', 'briefing'),
+      statusEvent(70, 'a1', 'working'),
+      statusEvent(90, 'a1', 'reporting'),
+      carriedStatusEvent(150, 'a1', 'done', { reportPath: 'reports/a1-revised.md', endedAt: 999 }),
+    ];
+
+    const result = foldEvents(run, events, 999_999);
+    const a1 = result.assignments[0];
+    expect(a1?.reportPath).toBe('reports/a1-revised.md');
+    expect(a1?.endedAt).toBe(999);
+  });
+
+  it('applies a carried error on a skipped status — a field the old approximation could never populate', () => {
+    // Before events.ts carried `error`, the fold's only source for it was
+    // "the most recent fatal `error` event", and the live dispatcher never
+    // emits one for a skip (see `dispatchRun`'s dependenciesUnreachable loop
+    // in dispatcher.ts) — so a replayed skip's reason was always lost. This
+    // uses the dispatcher's own skip message shape as a realistic fixture.
+    const run = baseRun([assignment('a1', ['dep-1'])]);
+    const events: LoggedAgentEvent[] = [
+      carriedStatusEvent(100, 'a1', 'skipped', {
+        error: 'skipped: a dependency did not complete (dep-1)',
+        endedAt: 100,
+      }),
+    ];
+
+    const result = foldEvents(run, events, 999);
+    const a1 = result.assignments[0];
+    expect(a1?.status).toBe('skipped');
+    expect(a1?.error).toBe('skipped: a dependency did not complete (dep-1)');
+    expect(a1?.endedAt).toBe(100);
+  });
+
+  it('clears endedAt on the FR-M10 revision edge (endedAtCleared), instead of leaving the stale completion timestamp', () => {
+    // The exact bug this schema change exists to fix: without
+    // `endedAtCleared`, a revised assignment replayed as `briefing` sitting
+    // next to the `endedAt` from its EARLIER completion — appearing to have
+    // finished before it restarted.
+    const run = baseRun([assignment('a1')]);
+    const events: LoggedAgentEvent[] = [
+      statusEvent(50, 'a1', 'briefing'),
+      statusEvent(70, 'a1', 'working'),
+      statusEvent(90, 'a1', 'reporting'),
+      carriedStatusEvent(100, 'a1', 'done', { reportPath: 'reports/a1.md', endedAt: 100 }),
+      // FR-M10 re-dispatch: done -> briefing, endedAt explicitly cleared.
+      carriedStatusEvent(200, 'a1', 'briefing', { endedAtCleared: true }),
+    ];
+
+    const result = foldEvents(run, events, 999);
+    const a1 = result.assignments[0];
+    expect(a1?.status).toBe('briefing');
+    expect(a1?.endedAt).toBeUndefined();
+    // reportPath is untouched by the revision edge (the dispatcher never
+    // clears it — only endedAt) — still holding the value from the earlier
+    // completion until (in a real run) the second `done` overwrites it.
+    expect(a1?.reportPath).toBe('reports/a1.md');
+  });
+});
+
+/**
+ * The end-to-end property GAP 1 exists to establish: a real `dispatchRun`
+ * (packages/server) and this file's `foldEvents` must agree, field for
+ * field, on the `RunState` a run ends up in. Everything above tests the fold
+ * in isolation against hand-built events; this drives the actual
+ * orchestrator, reads back the actual persisted `.jsonl` log through the
+ * actual `RunStore` interface, and folds THAT — the same path a real replay
+ * client takes. See the import comment at the top of this file for why this
+ * lives here rather than in `dispatcher.test.ts`.
+ */
+describe('foldEvents replaying a real dispatchRun, field for field (NFR-7, FR-M10)', () => {
+  function makeAgent(name: string): AgentDef {
+    return {
+      name,
+      description: `${name} does things.`,
+      tools: ['Read', 'Write'],
+      category: '01-core-development',
+      filePath: `categories/01-core-development/${name}.md`,
+      systemPrompt: `You are ${name}.`,
+    };
+  }
+
+  const REGISTRY = buildRegistry([
+    makeAgent('alpha'),
+    makeAgent('beta'),
+    makeAgent('gamma'),
+    makeAgent('delta'),
+  ]);
+
+  /**
+   * One phase produces a lead assignment and a doomed one; the second phase
+   * has a dependent of the doomed one (forced to `skipped`) and a reviewer of
+   * the lead (which requests one FR-M10 revision) — covering all three
+   * scenarios the task calls out in a single run.
+   */
+  function plan(): RunPlan {
+    return RunPlanSchema.parse({
+      summary: 'Exercise a failure, a skip and a revision in one run.',
+      domain: 'software',
+      reportStyle: 'engineering',
+      phases: [
+        {
+          id: 'first',
+          name: 'First',
+          parallel: true,
+          assignments: [
+            {
+              id: 'lead',
+              agentName: 'alpha',
+              objective: 'Produce the lead work.',
+              deliverable: 'reports/01-lead.md',
+              dependsOn: [],
+            },
+            {
+              id: 'flaky',
+              agentName: 'beta',
+              objective: 'This one fails.',
+              deliverable: 'reports/02-flaky.md',
+              dependsOn: [],
+            },
+          ],
+        },
+        {
+          id: 'second',
+          name: 'Second',
+          parallel: true,
+          assignments: [
+            {
+              id: 'blocked',
+              agentName: 'gamma',
+              objective: 'Depends on the doomed one.',
+              deliverable: 'reports/03-blocked.md',
+              dependsOn: ['flaky'],
+            },
+            {
+              id: 'reviewer',
+              agentName: 'delta',
+              objective: 'Review the lead work.',
+              deliverable: 'reports/04-reviewer.md',
+              dependsOn: ['lead'],
+            },
+          ],
+        },
+      ],
+    });
+  }
+
+  it('reconstructs the same RunState dispatchRun produced, from the persisted event log alone', async () => {
+    const REVISION_MARKER = '[[REVIEW_VERDICT: REVISIONS_REQUESTED]]';
+    const store = new MemoryRunStore();
+    const provider = new ScriptedProvider({
+      byAssignment: {
+        flaky: { failWith: 'deliberate failure for this fixture' },
+        reviewer: { text: `Needs another pass.\n\n${REVISION_MARKER}` },
+      },
+      fallback: { text: 'Findings.' },
+    });
+    const builtPlan = plan();
+    const run: RunState = {
+      id: '20260810-120000-test',
+      task: 'Exercise the replay contract end to end.',
+      status: 'running',
+      createdAt: 1,
+      updatedAt: 1,
+      plan: builtPlan,
+      assignments: materialiseAssignments(builtPlan),
+    };
+    await store.saveRun(run);
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    // Sanity on the scenario shape before trusting the comparison below — if
+    // the fixture stops exercising a failure, a skip and a revision, the
+    // field-for-field assertions after it would be proving less than they
+    // claim to.
+    const before = (id: string): AssignmentState | undefined => run.assignments.find((a) => a.id === id);
+    expect(before('lead')?.status).toBe('done');
+    expect(before('lead')?.attempts).toBe(2); // the one FR-M10 revision
+    expect(before('flaky')?.status).toBe('failed');
+    expect(before('blocked')?.status).toBe('skipped');
+    expect(before('reviewer')?.status).toBe('done');
+
+    // Read back exactly what a replay client reads: every assignment's
+    // persisted `.jsonl` log, nothing else.
+    const allEvents: LoggedAgentEvent[] = [];
+    for (const assignment of run.assignments) {
+      allEvents.push(...(await store.readEvents(run.id, assignment.id)));
+    }
+    const lastTs = allEvents.reduce((max, e) => Math.max(max, e.ts), 0);
+    const replayed = foldEvents(run, allEvents, lastTs);
+
+    for (const real of run.assignments) {
+      const folded = replayed.assignments.find((a) => a.id === real.id);
+      expect(folded).toBeDefined();
+      if (folded === undefined) continue;
+
+      // Static plan fields: never touched by the fold, so trivially equal —
+      // asserted anyway so a future change that broke them would fail here,
+      // not just in a less specific test elsewhere.
+      expect(folded.phaseId).toBe(real.phaseId);
+      expect(folded.agentName).toBe(real.agentName);
+      expect(folded.deliverable).toBe(real.deliverable);
+      expect(folded.dependsOn).toEqual(real.dependsOn);
+
+      // The properties this task's fix is actually about: carried directly
+      // from the event, the exact value `setStatus` stamped onto the real
+      // `AssignmentState` — not a re-derived guess. Exact equality is
+      // meaningful here specifically because dispatcher.ts's `setStatus` now
+      // reuses the SAME patch value for both the in-memory assignment and the
+      // emitted event, rather than computing it twice.
+      expect(folded.status).toBe(real.status);
+      expect(folded.reportPath).toBe(real.reportPath);
+      expect(folded.error).toBe(real.error);
+      expect(folded.endedAt).toBe(real.endedAt);
+
+      // usage: matches for EVERY assignment, including the revised one.
+      //
+      // It did not, and the disagreement is how a real defect was found. The
+      // fold sums every `usage` event on disk, so for a revised assignment it
+      // reported the true combined spend across both attempts; the live
+      // orchestrator overwrote its per-assignment figure on the second
+      // dispatch and reported only the revision's tokens. `runTotalUsage`, and
+      // therefore NFR-5's whole cost display, is built from exactly that
+      // figure — so every run containing a revision silently understated its
+      // own bill. The dispatcher now seeds the accumulator from what the
+      // assignment has already spent, and the two agree.
+      //
+      // Worth keeping the shape of that discovery in mind: neither side was
+      // obviously wrong on its own. It took comparing two independent
+      // reconstructions of the same fact to see that one of them was.
+      expect(folded.usage).toEqual(real.usage);
+
+      // attempts: matches, but not because the fold reconstructs it — it
+      // can't (see useReplay.ts's file header: no AgentEvent carries a change
+      // in attempt count). It matches here only because `foldEvents`'s `base`
+      // *is* the post-dispatch `run` object, whose `attempts` the reset step
+      // deliberately leaves untouched. This is not evidence attempts survives
+      // replay from a bare event log; it is the documented, out-of-scope
+      // limitation, asserted so a regression in the reset step would still be
+      // caught.
+      expect(folded.attempts).toBe(real.attempts);
+
+      // startedAt: the one field that DIVERGES by design, and is expected to.
+      // It is not carried on the event (see the file header for why it never
+      // needed to be) — the fold reconstructs it from the status event's own
+      // `ts`, a timestamp taken by the store a moment after dispatcher.ts's
+      // own `Date.now()` call that stamped the real `startedAt`. Two
+      // independent clock reads a few asynchronous steps apart are not
+      // guaranteed to land on the same millisecond, so exact equality is not
+      // asserted — only that both are set, and close.
+      if (real.startedAt === undefined) {
+        expect(folded.startedAt).toBeUndefined();
+      } else {
+        expect(folded.startedAt).toBeDefined();
+        expect(Math.abs((folded.startedAt ?? 0) - real.startedAt)).toBeLessThan(1_000);
+      }
+    }
   });
 });
 

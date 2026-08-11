@@ -13,7 +13,7 @@ import {
 import type { Registry } from '../registry/index.js';
 import type { DispatchOptions } from '../orchestrator/dispatcher.js';
 import { executeRun, type ExecuteRunDeps } from '../orchestrator/runner.js';
-import { makeProvider as defaultMakeProvider } from '../providers/factory.js';
+import { makeProvider as defaultMakeProvider, type MakeProviderOptions } from '../providers/factory.js';
 import type { AgentProvider } from '../providers/types.js';
 import { ProviderUnavailableError } from '../providers/types.js';
 import type { RunStore } from '../store/types.js';
@@ -89,8 +89,20 @@ export interface SupervisorDeps {
   /**
    * Injected so tests can drive a run without the real scripted plan, and so
    * Phase 7's provider-per-run selection has an obvious seam.
+   *
+   * `options` reuses {@link MakeProviderOptions} rather than a shape invented
+   * here, so `startRun` and `scripts/run.ts` build the same kind of object for
+   * the same factory function. It is the fourth parameter, not folded into
+   * `id`/`task`/`knownAgentNames`, so the many existing test doubles that only
+   * care about those three keep compiling unchanged (JS silently drops extra
+   * call arguments a function does not declare).
    */
-  makeProvider?: (id: string, task: string, knownAgentNames: ReadonlySet<string>) => AgentProvider;
+  makeProvider?: (
+    id: string,
+    task: string,
+    knownAgentNames: ReadonlySet<string>,
+    options?: MakeProviderOptions,
+  ) => AgentProvider;
   /** Used when a request omits `provider`. */
   defaultProviderId?: string;
   /**
@@ -200,7 +212,16 @@ export class RunSupervisor {
       store: deps.store,
       makeProvider:
         deps.makeProvider ??
-        ((id, task, known) => defaultMakeProvider(id, task, known, { ...(deps.stepDelayMs === undefined ? {} : { stepDelayMs: deps.stepDelayMs }) })),
+        // `options` here is the per-*run* piece (currently just `maxCostUsd`,
+        // built by `startRun` from the request); `stepDelayMs` is the per-
+        // *server* piece from `deps`. Both land in one `MakeProviderOptions`
+        // object rather than `startRun` having to know about `stepDelayMs` or
+        // this closure having to know about `maxCostUsd`.
+        ((id, task, known, options) =>
+          defaultMakeProvider(id, task, known, {
+            ...(deps.stepDelayMs === undefined ? {} : { stepDelayMs: deps.stepDelayMs }),
+            ...options,
+          })),
       defaultProviderId: deps.defaultProviderId ?? 'scripted',
       onWarning: deps.onWarning ?? ((message, cause) => console.warn(`[supervisor] ${message}`, cause ?? '')),
       now: deps.now ?? Date.now,
@@ -292,7 +313,17 @@ export class RunSupervisor {
    */
   async startRun(request: CreateRunRequest): Promise<string> {
     const providerId = request.provider ?? this.deps.defaultProviderId;
-    const provider = this.deps.makeProvider(providerId, request.task, this.knownAgentNames);
+    // DEFECT FIXED (FR-M8): this call used to pass no options at all, so
+    // `request.maxCostUsd` — validated by `CreateRunRequestSchema`, shown in
+    // the settings panel — never reached `makeProvider`, and from there never
+    // reached the Claude Code adapter's `--max-budget-usd`. `timeoutMs` and
+    // `tokenBudget` already had a working path into `DispatchOptions` via
+    // `dispatchOptionsFor` below; this is the same treatment for the one
+    // field that was missing it.
+    const providerOptions: MakeProviderOptions = {
+      ...(request.maxCostUsd === undefined ? {} : { maxCostUsd: request.maxCostUsd }),
+    };
+    const provider = this.deps.makeProvider(providerId, request.task, this.knownAgentNames, providerOptions);
 
     const availability = await provider.isAvailable();
     if (!availability.ok) {

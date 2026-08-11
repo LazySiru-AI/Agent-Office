@@ -1,4 +1,4 @@
-import type { AgentEvent } from '@agent-office/shared';
+import { formatCostUsd, type AgentEvent, type Usage } from '@agent-office/shared';
 import {
   apiKeyVariable,
   resolveAgentModel,
@@ -7,6 +7,7 @@ import {
   type ApiProviderId,
 } from '../apiConfig.js';
 import { createSandboxedTools, type SandboxedTools } from '../apiTools.js';
+import { estimateRunCostUsd, priceFor } from '../pricing.js';
 import { readSse } from '../sse.js';
 import {
   ProviderUnavailableError,
@@ -110,6 +111,29 @@ export interface OpenAiProviderOptions {
   maxToolRounds?: number;
 
   /**
+   * Per-assignment spend ceiling in USD (FR-M8). The name and shape match
+   * `factory.ts`'s `MakeProviderOptions.maxCostUsd` and the Anthropic
+   * adapter's option of the same name — construction always goes through
+   * `makeProvider`, so all three must agree.
+   *
+   * Chat Completions has no server-side spend cap to hand this to (unlike the
+   * Claude Code CLI's `--max-budget-usd`), so it is enforced here: estimated
+   * spend is accumulated between rounds of the tool-call loop and the run
+   * stops once it would exceed the cap — see `run`. The cap is therefore
+   * checked between HTTP round trips, not mid-response, so the worst-case
+   * overshoot is bounded by one round's `max_tokens`
+   * (`config.maxOutputTokens`), not zero.
+   *
+   * `pricing.ts`'s `priceFor` returns `undefined` for *every* OpenAI and
+   * DeepSeek model id — no price for either vendor has ever been verified
+   * here (see this file's module doc). Setting a cap for this provider
+   * therefore always means `isAvailable()` refuses to run rather than run
+   * uncapped: a silently unenforced cap is precisely the defect this option
+   * exists to close, and a run that never starts costs nothing.
+   */
+  maxCostUsd?: number;
+
+  /**
    * Surface for adapter-level diagnostics that are not agent events —
    * a malformed SSE frame, a chunk that does not match the expected shape, a
    * tool call whose arguments were not valid JSON. Mirrors the Claude Code
@@ -148,6 +172,8 @@ interface ToolCallAccumulator {
 interface RoundResult {
   text: string;
   toolCalls: ToolCallAccumulator[];
+  /** This round's own token usage — mirrors the `usage` event already yielded; see `consumeStream`. */
+  usage: Usage | undefined;
 }
 
 export class OpenAiCompatibleProvider implements AgentProvider {
@@ -162,18 +188,34 @@ export class OpenAiCompatibleProvider implements AgentProvider {
 
   private resolveConfig(): ApiProviderConfig {
     return resolveApiConfig(this.id, {
-      env: this.options.deps?.env,
+      ...(this.options.deps?.env === undefined ? {} : { env: this.options.deps.env }),
       ...(this.options.model === undefined ? {} : { overrides: { model: this.options.model } }),
     });
   }
 
-  /** No network call — a missing key is read straight out of the environment. */
+  /**
+   * No network call — a missing key is read straight out of the environment.
+   * Whether a requested cost cap can even be enforced is the second thing
+   * checked here, for the same reason: it is knowable for free, and a run
+   * that starts anyway would be exactly the "reads as working until the bill
+   * arrives" defect `maxCostUsd` exists to close (see its own doc comment).
+   */
   async isAvailable(): Promise<ProviderAvailability> {
     const config = this.resolveConfig();
     if (config.apiKey === '') {
       return {
         ok: false,
         reason: `no API key configured for ${this.id} — set ${apiKeyVariable(this.id)}`,
+      };
+    }
+    if (this.options.maxCostUsd !== undefined && priceFor(config.model) === undefined) {
+      return {
+        ok: false,
+        reason:
+          `a cost cap of ${formatCostUsd(this.options.maxCostUsd)} was requested, but model "${config.model}" ` +
+          `has no known price for ${this.id} — no OpenAI or DeepSeek price has ever been verified in this ` +
+          'repo, so that cap cannot be enforced. Refusing to run uncapped rather than silently ignoring it; ' +
+          'drop the cost cap to run this model without one.',
       };
     }
     return { ok: true };
@@ -228,8 +270,33 @@ export class OpenAiCompatibleProvider implements AgentProvider {
       yield { assignmentId, t: 'error', fatal: false, message: modelChoice.unhonoured };
     }
 
+    // `isAvailable()` (above) already refused a cap paired with an unpriced
+    // provider-wide model, but `resolveAgentModel` can still pass a literal,
+    // unrecognised catalog id straight through unchanged for this specific
+    // assignment (see `apiConfig.ts`). Since no OpenAI or DeepSeek id is ever
+    // priced anyway (`pricing.ts`'s `priceFor`), this is in practice always
+    // true already whenever `maxCostUsd` is set — kept anyway so this
+    // adapter never silently disagrees with `isAvailable()` about which
+    // model it is actually about to run.
+    if (this.options.maxCostUsd !== undefined && priceFor(modelChoice.model) === undefined) {
+      yield {
+        assignmentId,
+        t: 'error',
+        fatal: true,
+        message:
+          `a cost cap of ${formatCostUsd(this.options.maxCostUsd)} was requested, but this assignment's model ` +
+          `"${modelChoice.model}" has no known price, so that cap cannot be enforced. Refusing to run it ` +
+          'uncapped rather than silently ignoring the cap.',
+      };
+      return;
+    }
+
     let sawText = false;
     let completedWithTextOnlyTurn = false;
+    // FR-M8's spend cap, estimated round by round as the tool-call loop
+    // runs. See `OpenAiProviderOptions.maxCostUsd` for what precision this
+    // can and cannot promise.
+    let spentUsd = 0;
 
     for (let round = 0; round < maxRounds; round += 1) {
       if (request.signal.aborted) return;
@@ -294,6 +361,37 @@ export class OpenAiCompatibleProvider implements AgentProvider {
       if (request.signal.aborted) return;
 
       if (roundResult.text.length > 0) sawText = true;
+
+      if (this.options.maxCostUsd !== undefined) {
+        // `priceFor(modelChoice.model)` was already confirmed defined above,
+        // so `estimateRunCostUsd` only returns `undefined` here if a round
+        // never reported usage at all (`roundResult.usage === undefined`) —
+        // `?? 0` treats that round as free rather than silently skipping the
+        // cap check altogether.
+        if (roundResult.usage !== undefined) {
+          spentUsd += estimateRunCostUsd(roundResult.usage, modelChoice.model) ?? 0;
+        }
+        if (spentUsd > this.options.maxCostUsd) {
+          // A round that has already returned has already been billed for —
+          // there is no clawing back tokens the model already generated.
+          // Stopping here bounds the *next* round rather than this one, so
+          // the overshoot can be as large as one round's `max_tokens`
+          // (`config.maxOutputTokens`), not exactly zero. FR-M8's "fails
+          // cleanly with partial results preserved" holds because every
+          // `text` event yielded so far has already reached the caller.
+          yield {
+            assignmentId,
+            t: 'error',
+            fatal: true,
+            message:
+              `stopping: estimated spend so far (${formatCostUsd(spentUsd)}) exceeds this assignment's cost ` +
+              `cap of ${formatCostUsd(this.options.maxCostUsd)}. This estimate is checked between tool-call ` +
+              `rounds, not mid-round, so the overshoot can be as large as one round's max_tokens ` +
+              `(${String(config.maxOutputTokens)} tokens) rather than exactly zero.`,
+          };
+          return;
+        }
+      }
 
       if (roundResult.toolCalls.length === 0) {
         completedWithTextOnlyTurn = true;
@@ -526,7 +624,11 @@ export class OpenAiCompatibleProvider implements AgentProvider {
         ? []
         : [...toolAccumulators.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
 
-    return { text: textByChoice.get(0) ?? '', toolCalls };
+    return {
+      text: textByChoice.get(0) ?? '',
+      toolCalls,
+      usage: !signal.aborted ? latestUsage : undefined,
+    };
   }
 }
 

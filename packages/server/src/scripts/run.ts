@@ -3,7 +3,7 @@ import { fileURLToPath } from 'node:url';
 import type { AgentEvent } from '@agent-office/shared';
 import { loadRegistry } from '../registry/index.js';
 import { loadDotEnv } from '../env.js';
-import { DEFAULT_PROVIDER, makeProvider } from '../providers/factory.js';
+import { DEFAULT_PROVIDER, makeProvider, type MakeProviderOptions } from '../providers/factory.js';
 import { FileRunStore, defaultRunsRoot } from '../store/fileStore.js';
 import { executeRun } from '../orchestrator/runner.js';
 
@@ -31,6 +31,7 @@ interface CliOptions {
   concurrency?: number;
   timeoutMs?: number;
   tokenBudget?: number;
+  maxCostUsd?: number;
   quiet: boolean;
 }
 
@@ -43,6 +44,7 @@ Options:
   --concurrency <n>    Parallel assignments per phase (default 3).
   --timeout <ms>       Per-assignment timeout (default 600000).
   --budget <tokens>    Total run token budget. Unlimited when omitted.
+  --max-cost <usd>     Per-assignment spend cap (FR-M8). Unlimited when omitted.
   --repo-root <path>   Subagent catalog root (default: this repository).
   --runs-root <path>   Where run artifacts are written.
   --quiet              Only print the final summary.
@@ -95,6 +97,11 @@ function parseArgs(argv: string[]): CliOptions {
   const concurrency = numeric('concurrency');
   const timeoutMs = numeric('timeout');
   const tokenBudget = numeric('budget');
+  // Same `numeric` helper, same "positive or reject" rule as every other flag
+  // here — the CLI path gets the same defence-in-depth `buildArgs` also
+  // applies (see `providers/claude-code/provider.ts`), rather than trusting
+  // this parser to be the only gate.
+  const maxCostUsd = numeric('max-cost');
 
   return {
     task,
@@ -105,6 +112,7 @@ function parseArgs(argv: string[]): CliOptions {
     ...(concurrency === undefined ? {} : { concurrency }),
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     ...(tokenBudget === undefined ? {} : { tokenBudget }),
+    ...(maxCostUsd === undefined ? {} : { maxCostUsd }),
   };
 }
 
@@ -119,7 +127,16 @@ async function main(): Promise<void> {
   const registry = await loadRegistry(options.repoRoot);
   const knownAgentNames = new Set(registry.agents.map((agent) => agent.name));
 
-  const provider = makeProvider(options.provider, options.task, knownAgentNames);
+  // DEFECT FIXED (FR-M8): this call used to pass no options, so `--max-cost`
+  // — the flag `agent.ts` (the single-agent debug probe) has always honoured
+  // — was accepted by `parseArgs` here and then dropped on the floor before
+  // reaching `makeProvider`. `--budget` and `--timeout` already flowed into
+  // `dispatch` below; this gives `--max-cost` the same real path, through the
+  // same `MakeProviderOptions` shape `supervisor.ts` uses for the HTTP side.
+  const providerOptions: MakeProviderOptions = {
+    ...(options.maxCostUsd === undefined ? {} : { maxCostUsd: options.maxCostUsd }),
+  };
+  const provider = makeProvider(options.provider, options.task, knownAgentNames, providerOptions);
 
   const availability = await provider.isAvailable();
   if (!availability.ok) {

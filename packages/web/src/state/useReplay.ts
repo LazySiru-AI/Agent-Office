@@ -100,19 +100,44 @@ import { fetchRun, fetchRunEvents } from '../api.js';
  *   the Manager's plan, not from execution, so they are carried through
  *   from the base `RunState` unchanged.
  * - **Derived from events (reset, then folded):** `status`, `usage`,
- *   `startedAt`, `endedAt`. Directly backed by `status`/`usage` events.
- * - **Derived, but only approximately (a real gap in the event contract):**
- *   `reportPath` and `error`. The dispatcher
- *   (`packages/server/src/orchestrator/dispatcher.ts`, `setStatus(ctx, id,
- *   'done', { reportPath: assignment.deliverable, endedAt })` /
- *   `failAssignment`) attaches these to the *persisted* `RunState` at the
- *   same moment it emits a `status` event, but the emitted event itself
- *   carries only `{ t: 'status', status }` — no patch. The event log
- *   therefore cannot reproduce these fields exactly; the fold approximates
- *   them (`reportPath = deliverable` on `done`, matching the dispatcher's
- *   own rule; `error` from the most recent fatal `error` event seen for
- *   that assignment, if any). This is genuine contract friction against
- *   `events.ts` — flagged in the task report, not fixed here (out of scope).
+ *   `startedAt`, `endedAt`, `reportPath`, `error`. Directly backed by
+ *   `status`/`usage` events.
+ * - **`endedAt`, `reportPath`, `error` — carried, not guessed.** The
+ *   dispatcher (`packages/server/src/orchestrator/dispatcher.ts`'s
+ *   `setStatus`) attaches these to the *persisted* `RunState` at the same
+ *   moment it emits the `status` event, and — this is the point of the
+ *   change that added this paragraph — the event now carries the same
+ *   values, not just `{ t: 'status', status }`. The fold below applies them
+ *   directly rather than inferring them, which used to be wrong in two
+ *   ways: a `reportPath` guessed as `deliverable` was stale the moment a
+ *   revised assignment's report path could ever legitimately differ, and an
+ *   `error` guessed from "the most recent fatal `error` event" was simply
+ *   absent for `skipped` (the dispatcher never emits a fatal `error` event
+ *   for a skip; the reason lives only in the `status` event's own patch).
+ *   `endedAt` additionally needed a THIRD signal, `endedAtCleared`, for
+ *   FR-M10's `done -> briefing` revision re-dispatch: that transition clears
+ *   `endedAt` (the work is not finished any more) without setting a new one,
+ *   and an absent `endedAt` on the event already means "unchanged" for every
+ *   other transition — so "cleared" needed a signal absence could not carry.
+ *   Without it, a revised assignment replayed as `briefing` beside the STALE
+ *   `endedAt` from its earlier completion, appearing to finish before it
+ *   restarted.
+ *   A log written before this change carries none of these three fields, and
+ *   must keep replaying exactly as it always did (NFR-7) — so the fold falls
+ *   back, for each field independently, to its old approximation whenever the
+ *   event does not carry it: `reportPath = deliverable` on `done`, `error`
+ *   from the last fatal `error` event seen, `endedAt` from the status event's
+ *   own `ts`. `startedAt` has no carried field at all, and does not need one:
+ *   dispatcher.ts stamps it from exactly one transition — the FIRST
+ *   `briefing` a given assignment ever reaches — so the fold sets it from the
+ *   `ts` of that specific event (not, as an earlier version of this code did,
+ *   "the first non-pending status of any kind": a dependency failure sends an
+ *   assignment straight `pending -> skipped` without ever briefing it, and
+ *   that broader rule fabricated a `startedAt` for a skip the live
+ *   orchestrator never stamped one for at all). What remains is only the gap
+ *   between two independent clock reads a few lines apart — the event's `ts`
+ *   versus the dispatcher's own `Date.now()` — not exact equality; see
+ *   `useReplay.test.ts`'s field-for-field replay test for that in practice.
  * - **Not covered by the event contract at all:** `attempts`. No
  *   `AgentEvent` variant records a change in dispatch attempt count, so it
  *   cannot be folded from anything. It is left at whatever the fetched base
@@ -200,30 +225,74 @@ function applyEvent(
         // a state with even less basis in reality than simply not moving:
         // there is no way to know what a corrupted entry's "real" status
         // would have been, only that this one isn't it. Dropping it also
-        // closes the specific bug this guards against: `endedAt` is set once
-        // on the first terminal status and (by design) never cleared, so
-        // applying an illegal regression away from a terminal status used to
-        // leave a non-terminal `status` sitting next to a stale `endedAt` — a
-        // combination the live system can never produce.
+        // closes the specific bug this guards against: `endedAt`, once set on
+        // a terminal status, is cleared again by exactly one *legal* edge
+        // (FR-M10's `done -> briefing`, via `endedAtCleared` below) and by
+        // nothing else — so applying an illegal regression away from a
+        // terminal status used to leave a non-terminal `status` sitting next
+        // to a stale `endedAt` that no legal transition would have produced —
+        // a combination the live system can never produce.
         break;
       }
-      if (assignment.startedAt === undefined && event.status !== 'pending') {
+      // `briefing` specifically, not merely "any non-pending status": that is
+      // the ONLY transition dispatcher.ts ever stamps `startedAt` from
+      // (`executeAssignment`'s opening `setStatus(..., 'briefing', {
+      // startedAt: assignment.startedAt ?? Date.now(), ... })`). A dependency
+      // failure sends an assignment straight `pending -> skipped` without
+      // ever briefing it (`dispatchRun`'s dependenciesUnreachable loop), and
+      // the live orchestrator leaves THAT assignment's `startedAt` unset —
+      // correctly, since it never started. The broader "any non-pending
+      // status" rule this replaced set a fabricated `startedAt` on exactly
+      // that skip, which nothing had walked and nothing had asserted against
+      // until `useReplay.test.ts`'s field-for-field replay test compared a
+      // real skip's `RunState` against its fold and caught the mismatch.
+      if (assignment.startedAt === undefined && event.status === 'briefing') {
         assignment.startedAt = ts;
       }
-      if (isAssignmentTerminal(event.status) && assignment.endedAt === undefined) {
+
+      // endedAt: `setStatus` never sets more than one of `endedAtCleared` /
+      // `endedAt` on the same event, so at most one of the first two branches
+      // fires; the third is the old-log fallback and must come last. FR-M10's
+      // `done -> briefing` revision is a real, legal transition that leaves
+      // `endedAt` set from the assignment's EARLIER completion (folding
+      // events in order, that first `done` already ran and set it) unless
+      // this event explicitly clears it — which is exactly what
+      // `endedAtCleared` is for; omitting `endedAt` here would be read as
+      // "unchanged" and leave the stale value in place.
+      if (event.endedAtCleared === true) {
+        assignment.endedAt = undefined;
+      } else if (event.endedAt !== undefined) {
+        // Carried explicitly — the exact value the dispatcher stamped onto
+        // `AssignmentState`, not the event's own `ts` (a separate clock read
+        // a few lines away in dispatcher.ts; see the file header).
+        assignment.endedAt = event.endedAt;
+      } else if (isAssignmentTerminal(event.status) && assignment.endedAt === undefined) {
+        // Old log, written before `endedAt` was carried — approximate from
+        // this event's own `ts`, as before (NFR-7: must still replay).
         assignment.endedAt = ts;
       }
-      if (event.status === 'done') {
-        // Approximation — see the file header's "derived, but only
-        // approximately" note. Mirrors dispatcher.ts's own rule.
+
+      if (event.reportPath !== undefined) {
+        assignment.reportPath = event.reportPath;
+      } else if (event.status === 'done') {
+        // Old log without the carried field — approximate as before, mirroring
+        // dispatcher.ts's own `deliverable` rule.
         assignment.reportPath = assignment.deliverable;
       }
-      if (event.status === 'failed') {
+
+      if (event.error !== undefined) {
+        assignment.error = event.error;
+      } else if (event.status === 'failed') {
+        // Old log without the carried field — approximate from the last fatal
+        // `error` event seen, as before. (Note this fallback never fires for
+        // `skipped`: the live dispatcher never emitted a fatal `error` event
+        // for a skip, carried field or not — a skip's reason lived only in
+        // this now-carried `error`, which is exactly the gap this change
+        // closes for `skipped` specifically.)
         const message = lastFatalErrorByAssignment.get(assignment.id);
         if (message !== undefined) assignment.error = message;
-        // else: the log carries no failure reason for this transition (see
-        // the file header) — left unset rather than guessed.
       }
+
       assignment.status = event.status;
       break;
     }

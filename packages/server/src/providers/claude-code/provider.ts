@@ -400,6 +400,28 @@ export function buildArgs(input: BuildArgsInput): string[] {
   }
 
   if (options.maxCostUsd !== undefined) {
+    // DEFECT FIXED (FR-M8): this used to forward whatever it was handed —
+    // `String(-5)`, `String(0)`, `String(Infinity)` — straight to the CLI.
+    // `CreateRunRequestSchema` and `scripts/run.ts`'s `numeric()` both reject
+    // those at the edge now, but `buildArgs` has other callers (`agent.ts`'s
+    // own guard rejects only non-finite values, and any future caller may
+    // have none at all), and this is the one place every path through this
+    // adapter funnels through before the flag is built. A cap of zero or
+    // less is not "no cap" and must not be read as one: it either fails the
+    // CLI in some undocumented way or — worse — is accepted as meaning
+    // "unlimited", which is the exact opposite of what a caller setting it
+    // asked for. Unlike `apiConfig.ts`'s `AGENT_OFFICE_MAX_OUTPUT_TOKENS`,
+    // which falls back to a sane default because a token ceiling has one,
+    // there is no safe default *spend cap* to substitute — "no cap" is not a
+    // fallback, it is the failure this option exists to prevent. So this
+    // refuses rather than silently drops the flag: a caller that got here
+    // with a bad value finds out immediately, instead of shipping a run that
+    // reads as budget-protected and is not.
+    if (!Number.isFinite(options.maxCostUsd) || options.maxCostUsd <= 0) {
+      throw new Error(
+        `maxCostUsd must be a positive, finite number of US dollars; got ${String(options.maxCostUsd)}`,
+      );
+    }
     args.push('--max-budget-usd', String(options.maxCostUsd));
   }
 

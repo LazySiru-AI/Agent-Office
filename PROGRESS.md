@@ -1227,16 +1227,85 @@ its list of statuses from the very map it was checking for completeness.
 - Six new test files for modules that had none, including `costModel.ts` and
   `deliverable.ts` — which is how defect 4 survived this long.
 
+---
+
+## Closing out the QA pass
+
+The five items the audit left open, finished in one more parallel wave. Three of
+them turned up something the audit had not.
+
+### The spend cap now exists end to end
+
+`maxCostUsd` reaches a run from the settings panel, through the wire contract
+and the supervisor, into every adapter. Two things came with it:
+
+- **`buildArgs` refuses an invalid cap** rather than forwarding it. `0`, a
+  negative, `NaN` and `Infinity` were all being passed to `--max-budget-usd`
+  verbatim. A cap you believe is set and is not is worse than no cap.
+- **The HTTP adapters refuse to start when a cap is set on an unpriced model.**
+  Every OpenAI and DeepSeek model is unpriced here, because no price for one has
+  ever been verified in this repo. Running uncapped while the user believes
+  otherwise is the defect; refusing costs nothing.
+
+The overshoot is stated rather than implied: the check runs between tool rounds,
+so it is bounded by one round's `max_tokens`, not by zero.
+
+### Three defects found by the closing work itself
+
+- **A revised assignment undercounted its own tokens.** `executeAssignment`
+  started its usage accumulator at zero on each dispatch and then *overwrote*
+  the persisted figure, so an FR-M10 revision reported only the second attempt's
+  spend. `runTotalUsage` — and therefore NFR-5's entire cost display — is built
+  on that number, so every run containing a revision understated its bill. It
+  surfaced only because the replay fold sums the `usage` events on disk and
+  disagreed with the live state. **Neither side looked wrong alone.** It took
+  comparing two independent reconstructions of the same fact.
+- **The status event now carries what changed with it.** `reportPath`, `error`
+  and `endedAt` were set alongside a transition and never put on the event, so
+  replay inferred them. `endedAtCleared` is explicit, because absence already
+  means "unchanged" everywhere else. A revised assignment used to replay as
+  `briefing` beside a stale `endedAt` — finishing before it restarted.
+- **`vi.setConfig({ testTimeout })` does not cover hooks.** A test that asserted
+  in milliseconds failed at exactly 10s in its *teardown*, where a still-running
+  supervisor is drained, reported against the test body. That is the third
+  instance of one pattern in this file's history: an explicit budget set in one
+  place while a tighter unstated one governed elsewhere.
+
+### `exactOptionalPropertyTypes` was false the whole time
+
+Comments across the codebase assert it is on and justify the
+`...(x === undefined ? {} : { x })` pattern by it. `tsconfig.base.json` has said
+`false` since the line was written. The pattern was right and simply unenforced.
+Turning it on cost sixteen fixes, and one of them was real: `useSettings` set a
+cleared budget to `{ runTokenBudget: undefined }` — present and undefined, not
+absent — which is precisely the distinction the flag exists to police.
+
+### Verified
+
+- **1,280 tests pass, 4 skipped, across three consecutive full runs**; all three
+  workspaces typecheck with the stricter flag on. Up from 1,006 at the start of
+  the audit.
+- A replay test now drives a real `dispatchRun` through a plan containing a
+  failure, a skip and a revision, folds the persisted log, and compares the
+  result to `run.json` field by field. Everything matches except `startedAt`,
+  which diverges by two clock reads and is asserted as close rather than equal.
+- New test files for `socket.ts`, `useRun.ts`, `api.ts`, `pricing.ts` and
+  `TaskForm`'s request builder.
+
 ### Known gaps carried forward
 
 - **The ReDoS gate is a static check and cannot be complete.** Alternatives that
   overlap without sharing a first character still get through. The only total
   fix is matching inside something killable.
-- **`maxCostUsd` is reachable only from the single-agent script.** The plumbing
-  through the wire contract and the supervisor is not done.
+- **`attempts` cannot survive replay from a bare event log** — no event carries
+  a change in attempt count. The field-for-field test asserts it only because
+  the fold's base is the post-dispatch run.
 - Two reviewers were cut short by a session limit and resumed; the test-suite
   reviewer did not reach requirement-to-test mapping or a shuffled-order run.
-- `socket.ts`, `useRun.ts` and `api.ts` still have no tests.
 - A cancelled assignment is recorded as `failed`, because `status.ts` offers no
   terminal state that means "stopped". An imperfect fit, documented where it is
   made.
+- The two HTTP adapters yield `tool` events at different points relative to a
+  round completing, so a spend cap tripping on a round with tool calls leaves
+  Anthropic's stream showing that round's tool event and OpenAI's not.
+  Pre-existing; only visible now that a cap can trip.

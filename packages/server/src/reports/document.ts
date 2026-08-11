@@ -1,5 +1,6 @@
 import {
   REPORT_THEME_IDS,
+  formatCostUsd,
   type ReportDocument,
   type ReportThemeId,
   type RosterEntry,
@@ -78,12 +79,16 @@ function renderRoster(roster: readonly RosterEntry[]): string {
 }
 
 function renderCover(doc: ReportDocument): string {
-  const cost =
-    doc.costUsd === undefined
-      ? '—'
-      : doc.costUsd === 0
-        ? '$0.00'
-        : `$${doc.costUsd.toFixed(4)}`;
+  // `formatCostUsd` (shared/src/wire.ts) is what the live UI renders cost
+  // with — two decimals above a cent, four below, `$0.00` for a genuine zero,
+  // an em dash for "unknown". This used to be reimplemented here with an
+  // unconditional `toFixed(4)`, so a real run's cover page read
+  // `$123.4560` while the same run's UI read `$123.46` — the same number,
+  // disagreeing with itself, which looks like a bug in one of the two
+  // renderers when it was really two independent formatters drifting apart.
+  // Calling the shared function instead of matching it by hand is what makes
+  // that drift structurally impossible rather than merely fixed for now.
+  const cost = formatCostUsd(doc.costUsd);
 
   return [
     '<section class="cover">',

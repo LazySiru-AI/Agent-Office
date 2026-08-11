@@ -110,10 +110,24 @@ export function App(): JSX.Element {
   return (
     <div className="app-shell">
       <aside className="sidebar">
+        {/* Every run setting is forwarded, not just the two the form used to
+            display. The panel had fields for an assignment timeout, a token
+            budget and a cost budget; the form built its request from `provider`
+            and `concurrency` alone, so those three were collected from the user
+            and silently discarded. A control that does nothing is worse than a
+            missing one — the cost budget in particular read as protection
+            nobody had. */}
         <TaskForm
           onStart={office.startRun}
           provider={settings.settings.provider}
           concurrency={settings.settings.concurrency}
+          assignmentTimeoutMs={settings.settings.assignmentTimeoutMs}
+          {...(settings.settings.runTokenBudget === undefined
+            ? {}
+            : { runTokenBudget: settings.settings.runTokenBudget })}
+          {...(settings.settings.maxCostUsd === undefined
+            ? {}
+            : { maxCostUsd: settings.settings.maxCostUsd })}
           settingsInvalid={Object.keys(settings.errors).length > 0 || providerUnavailable}
           {...(providerUnavailable
             ? { blockedReason: selectedProvider?.reason ?? `${settings.settings.provider} is unavailable` }

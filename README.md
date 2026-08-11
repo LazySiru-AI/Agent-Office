@@ -25,7 +25,7 @@ rather than reasoned — including a review loop that could crash a whole run, a
 run's own state file, and a cost display that had never worked for a real
 provider. All are fixed; `PROGRESS.md` has the full account.
 
-1,178 tests pass, typecheck is
+1,280 tests pass, typecheck is
 clean, the registry indexes 156 agents, and you can drive a run
 from the browser — watch the team work in a pixel office, click a character to inspect
 it, refresh mid-run without losing it, cancel it, read the reports in-app,
@@ -48,6 +48,7 @@ installed on the machine, fully offline.
 | 7 | Anthropic / OpenAI / DeepSeek adapters | built (unverified — no key) |
 | 8 | Dark neon terminal interface | done |
 | — | QA pass: five reviewers, 29 defects, all fixed | done |
+| — | Closing out: spend cap end to end, replay fidelity | done |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
 has been driven against the real CLI — real spawn, real argv, real stream-json —

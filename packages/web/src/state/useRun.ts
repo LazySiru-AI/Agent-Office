@@ -5,6 +5,7 @@ import {
   type LoggedAgentEvent,
   type RunState,
   type RunSummary,
+  type ServerMessage,
 } from '@agent-office/shared';
 import { cancelRun, createRun, fetchRuns } from '../api.js';
 import { RunSocket, type SocketStatus } from './socket.js';
@@ -20,18 +21,118 @@ import { RunSocket, type SocketStatus } from './socket.js';
  * a partial update: `snapshot` and `state` are full replacements of
  * `RunState`, so this hook always assigns wholesale on those. Only `event`
  * and `log` are append-only deltas.
+ *
+ * ## Why the socket handler is one pure fold, not six `useState` setters
+ *
+ * `applyServerMessage` below is the entire transition table as a single pure
+ * function — `(state, message, selectedRunId) -> state` — rather than a
+ * `useEffect` closure calling `setRun`/`setEvents`/`setLogs`/`setLive`/
+ * `setTruncated` individually. That mirrors `useReplay.ts`'s `foldEvents` and
+ * `useSettings.ts`'s `parseStoredSettings`/`validateSettings`: this package's
+ * web tests run under plain Node with no DOM, so the only way to exercise
+ * "does a snapshot correctly replace live-accumulated events" or "does a
+ * truncated snapshot get reflected" is to pull the transition logic out where
+ * a test can call it directly (`useRun.test.ts`), not only indirectly by
+ * rendering the hook and driving a real socket through it.
  */
 
 const SELECTED_RUN_STORAGE_KEY = 'agent-office.selectedRunId';
 /** Soft client-side caps, independent of the server's own ring buffers
  * (`EVENT_BUFFER_LIMIT` / `LOG_BUFFER_LIMIT`), so a very long-lived tab
  * watching a very chatty run doesn't grow its arrays without bound. */
-const MAX_CLIENT_EVENTS = 4_000;
-const MAX_CLIENT_LOGS = 1_000;
+export const MAX_CLIENT_EVENTS = 4_000;
+export const MAX_CLIENT_LOGS = 1_000;
 
 export interface LogLine {
   ts: number;
   line: string;
+}
+
+/** Everything the socket's messages feed, folded into one value so a single
+ * pure function (`applyServerMessage`) can own every transition. */
+export interface RunSessionState {
+  run: RunState | undefined;
+  events: LoggedAgentEvent[];
+  logs: LogLine[];
+  live: boolean;
+  truncated: boolean;
+  runs: RunSummary[];
+  socketError: string | undefined;
+}
+
+export const INITIAL_SESSION_STATE: RunSessionState = {
+  run: undefined,
+  events: [],
+  logs: [],
+  live: false,
+  truncated: false,
+  runs: [],
+  socketError: undefined,
+};
+
+/**
+ * The one place every inbound `ServerMessage` becomes the next
+ * `RunSessionState`. `selectedRunId` is passed in rather than read off
+ * `state` because the hook tracks it in a ref (`selectedRunIdRef`), not
+ * state — a ref so that changing the selection does not recreate the
+ * socket's effect (see `useAgentOffice` below).
+ *
+ * `snapshot` and `state` are full replacements per `wire.ts` §2's contract
+ * ("clients therefore never need to merge a partial update"); `event` and
+ * `log` are the only append-only deltas. Getting that distinction backwards
+ * — e.g. appending a snapshot's events onto whatever had already
+ * accumulated from live `event` messages — would silently duplicate history
+ * on every reconnect, which is exactly what NFR-2 promises will not happen.
+ */
+export function applyServerMessage(
+  state: RunSessionState,
+  msg: ServerMessage,
+  selectedRunId: string | undefined,
+): RunSessionState {
+  switch (msg.t) {
+    case 'hello':
+      return state; // liveRunIds isn't surfaced yet — the run list already conveys this
+    case 'snapshot':
+      if (msg.run.id !== selectedRunId) return state; // stale reply for a since-abandoned subscription
+      return {
+        ...state,
+        run: msg.run,
+        events: msg.events,
+        // The snapshot carries no log-line history (wire.ts only buffers it
+        // separately for live push); the log pane necessarily starts empty
+        // on reattach and fills from here on.
+        logs: [],
+        live: msg.live,
+        truncated: msg.truncated,
+      };
+    case 'state':
+      if (msg.run.id !== selectedRunId) return state;
+      return { ...state, run: msg.run, live: !isRunTerminal(msg.run.status) };
+    case 'event':
+      if (msg.runId !== selectedRunId) return state;
+      return { ...state, events: appendCapped(state.events, msg.event, MAX_CLIENT_EVENTS) };
+    case 'log':
+      if (msg.runId !== selectedRunId) return state;
+      return { ...state, logs: appendCapped(state.logs, { ts: msg.ts, line: msg.line }, MAX_CLIENT_LOGS) };
+    case 'runs':
+      return { ...state, runs: msg.runs };
+    case 'error':
+      if (msg.runId !== undefined && msg.runId !== selectedRunId) return state;
+      return { ...state, socketError: msg.message };
+    case 'pong':
+      return state;
+  }
+}
+
+/**
+ * What selecting a different run resets. `runs` (the sidebar's run list) is
+ * not scoped to any one selection, so it survives; everything else describes
+ * the previously-selected run and must not leak into the newly-selected
+ * one's view (e.g. showing the old run's events for a heartbeat before the
+ * new snapshot arrives).
+ */
+export function selectionReset(state: RunSessionState): RunSessionState {
+  return { ...INITIAL_SESSION_STATE, runs: state.runs };
 }
 
 function readStoredRunId(): string | undefined {
@@ -80,18 +181,12 @@ export interface UseAgentOfficeResult {
 }
 
 export function useAgentOffice(): UseAgentOfficeResult {
-  const [runs, setRuns] = useState<RunSummary[]>([]);
+  const [session, setSession] = useState<RunSessionState>(INITIAL_SESSION_STATE);
   const [runsError, setRunsError] = useState<string | undefined>(undefined);
 
   const [selectedRunId, setSelectedRunId] = useState<string | undefined>(readStoredRunId);
-  const [run, setRun] = useState<RunState | undefined>(undefined);
-  const [events, setEvents] = useState<LoggedAgentEvent[]>([]);
-  const [logs, setLogs] = useState<LogLine[]>([]);
-  const [live, setLive] = useState(false);
-  const [truncated, setTruncated] = useState(false);
 
   const [socketStatus, setSocketStatus] = useState<SocketStatus>('connecting');
-  const [socketError, setSocketError] = useState<string | undefined>(undefined);
 
   const socketRef = useRef<RunSocket | undefined>(undefined);
   // Mirrors `selectedRunId` inside the message handler without re-creating the
@@ -107,43 +202,7 @@ export function useAgentOffice(): UseAgentOfficeResult {
         console.warn('discarding malformed server message', error);
       },
       onMessage: (msg) => {
-        switch (msg.t) {
-          case 'hello':
-            break; // liveRunIds isn't surfaced yet — the run list already conveys this
-          case 'snapshot':
-            if (msg.run.id !== selectedRunIdRef.current) break; // stale reply for a since-abandoned subscription
-            setRun(msg.run);
-            setEvents(msg.events);
-            // The snapshot carries no log-line history (wire.ts only buffers
-            // it separately for live push); the log pane necessarily starts
-            // empty on reattach and fills from here on.
-            setLogs([]);
-            setLive(msg.live);
-            setTruncated(msg.truncated);
-            break;
-          case 'state':
-            if (msg.run.id !== selectedRunIdRef.current) break;
-            setRun(msg.run);
-            setLive(!isRunTerminal(msg.run.status));
-            break;
-          case 'event':
-            if (msg.runId !== selectedRunIdRef.current) break;
-            setEvents((prev) => appendCapped(prev, msg.event, MAX_CLIENT_EVENTS));
-            break;
-          case 'log':
-            if (msg.runId !== selectedRunIdRef.current) break;
-            setLogs((prev) => appendCapped(prev, { ts: msg.ts, line: msg.line }, MAX_CLIENT_LOGS));
-            break;
-          case 'runs':
-            setRuns(msg.runs);
-            break;
-          case 'error':
-            if (msg.runId !== undefined && msg.runId !== selectedRunIdRef.current) break;
-            setSocketError(msg.message);
-            break;
-          case 'pong':
-            break;
-        }
+        setSession((prev) => applyServerMessage(prev, msg, selectedRunIdRef.current));
       },
     });
     socketRef.current = socket;
@@ -165,7 +224,7 @@ export function useAgentOffice(): UseAgentOfficeResult {
 
   useEffect(() => {
     fetchRuns()
-      .then(setRuns)
+      .then((runs) => setSession((prev) => ({ ...prev, runs })))
       .catch((error: unknown) => setRunsError(describeError(error)));
   }, []);
 
@@ -174,12 +233,7 @@ export function useAgentOffice(): UseAgentOfficeResult {
     socketRef.current?.subscribe(runId);
     setSelectedRunId(runId);
     writeStoredRunId(runId);
-    setRun(undefined);
-    setEvents([]);
-    setLogs([]);
-    setLive(false);
-    setTruncated(false);
-    setSocketError(undefined);
+    setSession(selectionReset);
   }, []);
 
   const startRun = useCallback(async (req: CreateRunRequest): Promise<string> => {
@@ -188,7 +242,7 @@ export function useAgentOffice(): UseAgentOfficeResult {
     // Best-effort refresh in case the server's own 'runs' push hasn't arrived
     // yet by the time this resolves.
     fetchRuns()
-      .then(setRuns)
+      .then((runs) => setSession((prev) => ({ ...prev, runs })))
       .catch(() => undefined);
     return runId;
   }, [selectRun]);
@@ -200,19 +254,19 @@ export function useAgentOffice(): UseAgentOfficeResult {
 
   // Read off the run itself, so it is correct for any run — including ones
   // this tab never started and ones from a previous browser session.
-  const selectedRunProvider = run?.provider;
+  const selectedRunProvider = session.run?.provider;
 
   return {
-    runs,
+    runs: session.runs,
     runsError,
     selectedRunId,
-    run,
-    events,
-    logs,
-    live,
-    truncated,
+    run: session.run,
+    events: session.events,
+    logs: session.logs,
+    live: session.live,
+    truncated: session.truncated,
     socketStatus,
-    socketError,
+    socketError: session.socketError,
     selectedRunProvider,
     selectRun,
     startRun,

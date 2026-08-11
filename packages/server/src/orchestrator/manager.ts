@@ -664,7 +664,7 @@ export async function planRun(deps: PlanRunDeps): Promise<RunPlan> {
   const log = deps.logger ?? defaultLogger;
   const systemPrompt = buildManagerSystemPrompt(registry, { mode: 'planning' });
   const basePrompt = buildPlanningPrompt(registry, task, {
-    candidateAgents: deps.candidateAgents,
+    ...(deps.candidateAgents === undefined ? {} : { candidateAgents: deps.candidateAgents }),
   });
 
   // FR-M3 checks against the *whole* registry, not just the prompt roster: an
@@ -688,7 +688,7 @@ export async function planRun(deps: PlanRunDeps): Promise<RunPlan> {
       allowedTools: deps.allowedTools ?? [],
       workspaceDir: deps.workspaceDir ?? process.cwd(),
       signal,
-      onEvent: deps.onEvent,
+      ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
     });
     lastRaw = raw;
 
@@ -936,8 +936,8 @@ export async function synthesiseReport(deps: SynthesiseReportDeps): Promise<stri
 
   const systemPrompt = buildManagerSystemPrompt(registry, { mode: 'synthesis' });
   const prompt = buildSynthesisPrompt(plan, reports, {
-    task: deps.task,
-    maxReportChars: deps.maxReportChars,
+    ...(deps.task === undefined ? {} : { task: deps.task }),
+    ...(deps.maxReportChars === undefined ? {} : { maxReportChars: deps.maxReportChars }),
   });
 
   const estimated = estimateTokens(systemPrompt) + estimateTokens(prompt);
@@ -956,7 +956,7 @@ export async function synthesiseReport(deps: SynthesiseReportDeps): Promise<stri
     allowedTools: deps.allowedTools ?? [],
     workspaceDir: deps.workspaceDir ?? process.cwd(),
     signal,
-    onEvent: deps.onEvent,
+    ...(deps.onEvent === undefined ? {} : { onEvent: deps.onEvent }),
   });
 
   if (signal.aborted) throw new ManagerAbortedError('synthesis');

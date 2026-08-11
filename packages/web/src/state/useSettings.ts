@@ -241,19 +241,41 @@ function withSetting<K extends keyof RunSettings>(settings: RunSettings, key: K,
       return { ...settings, concurrency: value as RunSettings['concurrency'] };
     case 'assignmentTimeoutMs':
       return { ...settings, assignmentTimeoutMs: value as RunSettings['assignmentTimeoutMs'] };
-    case 'runTokenBudget': {
-      const budget = value as RunSettings['runTokenBudget'];
-      return { ...settings, ...(budget === undefined ? { runTokenBudget: undefined } : { runTokenBudget: budget }) };
-    }
-    case 'maxCostUsd': {
-      const cost = value as RunSettings['maxCostUsd'];
-      return { ...settings, ...(cost === undefined ? { maxCostUsd: undefined } : { maxCostUsd: cost }) };
-    }
+    case 'runTokenBudget':
+      return withOptionalNumber(settings, 'runTokenBudget', value as RunSettings['runTokenBudget']);
+    case 'maxCostUsd':
+      return withOptionalNumber(settings, 'maxCostUsd', value as RunSettings['maxCostUsd']);
     default: {
       const exhaustive: never = key;
       throw new Error(`unhandled RunSettings key: ${JSON.stringify(exhaustive)}`);
     }
   }
+}
+
+/**
+ * Set an optional budget, or REMOVE it when the user clears the field.
+ *
+ * The distinction is the whole point and it used to be written as
+ * `{ runTokenBudget: undefined }`, which sets the key to `undefined` rather
+ * than removing it. Those are different objects: the first serialises to
+ * `{"runTokenBudget": null}`-shaped JSON in some paths and, more importantly,
+ * survives an `in` check and a spread as a present-but-empty field. With
+ * `exactOptionalPropertyTypes` now genuinely enabled (it was declared `false`
+ * while comments across the codebase asserted otherwise), the compiler says so.
+ *
+ * `delete` on an optional property is the honest expression of "this budget is
+ * not set", and it is what makes an emptied field mean "no limit" everywhere
+ * downstream rather than "a limit of nothing".
+ */
+function withOptionalNumber(
+  settings: RunSettings,
+  key: 'runTokenBudget' | 'maxCostUsd',
+  value: number | undefined,
+): RunSettings {
+  const next = { ...settings };
+  delete next[key];
+  if (value !== undefined) next[key] = value;
+  return next;
 }
 
 /**

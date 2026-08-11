@@ -79,6 +79,19 @@ export const CreateRunRequestSchema = z.object({
   concurrency: z.number().int().positive().max(12).optional(),
   timeoutMs: z.number().int().positive().optional(),
   tokenBudget: z.number().int().positive().optional(),
+  /**
+   * Per-assignment spend cap in USD (FR-M8), forwarded to the Claude Code
+   * adapter's `--max-budget-usd`. `timeoutMs` and `tokenBudget` above were
+   * already wired from this schema through the supervisor to the dispatcher;
+   * this field was the omission — the web settings panel has always sent it,
+   * but the schema dropped it before it reached anything that could act on
+   * it, so it was documented and tested in isolation while every real run
+   * ignored it. `.positive()` and `.finite()` both matter: zero or a negative
+   * cap must not reach the CLI reading as "protected" when it isn't, and
+   * `.finite()` rules out `NaN`/`Infinity` from a hand-built or non-JSON
+   * request body.
+   */
+  maxCostUsd: z.number().positive().finite().optional(),
 });
 
 export type CreateRunRequest = z.infer<typeof CreateRunRequestSchema>;

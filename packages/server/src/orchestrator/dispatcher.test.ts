@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { RunPlanSchema, type AgentDef, type RunPlan, type RunState } from '@agent-office/shared';
+import {
+  RunPlanSchema,
+  type AgentDef,
+  type AgentEvent,
+  type RunPlan,
+  type RunState,
+} from '@agent-office/shared';
 import { buildRegistry } from '../registry/index.js';
 import { ScriptedProvider, type ScriptedProviderOptions } from '../providers/scripted.js';
 import { MemoryRunStore } from '../store/memoryStore.js';
@@ -777,6 +783,40 @@ describe('dispatchRun — the review loop (FR-M10)', () => {
     expect(revisionBrief).not.toContain('REVIEW_VERDICT');
   });
 
+  it('adds a revision\'s tokens to what the first attempt already spent, rather than replacing them', async () => {
+    // A revised assignment ran the provider twice and paid twice. The local
+    // usage total used to start at zero on each execution and then overwrite
+    // the persisted figure, so `run.json` reported only the revision's tokens —
+    // an undercount of a real bill (NFR-5), and one that only showed up because
+    // the replay fold sums the `usage` events on disk and disagreed.
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: `Needs work.\n\n${REVISION_MARKER}`, usage: { inputTokens: 1, outputTokens: 1 } },
+      },
+      fallback: { text: 'Findings.', usage: { inputTokens: 10, outputTokens: 5 } },
+    });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const target = run.assignments.find((a) => a.id === 'a');
+    expect(target?.attempts).toBe(2);
+    // Two dispatches at 10/5 each. Not 10/5.
+    expect(target?.usage).toEqual({ inputTokens: 20, outputTokens: 10 });
+
+    // And an assignment that ran once is unaffected — the seeding must not
+    // double-count a first attempt against itself.
+    expect(run.assignments.find((a) => a.id === 'b')?.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+    });
+  });
+
   it('stops at one revision even if the reviewer asks again', async () => {
     // The reviewer only runs once in this plan, so a second request cannot
     // arise from it. This drives the budget directly instead: `a` starts having
@@ -879,6 +919,109 @@ describe('dispatchRun — the review loop (FR-M10)', () => {
     // for a marker nothing would ever read.
     expect(briefFor('a')).not.toContain('Verdict marker');
     expect(briefFor('b')).not.toContain('Verdict marker');
+  });
+});
+
+describe('dispatchRun — the status event carries what the status change actually carries (NFR-7)', () => {
+  // GAP 1: the `status` event used to be `{ t: 'status', status }` only, so a
+  // replay of the log could not reproduce `reportPath`, `error` or `endedAt`
+  // exactly and had to guess. These tests pin what `setStatus` now puts on the
+  // event itself, directly against the field it wrote onto `AssignmentState` a
+  // moment earlier — proving the two are the SAME value, not independently
+  // computed approximations of each other. `useReplay.test.ts`'s
+  // "replaying a real dispatchRun" test then proves the far side of this: that
+  // `foldEvents` actually applies what is pinned here correctly.
+  const REVISION_MARKER = '[[REVIEW_VERDICT: REVISIONS_REQUESTED]]';
+
+  function statusEventsFor(store: MemoryRunStore, runId: string, assignmentId: string) {
+    return store
+      .readEvents(runId, assignmentId)
+      .then((events) =>
+        events.map((e) => e.event).filter((event): event is Extract<AgentEvent, { t: 'status' }> => event.t === 'status'),
+      );
+  }
+
+  it('carries reportPath and endedAt on the done event, matching the assignment exactly', async () => {
+    const { store, provider, run } = await setup({
+      fallback: { text: 'Findings.', usage: { inputTokens: 1, outputTokens: 1 } },
+    });
+
+    await dispatchRun({ run, registry: REGISTRY, provider, store, signal: new AbortController().signal });
+
+    const a = run.assignments.find((assignment) => assignment.id === 'a');
+    if (a === undefined) throw new Error('fixture did not produce assignment "a"');
+
+    const statuses = await statusEventsFor(store, run.id, 'a');
+    const done = statuses.find((event) => event.status === 'done');
+    expect(done?.reportPath).toBe(a.reportPath);
+    expect(done?.endedAt).toBe(a.endedAt);
+    // Not an approximation that happens to match — the same value.
+    expect(done?.reportPath).toBe('reports/01-alpha.md');
+    expect(done?.endedAt).toBeTypeOf('number');
+  });
+
+  it('carries error and endedAt on the skipped event, matching the assignment exactly', async () => {
+    const { store, provider, run } = await setup({
+      byAssignment: { a: { failWith: 'boom' } },
+      fallback: { text: 'ok' },
+    });
+
+    await dispatchRun({ run, registry: REGISTRY, provider, store, signal: new AbortController().signal });
+
+    const c = run.assignments.find((assignment) => assignment.id === 'c');
+    if (c === undefined) throw new Error('fixture did not produce assignment "c"');
+    expect(c.status).toBe('skipped'); // sanity: c depends on a, which failed
+
+    const statuses = await statusEventsFor(store, run.id, 'c');
+    const skipped = statuses.find((event) => event.status === 'skipped');
+    expect(skipped?.error).toBe(c.error);
+    expect(skipped?.endedAt).toBe(c.endedAt);
+    expect(skipped?.error).toContain('a dependency did not complete');
+  });
+
+  it('carries error and endedAt on the failed event, matching the assignment exactly', async () => {
+    const { store, provider, run } = await setup({
+      byAssignment: { a: { failWith: 'model refused' } },
+      fallback: { text: 'ok' },
+    });
+
+    await dispatchRun({ run, registry: REGISTRY, provider, store, signal: new AbortController().signal });
+
+    const a = run.assignments.find((assignment) => assignment.id === 'a');
+    if (a === undefined) throw new Error('fixture did not produce assignment "a"');
+
+    const statuses = await statusEventsFor(store, run.id, 'a');
+    const failed = statuses.find((event) => event.status === 'failed');
+    expect(failed?.error).toBe(a.error);
+    expect(failed?.endedAt).toBe(a.endedAt);
+  });
+
+  it('marks the FR-M10 revision re-dispatch\'s briefing event endedAtCleared, and carries no stale endedAt', async () => {
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: `Needs work.\n\n${REVISION_MARKER}` },
+      },
+      fallback: { text: 'Findings.' },
+    });
+
+    await dispatchRun({ run, registry: REGISTRY, provider, store, signal: new AbortController().signal });
+
+    const target = run.assignments.find((assignment) => assignment.id === 'a');
+    expect(target?.attempts).toBe(2); // sanity: the revision actually happened
+
+    const statuses = await statusEventsFor(store, run.id, 'a');
+    const briefings = statuses.filter((event) => event.status === 'briefing');
+    // Two dispatches of "a": the original and the FR-M10 revision.
+    expect(briefings).toHaveLength(2);
+
+    // The first briefing (the original dispatch) had nothing to clear.
+    expect(briefings[0]?.endedAtCleared).toBeUndefined();
+    // The second (the revision re-dispatch) explicitly clears the stale
+    // `endedAt` from the first `done` — this is the field the fold reads to
+    // avoid showing a revised assignment as having finished before it
+    // restarted.
+    expect(briefings[1]?.endedAtCleared).toBe(true);
+    expect(briefings[1]?.endedAt).toBeUndefined();
   });
 });
 

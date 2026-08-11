@@ -256,7 +256,11 @@ export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
   };
 }
 
-async function executeAssignment(ctx: DispatchContext, assignmentId: string): Promise<void> {
+async function executeAssignment(
+  ctx: DispatchContext,
+  assignmentId: string,
+  opts: { revision?: boolean } = {},
+): Promise<void> {
   const assignment = findAssignment(ctx.run, assignmentId);
   if (assignment === undefined) return;
 
@@ -271,6 +275,15 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
   await setStatus(ctx, assignmentId, 'briefing', {
     startedAt: assignment.startedAt ?? Date.now(),
     attempts: assignment.attempts + 1,
+    // FR-M10 revision re-dispatch: the assignment has not ended any more, so
+    // its stale `endedAt` from the earlier completion must be cleared — both
+    // in memory (this `Object.assign`, inside `setStatus`) and in the event
+    // log (`endedAtCleared`, which `setStatus` derives from the explicit
+    // `endedAt: undefined` key below — see events.ts for why an absent key
+    // cannot carry this meaning). Folding the clear into this call, rather
+    // than a separate untracked patch before it, is what gets it into the log
+    // at all: only `setStatus` emits an event.
+    ...(opts.revision === true ? { endedAt: undefined } : {}),
   });
 
   // Consumed, not merely read: a critique is for one re-dispatch. Leaving it in
@@ -305,7 +318,17 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
 
   let text = '';
   let fatalError: string | undefined;
-  const usage = { ...EMPTY_USAGE };
+  // Seeded from what this assignment has already spent, not from zero.
+  //
+  // An assignment can execute twice: FR-M10 sends one back for a single
+  // revision, and that second run is a second provider call costing real money.
+  // This local total used to start empty and then OVERWRITE the persisted
+  // figure, so a revised assignment reported only its revision's tokens and the
+  // first attempt's spend vanished from `run.json` — while the replay fold,
+  // which sums the `usage` events on disk, reported the true total. The two
+  // disagreeing is what made it visible; the undercount is what made it matter
+  // (NFR-5). `attempts` is already incremented for exactly this case.
+  const usage = { ...assignment.usage };
 
   // Resolved per assignment, not hoisted: a run may legitimately field two
   // providers, and caching one here would silently apply the first
@@ -522,13 +545,15 @@ async function applyReviewVerdict(
       }),
     );
 
-    // `endedAt` is cleared first because the assignment has not ended any more —
-    // leaving the old timestamp would make the replay show it finishing before it
-    // restarted. Then it goes back through `executeAssignment` unchanged: that
-    // function opens with `done -> briefing`, which `shared/src/status.ts` permits
-    // for exactly this, and it will pick the critique out of the map itself.
-    await patchAssignment(ctx, targetId, { endedAt: undefined });
-    await executeAssignment(ctx, targetId);
+    // Goes back through `executeAssignment` unchanged: that function opens with
+    // `done -> briefing`, which `shared/src/status.ts` permits for exactly this,
+    // and it will pick the critique out of the map itself. `revision: true` is
+    // what clears `endedAt` — both in memory and, via `endedAtCleared` on the
+    // emitted event, in the log — inside that same opening `setStatus` call; see
+    // the comment there for why this used to be a separate `patchAssignment`
+    // call that never reached the log at all (a real NFR-7 gap, not merely a
+    // simplification here).
+    await executeAssignment(ctx, targetId, { revision: true });
   } finally {
     // Released once this redispatch has run its course. With
     // `MAX_REVIEW_REVISIONS` at 1 nothing will ever consult this claim again
@@ -629,6 +654,15 @@ async function setStatus(
     );
   }
 
+  // Read before `Object.assign` overwrites `patch` into `assignment`: this is
+  // the `in`-vs-`=== undefined` distinction events.ts's `endedAtCleared` exists
+  // for. `patch.endedAt === undefined` is true both when the caller never
+  // mentioned `endedAt` (every ordinary call) and when the caller explicitly
+  // wrote `endedAt: undefined` to clear it (the FR-M10 revision call in
+  // `executeAssignment`) — those are different intents and must not collapse
+  // to the same event. `'endedAt' in patch` is what tells them apart.
+  const clearsEndedAt = 'endedAt' in patch && patch.endedAt === undefined;
+
   Object.assign(assignment, patch, { status });
   await persist(ctx);
 
@@ -641,7 +675,21 @@ async function setStatus(
   // office where every assignment sat in `pending` for ever, which looks like a
   // renderer bug and is not one. Status is the single most important thing the
   // sim reads; it has to survive the run that produced it.
-  const event: AgentEvent = { t: 'status', assignmentId, status };
+  //
+  // The patch fields below ride the SAME event, carrying the exact values just
+  // assigned to `assignment` above (not a re-derived approximation) — this is
+  // what makes `useReplay.ts`'s fold reconstruct `reportPath`/`error`/`endedAt`
+  // exactly rather than guess them. See events.ts for why each is optional and
+  // why `endedAtCleared` exists as a separate signal from `endedAt`'s absence.
+  const event: AgentEvent = {
+    t: 'status',
+    assignmentId,
+    status,
+    ...(patch.reportPath === undefined ? {} : { reportPath: patch.reportPath }),
+    ...(patch.error === undefined ? {} : { error: patch.error }),
+    ...(patch.endedAt === undefined ? {} : { endedAt: patch.endedAt }),
+    ...(clearsEndedAt ? { endedAtCleared: true as const } : {}),
+  };
   await ctx.store.appendEvent(ctx.run.id, assignmentId, event);
   ctx.onEvent?.(event);
 }

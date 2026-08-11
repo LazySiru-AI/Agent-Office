@@ -11,8 +11,17 @@ import type { RunSettings } from '../state/useSettings.js';
 export interface ProviderOption {
   id: string;
   available: boolean;
-  /** Why it is unavailable — e.g. "ANTHROPIC_API_KEY is not set". */
-  reason?: string;
+  /**
+   * Why it is unavailable — e.g. "ANTHROPIC_API_KEY is not set".
+   *
+   * `| undefined` is explicit rather than redundant. These values arrive from
+   * `ProviderInfoSchema`, whose `z.string().optional()` infers `reason?: string
+   * | undefined` — a property that may be *present and undefined*, not merely
+   * absent. Under `exactOptionalPropertyTypes` those are different types and a
+   * bare `reason?: string` will not accept one, so this mirrors what the wire
+   * contract actually produces instead of a tidier shape it does not.
+   */
+  reason?: string | undefined;
 }
 
 export interface SettingsPanelProps {
