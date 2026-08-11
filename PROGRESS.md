@@ -1800,3 +1800,103 @@ with per-token quoting, and **refuses** rather than escapes the characters a
 batch shim would re-parse (`" % ! ^ & | < >`). That is the right call —
 escaping is unsound in the general case (BatBadBut/CVE-2024-24576) — and the
 injection attempt is refused before any process starts.
+
+---
+
+## Phase 10 — the office becomes a room, and the head desk gets someone at it
+
+Prompted by re-reading the pixel-agents screenshot for its **art direction**
+rather than its features. The honest finding was that the office was not losing
+on pixel-art style; it was losing on being a depicted space at all.
+
+### What was actually wrong
+
+Phase 8 painted the office in the chrome's near-blacks, arguing that a CRT is
+dark whatever the room is. Sound, and it produced the wrong result: the office
+depicts a *place*, and a place rendered in four shades of one near-black reads
+as a wireframe of an office. There was no wall, no floor material, no chair, no
+screen — the whole scene's only visual distinction was a checker of two
+near-identical greys.
+
+The characters had a separate problem with a single cause. At **12×16** a head
+is a 4×4 block: no row for a hairline, no column for a shoulder, one pixel per
+eye. Every character therefore came out as the same silhouette in different
+colours. The art was not crude by intention — the box could not hold anything
+else, and no palette work was going to change that.
+
+The palette here is **measured, not chosen**: floor, wall, wood and carpet are
+literal samples taken off the reference. "Warm brown" is a description;
+`#734728` is a decision.
+
+### Two things only rendering could catch
+
+Both were found by dumping sprite grids to PNG and *looking* at them, against
+suites that were fully green at the time.
+
+The reference's head owns the **top 57%** of the figure and is **wider than the
+torso** — ours stopped at 33% and was narrower. That is a realistic adult
+against a deliberately chibi one, and the chibi head is not just charm: it is
+the part carrying the hair silhouette an agent is identified by at 16px.
+
+Correcting the ratio alone produced a **featureless block**, because the ratio
+was never the whole story. The reference's hair is a mass that *frames* a
+narrower face, and its eyes are a light sclera with a dark pupil. Two dark dots
+read as a smudge; sclera-plus-pupil reads unmistakably as a face. `eyeWhite`
+earns a token for four pixels because those four pixels do most of the work.
+
+### The walk to the Manager had never been visible
+
+The office has drawn a Manager's desk since Phase 4 and never put anyone behind
+it, so its central interaction had one party in it. Worse, the walk itself was a
+twitch: `briefing` is set at `dispatcher.ts:287` and `working` at `:321`, a few
+file reads apart, and `reporting → done` is one `writeReport`. At 4 tiles/sec a
+character gets **about one pixel** toward the Manager before `stepTowards`
+correctly re-routes it home.
+
+Six phases, and nothing caught it, because every test asserts
+`target === manager.approach` — which is true, for the millisecond the status
+exists. No test asked whether the journey was ever *observable*. That is a
+different claim, and it was the one that mattered.
+
+### Consequences that had to be decided, not papered over
+
+- On a wood floor the old plate detail measured **2.18:1**. Plates now print on
+  an opaque card, its alpha pinned at exactly 1 by a test — a translucent one
+  would make the contrast grid measure a colour that never appears on screen.
+- Plates sat two tiles below their seat with rows four tiles apart, i.e. halfway
+  between their character and the next row's. They pointed at the wrong desks.
+  Proximity assigns a label; the vertical budget gave way instead.
+- 13px names mean `architect-reviewer` no longer fits at 2x. The plate is one
+  desk spacing wide and cannot grow without crossing its neighbour, so the choice
+  was a readable name with an elided tail or a whole name too small to read.
+- Seated agents face the **viewer**. Less realistic — and the office is entirely
+  agents at desks, so `up` meant every character was a back of a head,
+  permanently. A depiction that never shows a face is less informative, not more
+  real.
+
+### Sizing, measured on a real 1440×960 window (host 1055×718)
+
+The office filled 48% of its frame's width, because a 256×288 world in a 1055×718
+host is a **portrait room in a landscape frame** — the height ratio came out at
+2.49 and the width at 4.12, so 2x was chosen and half a step was discarded to
+aspect mismatch alone. Drawing the room landscape brings it to 82–97%. The host
+height was also fixed at 520px, which the new wall band silently turned into a
+downgrade from 2x to 1x.
+
+FR-S13 (zoom) was promoted from *Could* to a **Must**, because no host size
+covers every window — measured a narrow pane where **width** binds instead of
+height. Zooming past the fit then exposed its own defect: under
+`justify-content: center` an oversized child overflows in *both* directions and
+overflow left of the scroll origin is unreachable, so ~124px of office sat
+permanently off-screen at 3x.
+
+### Verified
+
+- **1,482 tests pass, 4 skipped**, across 55 files; typecheck clean in all three
+  workspaces. Up from 1,403.
+- Zoom confirmed end to end in the running app: auto → 3x grows the canvas
+  1049×718 → 1296×864, persists, and `Fit` reverts; scrollWidth now equals the
+  canvas width exactly.
+- The office was captured from the running renderer, not mocked — which required
+  driving `ticker.update()` and `render()` by hand, since FR-S7 correctly stops
+  the ticker when the document is hidden.
