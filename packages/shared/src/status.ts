@@ -33,6 +33,28 @@ export const ASSIGNMENT_STATUSES = [
   'done',
   'failed',
   'skipped',
+  /**
+   * FR-M9: the run was stopped while this assignment was in flight.
+   *
+   * Added late, and the reason it was missing is worth keeping. `working`'s
+   * only legal onward edges are `reporting` and `blocked`, neither terminal,
+   * so for four phases the dispatcher had exactly one terminal status to reach
+   * for when a cancel landed mid-flight — `failed` — and it took it, with the
+   * cause written into `error` text. Everything downstream then read the
+   * consequence rather than the cause: `ASSIGNMENT_BEHAVIOUR` gave the
+   * character `idle_slumped` with an error bubble, the office showed a team
+   * that had failed at work the user had simply called off, and the run list's
+   * "Failed" filter counted it. A status vocabulary that cannot say "stopped"
+   * forces every reader of it to say "broken" instead.
+   *
+   * Distinct from `skipped`, which is also a no-result terminal state: a skip
+   * is a decision the dispatcher made about THIS assignment (its dependencies
+   * were unreachable), whereas a cancellation is something that happened to
+   * the whole run. They share `statusStopped` in the palette, because both are
+   * "withdrawn, not a result", and stay separate here because the office and
+   * the log have to be able to say which one occurred.
+   */
+  'cancelled',
 ] as const;
 
 export type AssignmentStatus = (typeof ASSIGNMENT_STATUSES)[number];
@@ -44,6 +66,7 @@ export const TERMINAL_ASSIGNMENT_STATUSES: readonly AssignmentStatus[] = [
   'done',
   'failed',
   'skipped',
+  'cancelled',
 ];
 
 export function isRunTerminal(s: RunStatus): boolean {
@@ -106,6 +129,7 @@ const ASSIGNMENT_TRANSITIONS: Record<AssignmentStatus, readonly AssignmentStatus
   done: ['briefing'],
   failed: [],
   skipped: [],
+  cancelled: [],
 };
 
 export function canTransitionRun(from: RunStatus, to: RunStatus): boolean {
@@ -128,7 +152,13 @@ export function canTransitionRun(from: RunStatus, to: RunStatus): boolean {
 export function canTransitionAssignment(from: AssignmentStatus, to: AssignmentStatus): boolean {
   if (ASSIGNMENT_TRANSITIONS[from].includes(to)) return true;
   if (isAssignmentTerminal(from)) return false;
-  return to === 'failed';
+  // Both are "this stopped, from outside the assignment's own lifecycle", and
+  // both can arrive at any point before it finishes, so neither is worth
+  // repeating in all five non-terminal rows above. `cancelled` joins `failed`
+  // here rather than being written into the table for exactly the reason the
+  // run-level comment gives: an edge that exists from everywhere is clearer
+  // stated once than enumerated five times and then forgotten on the sixth.
+  return to === 'failed' || to === 'cancelled';
 }
 
 /**
@@ -159,4 +189,9 @@ export const ASSIGNMENT_BEHAVIOUR: Record<AssignmentStatus, CharacterBehaviour> 
   done: { animation: 'idle_relaxed', location: 'desk', bubble: 'none', carrying: false },
   failed: { animation: 'idle_slumped', location: 'desk', bubble: 'error', carrying: false },
   skipped: { animation: 'idle', location: 'desk', bubble: 'none', carrying: false },
+  // Same body language as `skipped`, and deliberately NOT `failed`'s: the
+  // office must not show a slumped, error-bubbled agent because the user
+  // pressed Cancel. Nothing went wrong at this desk — the work simply stopped
+  // being wanted, which reads as an agent sitting idle, not a defeated one.
+  cancelled: { animation: 'idle', location: 'desk', bubble: 'none', carrying: false },
 };

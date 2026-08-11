@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  canTransitionAssignment,
   RunPlanSchema,
   type AgentDef,
   type AgentEvent,
@@ -557,9 +558,43 @@ describe('dispatchRun — budgets and cancellation (FR-M8, FR-M9)', () => {
     const a = run.assignments.find((assignment) => assignment.id === 'a');
     // Not `working` — a terminal status, so replay stops rendering it as
     // still in progress once the run itself is over.
-    expect(a?.status).toBe('failed');
+    //
+    // `cancelled`, not `failed`. This assertion read `failed` for four phases,
+    // and it was pinning a workaround rather than a requirement: `working`'s
+    // only terminal exit used to be `failed`, so the dispatcher took it and
+    // wrote the real cause into `error` text. Everything downstream read the
+    // status instead — `ASSIGNMENT_BEHAVIOUR` gave the character
+    // `idle_slumped` under an error bubble, and the run list counted the
+    // assignment as failed — for work the user had deliberately stopped.
+    // `shared/src/status.ts` now has a terminal `cancelled`; the error text
+    // and `endedAt` below are unchanged, because knowing WHICH assignment was
+    // in flight when the cancel landed was always the useful part.
+    expect(a?.status).toBe('cancelled');
     expect(a?.error).toContain('cancelled');
     expect(a?.endedAt).toBeDefined();
+
+    // Counted somewhere. The tally's buckets are meant to partition the
+    // assignment list, and a new status is exactly how one silently stops
+    // being counted at all — `cancelled` used to land in `failed` by accident
+    // of the status it was given.
+    expect(result.cancelled).toBe(1);
+    expect(result.failed).toBe(0);
+  });
+
+  it('lets a cancelled assignment reach `cancelled` from any point before it finishes', () => {
+    // The edge is granted by `canTransitionAssignment`'s fallback rather than
+    // written into `ASSIGNMENT_TRANSITIONS`, alongside `failed`. That is worth
+    // an explicit test: a fallback is invisible in the table a reader checks
+    // first, and the two statuses it grants are the two that can arrive from
+    // outside the assignment's own lifecycle.
+    for (const from of ['pending', 'briefing', 'working', 'blocked', 'reporting'] as const) {
+      expect(canTransitionAssignment(from, 'cancelled'), `${from} -> cancelled`).toBe(true);
+    }
+    // Terminal stays terminal: a run cancelled after an assignment finished
+    // must not retroactively un-finish it.
+    for (const from of ['done', 'failed', 'skipped', 'cancelled'] as const) {
+      expect(canTransitionAssignment(from, 'cancelled'), `${from} -> cancelled`).toBe(false);
+    }
   });
 
   it('cuts an in-flight lane short once the token budget trips, instead of letting it run to completion (FR-M8)', async () => {

@@ -85,6 +85,15 @@ export interface DispatchResult {
   completed: number;
   failed: number;
   skipped: number;
+  /**
+   * Assignments stopped mid-flight by FR-M9 cancellation.
+   *
+   * Its own bucket rather than folded into `failed`, which is where these used
+   * to land back when `cancelled` was not an assignment status: the four
+   * counters are supposed to partition the assignment list, and a status with
+   * no bucket is one that quietly stops being counted anywhere.
+   */
+  cancelled: number;
   /** Set when dispatch halted early. */
   haltedBecause?: 'cancelled' | 'token-budget';
 }
@@ -242,11 +251,12 @@ export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
 
   if (ctx.signal.aborted) ctx.halted = 'cancelled';
 
-  const tally = { completed: 0, failed: 0, skipped: 0 };
+  const tally = { completed: 0, failed: 0, skipped: 0, cancelled: 0 };
   for (const assignment of ctx.run.assignments) {
     if (assignment.status === 'done') tally.completed += 1;
     else if (assignment.status === 'failed') tally.failed += 1;
     else if (assignment.status === 'skipped') tally.skipped += 1;
+    else if (assignment.status === 'cancelled') tally.cancelled += 1;
   }
 
   return {
@@ -387,22 +397,20 @@ async function executeAssignment(
     // so every reload or replay of a cancelled run showed that agent still
     // typing, indefinitely, for a run that was long over.
     //
-    // `working`'s only legal onward transitions are `reporting` (this run did
-    // not produce one) and `blocked` (also not terminal — see
-    // `canTransitionAssignment` in `shared/src/status.ts`, which this package
-    // may not edit). The sole terminal status reachable from `working` is
-    // `failed`, via that function's "anything not otherwise reachable may
-    // still fail" fallback. Calling it a failure is an imperfect fit — a
-    // cancellation is not really an error — but it is the only terminal option
-    // the state machine offers without changing `status.ts`, and the original
-    // intent survives in the error text and `endedAt` below: a reader can
-    // still see exactly which assignment was in flight when the cancel landed,
-    // instead of inferring it from a character that never stops typing.
-    await failAssignment(
-      ctx,
-      assignmentId,
-      'cancelled: run was stopped while this assignment was in progress',
-    );
+    // It then spent four phases recorded as `failed`, because that was the
+    // only terminal status `working` could reach. That was documented as an
+    // imperfect fit and it was worse than imperfect: the office rendered a
+    // slumped agent under an error bubble, and the run list counted the
+    // assignment under "Failed", for work the user had deliberately called
+    // off. `shared/src/status.ts` now has a terminal `cancelled` that means
+    // stopped rather than broken, and this is the one place that reaches it.
+    //
+    // `endedAt` and the message are kept from the old path: a reader still
+    // sees exactly which assignment was in flight when the cancel landed.
+    await setStatus(ctx, assignmentId, 'cancelled', {
+      error: 'cancelled: run was stopped while this assignment was in progress',
+      endedAt: Date.now(),
+    });
     return;
   }
   if (ctx.haltController.signal.aborted && text.trim() === '') {
@@ -689,6 +697,7 @@ async function setStatus(
     ...(patch.error === undefined ? {} : { error: patch.error }),
     ...(patch.endedAt === undefined ? {} : { endedAt: patch.endedAt }),
     ...(clearsEndedAt ? { endedAtCleared: true as const } : {}),
+    ...(patch.attempts === undefined ? {} : { attempts: patch.attempts }),
   };
   await ctx.store.appendEvent(ctx.run.id, assignmentId, event);
   ctx.onEvent?.(event);

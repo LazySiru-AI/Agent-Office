@@ -59,12 +59,86 @@ textarea:focus-visible,
   border-radius: 2px;
 }
 
+/* Text for assistive technology only: present in the accessible tree, absent
+   from the visual design. The clip-rect form rather than `display: none` or
+   `visibility: hidden`, both of which remove the element from the accessible
+   tree too and would defeat the point.
+
+   `ReplayControls.tsx` used to carry a comment explaining that it left a
+   label visible because "styles.css defines no visually-hidden utility class".
+   It does now — this is that class — and the canvas keyboard alternative and
+   the live-run dot both depend on it. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* A visually-hidden control must become visible when focused, or a keyboard
+   user tabs into something they cannot see. */
+.visually-hidden-focusable:focus-within {
+  position: static;
+  width: auto;
+  height: auto;
+  margin: 0;
+  overflow: visible;
+  clip: auto;
+  clip-path: none;
+  white-space: normal;
+}
+
 /* --- Layout shell --- */
 
 .app-shell {
   display: grid;
   grid-template-columns: 320px 1fr;
   min-height: 100vh;
+}
+
+/* WCAG 1.4.10 (Reflow) and 1.4.4 (Resize text, i.e. 400% zoom on a 1280px
+   screen — the same 320px equivalent).
+ *
+ * The shell was a bare `320px 1fr` with no breakpoint anywhere in this file.
+ * Measured across seven widths, the fixed sidebar keeps all 320px and the
+ * content column absorbs every pixel lost: 1280 -> 960, 640 -> 320, 400 -> 80,
+ * and at 320 the main column is 48px — which is exactly `.main`'s own left and
+ * right padding, i.e. nothing but padding. The office, the assignment table,
+ * the log and the reports were all inside that.
+ *
+ * 900px, not a device width: it is where the content column drops below the
+ * ~560px the assignment table and the office canvas need before either starts
+ * scrolling internally. Stacking rather than shrinking the sidebar, because a
+ * narrower sidebar makes the run list unreadable long before it makes the
+ * office usable. */
+@media (max-width: 900px) {
+  .app-shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid var(--ao-line);
+    /* The sidebar's own `overflow-y: auto` is a scroll container inside a
+       scroll container once stacked — two nested scrollbars for one list. */
+    overflow-y: visible;
+  }
+
+  .main {
+    padding: 1rem;
+  }
+
+  /* The office's own narrow-width rule is NOT here — it lives immediately
+     after `.office-canvas`'s base rule further down. Both selectors have the
+     same specificity, and a media query adds none, so the later declaration
+     wins: an override written up here is silently undone by the `overflow:
+     hidden` shorthand several hundred lines below. */
 }
 
 .sidebar {
@@ -293,8 +367,13 @@ button[aria-pressed='true'] {
   gap: 0.3rem;
 }
 
+/* `min-height` rather than more padding: these read as compact chips by
+   design, and padding alone put them at roughly 18px tall — under the 24px
+   floor WCAG 2.2 §2.5.8 sets for a pointer target (and well under 2.1's
+   AAA 44px). The type size is unchanged; only the hit area grows. */
 .run-list-filters button {
   padding: 0.15rem 0.45rem;
+  min-height: 24px;
   font-size: 0.72rem;
   font-family: var(--ao-font-mono);
 }
@@ -364,6 +443,38 @@ button[aria-pressed='true'] {
   display: flex;
   align-items: center;
   gap: 0.6rem;
+}
+
+/* The run id was an `<h1>`, which put the page's only top-level heading three
+   landmarks down and made it a machine-generated id — and left the page with
+   no `h1` at all until a run was selected. `<h1>Agent Office</h1>` now opens
+   the sidebar; this is the `<h2>` that took the run id's place, styled to look
+   exactly as it did before rather than inheriting the section-header treatment
+   (the `// ` sigil and the rule underneath belong to "Office"/"Activity", not
+   to the run's own name). */
+.run-id {
+  font-size: 1.1rem;
+  font-family: var(--ao-font-mono);
+  color: var(--ao-ink);
+  font-weight: 600;
+  letter-spacing: normal;
+  border-bottom: none;
+  padding-bottom: 0;
+  margin: 0;
+  text-transform: none;
+}
+
+.run-id::before {
+  content: none;
+}
+
+/* The app title. Small and quiet — it names the page for a screen reader and
+   for the heading outline; it is not a masthead. */
+.app-title {
+  font-size: 0.85rem;
+  color: var(--ao-accent);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .run-task {
@@ -457,9 +568,16 @@ button[aria-pressed='true'] {
   background: color-mix(in srgb, var(--ao-status-bad) 14%, var(--ao-sunken));
 }
 
+/* No `opacity` here, deliberately, and `status.test.ts` enforces its absence
+   on every tone. This rule carried `opacity: .85` to make "withdrawn" read as
+   quieter than a real result — and that dimming composited the chip's text AND
+   its `--ao-sunken` fill toward the surface beneath, landing `cancelled` and
+   `skipped` at 4.25–4.41:1 while the enforced grid, which measures the token,
+   read a comfortable 5.49/6.25. The quietness now comes from the token value
+   itself (`statusStopped` is the least saturated hue in the palette) and from
+   the `–` glyph, both of which the audit can actually see. */
 .status-tone-stopped {
   color: var(--ao-status-stopped);
-  opacity: 0.85;
 }
 
 /* --- Assignment table --- */
@@ -582,6 +700,41 @@ button[aria-pressed='true'] {
      (19 tiles, 608px at 2x) falls back to 1x rather than being cropped, which
      is the right way round. */
   height: 520px;
+}
+
+/* The office is the one thing on the page that cannot reflow: it is a
+   fixed-aspect pixel scene, and `scene.ts` already picks the largest INTEGER
+   scale that fits, so below a certain width there is no smaller whole-number
+   step left to take. Measured at a 320px viewport: a 665px-wide canvas inside
+   a 272px frame, with the `overflow: hidden` above quietly cropping ~60% of
+   the floor and no way to reach the rest.
+
+   Letting the frame scroll horizontally keeps every desk reachable while the
+   PAGE stays free of horizontal scrolling, which is what 1.4.10 actually asks
+   for. Scoped to the breakpoint so the bezel stays a clean `hidden` at the
+   widths where the office fits anyway.
+
+   Placed here, directly after the base rule, rather than with the rest of the
+   breakpoint at the top of this file: the two selectors have equal specificity
+   and a media query adds none, so up there the `overflow: hidden` shorthand
+   below would simply win and this would do nothing. */
+@media (max-width: 900px) {
+  .office-canvas {
+    overflow-x: auto;
+    justify-content: flex-start;
+  }
+}
+
+/* The element the renderer actually measures and mounts into. It exists so the
+   host can also hold the canvas's keyboard/screen-reader alternative without
+   that markup landing inside the box Pixi sizes itself against. It fills the
+   host exactly, so `scene.ts`'s integer-scale calculation is unchanged. */
+.office-stage {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
 }
 
 .office-canvas canvas {

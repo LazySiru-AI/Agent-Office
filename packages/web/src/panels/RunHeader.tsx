@@ -52,7 +52,12 @@ export function RunHeader({
   return (
     <div className="run-header">
       <div className="run-header-row">
-        <h1>{run.id}</h1>
+        {/* `<h2>`, not `<h1>`. The page's one top-level heading is the app
+            title in the sidebar; a machine-generated run id is not the name of
+            the document, and making it `h1` also meant there was no `h1` at
+            all until a run had been selected. See `.run-id` in styles.css —
+            this looks exactly as it did. */}
+        <h2 className="run-id">{run.id}</h2>
         <StatusBadge status={run.status} />
         {canCancel && (
           <button type="button" className="cancel-button" onClick={onCancel}>
@@ -69,7 +74,14 @@ export function RunHeader({
         {runProvider !== undefined && <span className="muted"> · provider: {runProvider}</span>}
       </p>
       {truncated && <p className="muted">Event history is partial — the server's buffer had already trimmed it.</p>}
-      {run.error !== undefined && <p className="form-error">{run.error}</p>}
+      {/* `role="alert"` (WCAG 3.3.1): a run failing is the one thing on this
+          screen a user must not have to notice by watching. Everything else
+          here updates continuously and would be noise if announced. */}
+      {run.error !== undefined && (
+        <p className="form-error" role="alert">
+          {run.error}
+        </p>
+      )}
     </div>
   );
 }

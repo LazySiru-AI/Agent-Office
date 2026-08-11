@@ -524,6 +524,96 @@ describe('routing matrix against the real registry', () => {
     expect(kept / total, 'a pre-filter that loses most wanted agents is worse than no filter').toBeGreaterThan(0.5);
   });
 
+  // The test above measures ONE limit, and one number invites the obvious
+  // question the phase write-up could not answer: is 40 simply too small?
+  // This one answers it by sweeping the limit all the way to the full roster.
+  //
+  // It is not too small. Recall goes 10, 11, 11, 11, 11, 15 across
+  // 40/60/80/100/120/140 and reaches 16/16 only at 156 — where the "cut" is
+  // every agent in the catalog and the pre-filter has, by definition, filtered
+  // nothing. There is no limit that is both safe and a saving.
+  //
+  // The reason is visible in the ranks rather than the totals: half the wanted
+  // agents score EXACTLY 0.000 against their own task. `ux-researcher` ranks
+  // #150 of 156 on a task about onboarding metrics, `security-auditor` #130 on
+  // one about authentication bugs, `risk-manager` #123 on a liability review.
+  // They are not ranked badly; they are not ranked at all, and their position
+  // is decided by the alphabetical tie-break among the whole zero-scoring
+  // tail. A larger limit just admits more of that tail in alphabetical order.
+  //
+  // That is what makes this a property of literal-token BM25 over this corpus
+  // and not a tuning problem: no threshold, weight or stopword change moves an
+  // agent whose description shares no token with the task. The fix is a ranker
+  // that can see that "onboarding metrics" and "user research" are related —
+  // i.e. embeddings — which is a different module, not a different constant.
+  // Until then `planRun` is right not to call this, and this test is why.
+  it('sweeping the candidate limit shows no cut is both safe and a saving', async () => {
+    const registry = await loadRegistry(REPO_ROOT);
+
+    const scenarios: { task: string; wanted: string[] }[] = [
+      {
+        task: 'Review the payments service for authentication bugs and refactor the retry logic',
+        wanted: ['backend-developer', 'security-auditor', 'code-reviewer', 'payment-integration'],
+      },
+      {
+        task: 'Review our vendor NDA for unusual liability and termination terms',
+        wanted: ['legal-advisor', 'compliance-auditor', 'risk-manager'],
+      },
+      {
+        task: 'We are opening a subsidiary in Ireland — what are the corporation tax and VAT registration consequences?',
+        wanted: ['tax-advisor', 'tax-compliance-specialist', 'risk-manager'],
+      },
+      {
+        task: 'Survey the published literature on retrieval-augmented generation and summarise the state of the art',
+        wanted: ['research-analyst', 'data-researcher', 'scientific-literature-researcher'],
+      },
+      {
+        task: 'Prioritise the Q3 roadmap and define success metrics for the new onboarding flow',
+        wanted: ['product-manager', 'ux-researcher', 'business-analyst'],
+      },
+    ];
+
+    const rosterSize = registry.agents.length;
+    const limits = [40, 60, 80, 100, 120, 140, rosterSize];
+    const byLimit = new Map<number, { kept: number; total: number }>();
+
+    for (const limit of limits) {
+      let kept = 0;
+      let total = 0;
+      for (const scenario of scenarios) {
+        const shortlist = new Set(selectCandidates(registry, scenario.task, { limit }));
+        kept += scenario.wanted.filter((name) => shortlist.has(name)).length;
+        total += scenario.wanted.length;
+      }
+      byLimit.set(limit, { kept, total });
+    }
+
+    // eslint-disable-next-line no-console -- the sweep is the finding.
+    console.log(
+      `[FR-R4 recall sweep] ${limits
+        .map((l) => `@${l}=${byLimit.get(l)?.kept}/${byLimit.get(l)?.total}`)
+        .join('  ')}`,
+    );
+
+    // Full recall at the full roster. This is the control: it proves the
+    // fixture agents are all findable and that any loss below is the CUT's
+    // doing, not a broken expectation list.
+    const whole = byLimit.get(rosterSize);
+    expect(whole?.kept).toBe(whole?.total);
+
+    // And no real cut achieves it. Asserted as a strict inequality against the
+    // uncut baseline rather than as a hardcoded "11/16", so the day a better
+    // ranker closes the gap this test FAILS and asks to be rewritten, instead
+    // of quietly continuing to certify a limitation that no longer exists.
+    for (const limit of limits.filter((l) => l < rosterSize)) {
+      const measured = byLimit.get(limit);
+      expect(
+        measured?.kept,
+        `a cut at ${limit} now keeps every wanted agent — the ranker improved, so wire the pre-filter into planRun and delete this assertion`,
+      ).toBeLessThan(whole?.kept ?? 0);
+    }
+  }, 20_000);
+
   // ---------------------------------------------------------------------
   // Tax domain.
   //

@@ -43,7 +43,18 @@ export function ReportViewer({
           <p className="form-error">{synthesis.error}</p>
         )}
         {runReportPath !== undefined && synthesis.loading && <p className="muted">Loading…</p>}
-        {synthesis.data !== undefined && <pre className="markdown">{synthesis.data.markdown}</pre>}
+        {synthesis.data !== undefined && (
+          /* `max-height: 500px; overflow-y: auto` in the stylesheet makes this
+             a scroll container, and a scroll container with nothing focusable
+             in it cannot be scrolled from the keyboard at all (WCAG 2.1.1) —
+             for a report that is very often longer than 500px. `tabIndex={0}`
+             plus a named `region` role is the standard remedy: focusable, so
+             the arrow and page keys reach it, and announced as a landmark so
+             it can be found rather than stumbled into. */
+          <pre className="markdown" tabIndex={0} role="region" aria-label="Synthesis report">
+            {synthesis.data.markdown}
+          </pre>
+        )}
       </section>
 
       {assignmentReportPath !== undefined && (
@@ -56,7 +67,11 @@ export function ReportViewer({
           </div>
           {assignment.error !== undefined && <p className="form-error">{assignment.error}</p>}
           {assignment.loading && <p className="muted">Loading…</p>}
-          {assignment.data !== undefined && <pre className="markdown">{assignment.data.markdown}</pre>}
+          {assignment.data !== undefined && (
+            <pre className="markdown" tabIndex={0} role="region" aria-label={`Report: ${assignmentReportPath}`}>
+              {assignment.data.markdown}
+            </pre>
+          )}
         </section>
       )}
     </div>

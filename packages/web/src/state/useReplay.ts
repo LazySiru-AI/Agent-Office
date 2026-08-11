@@ -138,11 +138,19 @@ import { fetchRun, fetchRunEvents } from '../api.js';
  *   between two independent clock reads a few lines apart — the event's `ts`
  *   versus the dispatcher's own `Date.now()` — not exact equality; see
  *   `useReplay.test.ts`'s field-for-field replay test for that in practice.
- * - **Not covered by the event contract at all:** `attempts`. No
- *   `AgentEvent` variant records a change in dispatch attempt count, so it
- *   cannot be folded from anything. It is left at whatever the fetched base
- *   `RunState` recorded (normally the run's final value) for the entire
- *   replay — a known, documented approximation rather than a silent one.
+ * - **`attempts` — carried since the field was added, base value before
+ *   that.** This was the one field the event contract did not cover at all:
+ *   no variant recorded a change in dispatch attempt count, so the fold left
+ *   it at whatever the fetched base `RunState` held — normally the run's
+ *   FINAL value — for the whole of playback, and a run containing an FR-M10
+ *   revision replayed as though it had been on its second attempt from the
+ *   first frame. The `status` event now carries `attempts`, which is
+ *   `dispatcher.ts`'s own patch value rather than a re-derivation, and the
+ *   fold applies it. There is deliberately NO fallback: nothing in an older
+ *   log can approximate a dispatch count. `foldEvents` therefore resets
+ *   `attempts` to zero only when the log it was handed carries the field at
+ *   least once — see the comment there — so an old log keeps replaying
+ *   exactly as it always did (NFR-7) instead of being newly zeroed.
  * - **Run-level fields with no event representation:** `status`,
  *   `managerUsage`, `reportPath` (the Manager's synthesis), `pdfPath`,
  *   `error` all live on `RunState` itself, not on any per-assignment event,
@@ -160,8 +168,10 @@ import { fetchRun, fetchRunEvents } from '../api.js';
 
 /**
  * Resets every assignment's event-derived fields to their pre-run defaults,
- * keeping the static plan fields (and `attempts` — see file header) as
- * fetched. This is the base every {@link foldEvents} call folds onto; calling
+ * keeping the static plan fields as fetched. `attempts` is deliberately NOT
+ * reset here even though it is now event-derived: whether it can be rebuilt
+ * depends on the vintage of the log, which this function is not given — see
+ * {@link foldEvents}, which resets it there once it has looked. This is the base every {@link foldEvents} call folds onto; calling
  * it directly (with zero events applied) is what "an empty event list yields
  * the base run unchanged" means in the test file — unchanged relative to a
  * run whose assignments already sit at these defaults.
@@ -293,6 +303,16 @@ function applyEvent(
         if (message !== undefined) assignment.error = message;
       }
 
+      // Carried, with no fallback and deliberately none. Unlike `endedAt` and
+      // `reportPath`, there is nothing to approximate `attempts` FROM in an
+      // old log — no other event records a dispatch — so a log written before
+      // the field existed leaves it at the base run's value, which is exactly
+      // the documented old behaviour and therefore still replays as it always
+      // did (NFR-7). A new log gets the real number at the moment it changed.
+      if (event.attempts !== undefined) {
+        assignment.attempts = event.attempts;
+      }
+
       assignment.status = event.status;
       break;
     }
@@ -341,6 +361,25 @@ function applyEvent(
  */
 export function foldEvents(base: RunState, events: readonly LoggedAgentEvent[], atTs: number): RunState {
   const result = resetAssignmentsForReplay(base);
+
+  // `attempts` is reset only when the log can rebuild it, and the log itself
+  // is what says so. Every other event-derived field is unconditionally reset
+  // by `resetAssignmentsForReplay` because a `status`/`usage` event has always
+  // existed to fold it back; `attempts` is carried only by logs written after
+  // the field was added to `AgentEvent`. Resetting it unconditionally would
+  // make every log recorded before that replay with `attempts: 0` throughout
+  // — a REGRESSION in old-log fidelity, which NFR-7 exists to prevent — and
+  // never resetting it leaves a new log's exact numbers overwritten by the
+  // base run's final value until the first `briefing` arrives. Reading the
+  // vintage off the log gets both: old logs behave exactly as before, new
+  // ones replay the field truthfully from zero.
+  const logCarriesAttempts = events.some(
+    (l) => l.event.t === 'status' && l.event.attempts !== undefined,
+  );
+  if (logCarriesAttempts) {
+    for (const assignment of result.assignments) assignment.attempts = 0;
+  }
+
   const byId = new Map(result.assignments.map((a) => [a.id, a]));
   const lastFatalErrorByAssignment = new Map<string, string>();
   // Exact-entry idempotency guard — see the file header's "Duplicate log

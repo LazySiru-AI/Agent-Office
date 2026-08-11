@@ -1318,3 +1318,179 @@ absent — which is precisely the distinction the flag exists to police.
   round completing, so a spend cap tripping on a round with tool calls leaves
   Anthropic's stream showing that round's tool event and OpenAI's not.
   Pre-existing; only visible now that a cap can trip.
+
+---
+
+## Second QA pass — the design team, and the gaps that were still open
+
+The first QA pass audited the code. This one audited the *interface*, and then
+went back through every "known gap carried forward" the previous entries had
+accumulated to see which were still real. Twenty-one findings, nineteen fixed,
+and the two that are not are not fixable here.
+
+The rule for this pass was that a finding had to be **measured**, not read.
+Every number below came from the running app or from a script, which is why
+several of them contradict what the code confidently says about itself.
+
+### The design pass found that the accessibility work had audited the wrong thing
+
+Phase 8 built a contrast grid and enforced it. It is a good grid. It measures
+**tokens**, and three of the four worst findings here are places where the
+browser does not paint the token.
+
+- **`.status-tone-stopped { opacity: .85 }`.** The grid reads `statusStopped`
+  against `sunken` and gets 5.49:1 in dark, 6.25:1 in light — comfortable. The
+  browser composites the whole chip, text and fill together, toward whatever it
+  sits on, and paints **4.25–4.41:1** — under AA in both themes, on every
+  surface, for `cancelled` and `skipped`. This is Phase 8's own lesson ("audit
+  against the surface a colour lands on, not against `bg`") recurring one level
+  down: audit the colour the browser paints, not the one the token holds. The
+  dimming is gone; the tone was already the least saturated hue in the palette
+  and already had its own glyph. `status.test.ts` now fails the build if any
+  tone rule sets `opacity` at all, because the grid cannot see through it.
+- **Every control border failed WCAG 1.4.11.** `--ao-line-firm` draws the
+  outline of every text input, select, textarea and button — measured
+  **1.41–1.90:1** against a 3:1 requirement, i.e. a form whose fields have
+  effectively no edge. It had been filed as decorative alongside `line`, and for
+  a section divider that is true. One token was doing two jobs, one exempt and
+  one not. Retuned to `#5b6b80` / `#74828f`, chosen against the *worst* ground
+  rather than the easiest, and moved out of the decorative exemption into a
+  1.4.11 grid of its own.
+- **The office canvas was invisible to assistive technology.** The app's
+  DEFAULT view was a bare `div` wrapping a `canvas`: no role, no name, no text
+  alternative, and click-to-inspect reachable only by mouse. A screen reader
+  found the "Office" heading and then an empty box. The fix is not a caption —
+  every fact the office shows is already in `RunState` as text, so it renders as
+  a real list of real buttons that do what clicking a character does. One
+  structure satisfies 1.1.1, 2.1.1 and 4.1.2, and it cannot drift from the
+  canvas because both read the same `assignments`.
+- **The layout had no breakpoint at all.** Measured across seven widths: the
+  fixed 320px sidebar keeps every pixel and the content column absorbs the loss
+  — 1280 to 960, 640 to 320, 400 to 80, and at 320 the main column is **48px,
+  which is exactly `.main`'s own padding**. The office, the table, the log and
+  the reports were all inside that. WCAG 1.4.10, and equally 1.4.4 at 400% zoom.
+
+Fixing the layout then exposed a second one behind it: at a 320px viewport the
+office is a 665px canvas in a 272px frame under `overflow: hidden`, silently
+cropping ~60% of the floor with no way to reach the rest. It scrolls
+horizontally inside its own frame now, so the page never does.
+
+That fix also produced the most instructive small failure of the pass. The
+override was written into the breakpoint at the top of the stylesheet, the
+browser reported `overflow-x: hidden` anyway, and it took reading the computed
+rules to see why: `.office-canvas`'s base rule sits several hundred lines lower,
+both selectors have the same specificity, and **a media query adds none** — so
+the later `overflow: hidden` shorthand simply won. Same shape as the four budget
+defects the first QA pass ended on: a value set in one place while something
+further along quietly governed.
+
+### Six more, smaller
+
+- The page's `h1` was the run id, which put the only top-level heading three
+  landmarks down and left the page with **no `h1` at all** until a run was
+  selected. The live outline read `H2 Runs` then `H1 <run-id>` then `H2 Office`.
+- The selected run was carried by an accent border and a glow and nothing else —
+  no `aria-current`, so assistive technology could not tell which row was open.
+- The log pane and the report viewer are scroll containers with nothing
+  focusable inside them, which means no keyboard can scroll either.
+- The log pane auto-scrolled to the bottom on **every** new line regardless of
+  where the reader was, so reading back through a live run was undone about once
+  a second. It follows the tail only when already at the tail now.
+- A run failing announced nothing; it is a `role="alert"` now. Deliberately the
+  only thing on the screen that announces — the activity pane emits several
+  lines a second, and announcing those would make the page unusable.
+- Two style hooks, `.office-empty` and `.replay-partial`, had been in the
+  stylesheet for phases and were referenced by nothing. Both are wired rather
+  than deleted: the office had no empty state at all, and "what you are watching
+  is missing activity" had been rendering in the same grey as "Loading…".
+
+### A cancelled assignment is no longer recorded as `failed`
+
+Carried as a known gap since the first QA pass, and worse than the "imperfect
+fit" it was filed as. `working`'s only terminal exit was `failed`, so the
+dispatcher took it and wrote the real cause into the error text — and every
+reader downstream took the status instead: `ASSIGNMENT_BEHAVIOUR` gave the
+character `idle_slumped` under an error bubble, and the run list counted it
+under "Failed", for work the user had deliberately stopped. A status vocabulary
+that cannot say "stopped" forces everything reading it to say "broken".
+
+`cancelled` is now a terminal `AssignmentStatus`, reachable from any
+non-terminal status via the same fallback that grants `failed` and sealed once
+reached. It shares `statusStopped` with `skipped` — both are "withdrawn, not a
+result" — and stays a distinct status because the office and the log have to be
+able to say which one happened. `DispatchResult` gained a `cancelled` counter in
+the same change: the tally's buckets are meant to partition the assignment list,
+and a status with no bucket is one that quietly stops being counted.
+
+### `attempts` survives replay now
+
+The other carried gap. No `AgentEvent` recorded a dispatch, so the fold left
+`attempts` at the base run's value — normally its **final** value — for the
+whole of playback, and a run containing an FR-M10 revision replayed as though it
+had been on its second attempt from the first frame. The dispatcher was already
+handing `setStatus` the number; it was simply never put on the event.
+
+The interesting part was back-compatibility. Resetting `attempts` to zero like
+every other event-derived field would make every log recorded before this replay
+as `0` throughout — a *regression* in old-log fidelity, which is exactly what
+NFR-7 exists to prevent. Never resetting it leaves a new log's real numbers
+masked by the base value. `foldEvents` reads the vintage off the log — does any
+event carry the field — and gets both. The test folds onto a base where every
+assignment claims 99 attempts, so the numbers can only have come from the
+`.jsonl`.
+
+### FR-R4: measured to a conclusion, not deferred again
+
+Phase 6 measured the pre-filter at one limit (10/16 recall at 40) and left it
+unwired, which invited the obvious question: is 40 simply too small? Swept
+across 40/60/80/100/120/140/156, recall goes **10, 11, 11, 11, 11, 15, 16** —
+full recall arrives only when the "cut" is all 156 agents and the pre-filter has
+by definition filtered nothing.
+
+The totals understate it; the ranks are the finding. Half the wanted agents
+score **exactly 0.000** against their own task: `ux-researcher` ranks #150 of
+156 on a task about onboarding metrics, `security-auditor` #130 on one about
+authentication bugs, `risk-manager` #123 on a liability review. They are not
+ranked badly, they are not ranked at all, and their survival is decided by the
+alphabetical tie-break among the whole zero-scoring tail. A larger limit just
+admits more of that tail in alphabetical order. A hybrid that expands to whole
+categories reaches 15/16 and inflates the software shortlist to 132 of 156 — no
+saving.
+
+So this is a property of literal-token BM25 over this corpus, not a tuning
+problem: no threshold, weight or stopword change moves an agent whose
+description shares no token with the task. The decision to leave it unwired
+stands, now on six data points instead of one, and the test asserts the
+limitation **against the uncut baseline** rather than a hardcoded number — so
+the day a better ranker closes the gap, it fails and asks to be rewritten
+instead of quietly certifying a limitation that no longer exists.
+
+### Verified
+
+- **1,301 tests pass, 4 skipped**; typecheck clean across all three workspaces.
+  Up from 1,280.
+- **A shuffled-order run** (`--sequence.shuffle`, seed 20260811) passes
+  identically — closing one of the two items the first pass's test-suite
+  reviewer never reached. Requirement-to-test mapping is still not done.
+- Every design fix confirmed in the running browser rather than by reading:
+  heading outline, `aria-hidden` on the canvas with three keyboard-reachable
+  agent buttons beside it, `aria-current` on the selected run, `tabindex` on
+  both scroll containers, `opacity: 1` on the stopped tone, the retuned border
+  token, and the layout holding at both 1280px and 320px with no page-level
+  horizontal scrolling at either.
+- The 4 skips are unchanged: Windows symlink-escape tests that skip loudly.
+
+### Known gaps carried forward
+
+- **The ReDoS gate is still a static check and still cannot be complete.**
+  Unchanged: alternatives overlapping without a shared first character, and
+  repetition-free polynomial blowup. The only total fix is matching inside
+  something killable — a worker thread — which is a real architectural change
+  and not one to make on the way past.
+- **The two HTTP adapters still yield `tool` at different points** relative to a
+  round completing. Anthropic emits inside the stream at `content_block_stop`;
+  OpenAI after `consumeStream` returns, because its wire format has no per-call
+  completion signal to hang it on. Aligning them means moving Anthropic's, not
+  OpenAI's.
+- Requirement-to-test traceability (FR-*/NFR-* to test names) is still unbuilt.
+- No retention or pruning for `runs/`.

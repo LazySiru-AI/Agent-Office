@@ -15,6 +15,14 @@ export interface LogPaneProps {
   events: LoggedAgentEvent[];
 }
 
+/**
+ * How close to the bottom counts as "following the tail", in CSS pixels.
+ * Roughly two lines at this pane's 0.8rem monospace — enough to absorb
+ * sub-pixel scroll positions without treating a deliberate scroll-back of a
+ * screenful as still being at the end.
+ */
+const FOLLOW_TAIL_THRESHOLD_PX = 32;
+
 interface FeedLine {
   ts: number;
   key: string;
@@ -44,11 +52,41 @@ export function LogPane({ logs, events }: LogPaneProps): JSX.Element {
   useEffect(() => {
     const el = containerRef.current;
     if (el === null) return;
-    el.scrollTop = el.scrollHeight;
+    // Follow the tail only while the reader is already AT the tail. This used
+    // to run unconditionally on every new line, so scrolling back through a
+    // live run to read what an agent did was undone by the next event —
+    // roughly once a second on a busy run, which makes the history in this
+    // pane unreadable precisely while it is being written.
+    //
+    // The threshold is a few lines rather than exact equality: a fractional
+    // `scrollTop` from a trackpad, or a line arriving mid-scroll, should still
+    // count as "at the bottom".
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom <= FOLLOW_TAIL_THRESHOLD_PX) {
+      el.scrollTop = el.scrollHeight;
+    }
   }, [feed.length]);
 
   return (
-    <div className="log-pane" ref={containerRef}>
+    <div
+      className="log-pane"
+      ref={containerRef}
+      /* A 260px box with `overflow-y: auto` and nothing focusable inside it is
+         unreachable by keyboard: there is no way to put the caret in it and no
+         way to scroll it (WCAG 2.1.1). `tabIndex={0}` makes it a focus target,
+         which is what lets the arrow keys and Page Up/Down act on it, and the
+         browser's own scroll handling does the rest.
+
+         `role="log"` gives it a name and a purpose, and marks it as a feed
+         that appends. It is deliberately NOT `aria-live="polite"` on top of
+         that: this pane emits several lines a second on a real run, and
+         announcing each would render a screen reader useless for the rest of
+         the page. The things that genuinely need announcing announce
+         themselves — see `RunHeader`'s `role="alert"` on a run error. */
+      tabIndex={0}
+      role="log"
+      aria-label="Run activity"
+    >
       {feed.length === 0 && <p className="muted">No activity yet.</p>}
       {feed.map((line) => (
         <div key={line.key} className={`log-line log-line-${line.kind}`}>

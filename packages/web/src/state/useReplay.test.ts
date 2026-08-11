@@ -477,7 +477,17 @@ describe('foldEvents replaying a real dispatchRun, field for field (NFR-7, FR-M1
     });
   }
 
-  it('reconstructs the same RunState dispatchRun produced, from the persisted event log alone', async () => {
+  /**
+   * A run that exercises every branch replay has to reconstruct: a failure, a
+   * dependency skip, and one FR-M10 revision (which is the only thing that
+   * moves `attempts` past 1). Shared by the two tests below, which need the
+   * identical scenario and differ only in what they fold it onto.
+   */
+  async function setupRevisionScenario(): Promise<{
+    store: MemoryRunStore;
+    provider: ScriptedProvider;
+    run: RunState;
+  }> {
     const REVISION_MARKER = '[[REVIEW_VERDICT: REVISIONS_REQUESTED]]';
     const store = new MemoryRunStore();
     const provider = new ScriptedProvider({
@@ -498,6 +508,11 @@ describe('foldEvents replaying a real dispatchRun, field for field (NFR-7, FR-M1
       assignments: materialiseAssignments(builtPlan),
     };
     await store.saveRun(run);
+    return { store, provider, run };
+  }
+
+  it('reconstructs the same RunState dispatchRun produced, from the persisted event log alone', async () => {
+    const { store, provider, run } = await setupRevisionScenario();
 
     await dispatchRun({
       run,
@@ -568,14 +583,19 @@ describe('foldEvents replaying a real dispatchRun, field for field (NFR-7, FR-M1
       // reconstructions of the same fact to see that one of them was.
       expect(folded.usage).toEqual(real.usage);
 
-      // attempts: matches, but not because the fold reconstructs it — it
-      // can't (see useReplay.ts's file header: no AgentEvent carries a change
-      // in attempt count). It matches here only because `foldEvents`'s `base`
-      // *is* the post-dispatch `run` object, whose `attempts` the reset step
-      // deliberately leaves untouched. This is not evidence attempts survives
-      // replay from a bare event log; it is the documented, out-of-scope
-      // limitation, asserted so a regression in the reset step would still be
-      // caught.
+      // attempts: matches, and — unlike every previous version of this test —
+      // it now matches for a reason. It used to agree only because
+      // `foldEvents`'s `base` IS the post-dispatch `run` object, whose
+      // `attempts` the reset step left untouched; the comment here said so,
+      // and said plainly that this was not evidence the field survived replay
+      // from a bare log. It didn't: no `AgentEvent` carried a dispatch, so a
+      // run with an FR-M10 revision replayed as though it had been on its
+      // second attempt from the first frame.
+      //
+      // The `status` event carries `attempts` now, and the test below
+      // (`rebuilds attempts from the log alone`) folds onto a base with
+      // deliberately wrong values to prove the log is doing the work. This
+      // assertion stays as the end-to-end check that the two agree.
       expect(folded.attempts).toBe(real.attempts);
 
       // startedAt: the one field that DIVERGES by design, and is expected to.
@@ -593,6 +613,73 @@ describe('foldEvents replaying a real dispatchRun, field for field (NFR-7, FR-M1
         expect(Math.abs((folded.startedAt ?? 0) - real.startedAt)).toBeLessThan(1_000);
       }
     }
+  });
+
+  it('rebuilds attempts from the log alone, not from the base run it was handed', async () => {
+    // The previous test cannot prove this on its own: it folds onto the very
+    // `run` object dispatch just finished mutating, so a fold that ignored
+    // `attempts` entirely would still agree with it. This one poisons the
+    // base — every assignment claims 99 attempts — so the only way the
+    // assertions below can pass is if the numbers came off the `.jsonl`.
+    const { store, provider, run } = await setupRevisionScenario();
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    expect(run.assignments.find((a) => a.id === 'lead')?.attempts).toBe(2);
+
+    const allEvents: LoggedAgentEvent[] = [];
+    for (const assignment of run.assignments) {
+      allEvents.push(...(await store.readEvents(run.id, assignment.id)));
+    }
+    const lastTs = allEvents.reduce((max, e) => Math.max(max, e.ts), 0);
+
+    const poisoned: RunState = {
+      ...run,
+      assignments: run.assignments.map((a) => ({ ...a, attempts: 99 })),
+    };
+
+    const replayed = foldEvents(poisoned, allEvents, lastTs);
+    for (const real of run.assignments) {
+      const folded = replayed.assignments.find((a) => a.id === real.id);
+      expect(folded?.attempts, `${real.id} attempts came from the base, not the log`).toBe(
+        real.attempts,
+      );
+    }
+
+    // Mid-playback, before the revision's re-dispatch, the lead is on its
+    // FIRST attempt — the fact the old fold could never show, because it had
+    // only the run's final value to display.
+    const leadEvents = await store.readEvents(run.id, 'lead');
+    const firstDone = leadEvents.find((l) => l.event.t === 'status' && l.event.status === 'done');
+    expect(firstDone, 'fixture must contain the pre-revision `done`').toBeDefined();
+
+    const midway = foldEvents(poisoned, allEvents, firstDone?.ts ?? 0);
+    expect(midway.assignments.find((a) => a.id === 'lead')?.attempts).toBe(1);
+  });
+
+  it('leaves attempts at the base value for a log written before the field existed (NFR-7)', () => {
+    // Old `.jsonl` lines parse as `{ status }` with no `attempts`, and there
+    // is nothing in them to reconstruct a dispatch count from. Resetting to
+    // zero anyway would be a REGRESSION in old-log fidelity — the run would
+    // replay showing 0 attempts throughout, which it never did before. So
+    // `foldEvents` reads the log's vintage off the log and only resets when
+    // at least one event actually carries the field.
+    const base = baseRun([{ ...assignment('a1'), attempts: 3 }]);
+    const legacy: LoggedAgentEvent[] = [
+      { ts: 100, event: { t: 'status', assignmentId: 'a1', status: 'briefing' } },
+      { ts: 200, event: { t: 'status', assignmentId: 'a1', status: 'working' } },
+    ];
+
+    const folded = foldEvents(base, legacy, 500);
+    expect(folded.assignments[0]?.attempts).toBe(3);
+    // The rest of the fold still ran — this is a vintage check, not a bail-out.
+    expect(folded.assignments[0]?.status).toBe('working');
   });
 });
 
@@ -615,8 +702,11 @@ describe('resetAssignmentsForReplay', () => {
     expect(result?.agentName).toBe('agent-a1');
     expect(result?.deliverable).toBe('reports/a1.md');
     expect(result?.dependsOn).toEqual([]);
-    // attempts cannot be derived from the event contract (no AgentEvent
-    // carries it) — documented in useReplay.ts as an intentional non-reset.
+    // `attempts` survives this function even though it IS event-derived now.
+    // The reason changed: it used to be un-resettable because nothing could
+    // rebuild it; it is now un-reset *here* because whether it can be rebuilt
+    // depends on the vintage of the log, and this function is not given one.
+    // `foldEvents` is where that decision belongs and where it is made.
     expect(result?.attempts).toBe(2);
 
     expect(result?.status).toBe('pending');

@@ -17,6 +17,7 @@ import {
   statusGlyph,
   statusToken,
   statusToneClass,
+  WCAG_AA_LARGE_TEXT,
   WCAG_AA_NORMAL_TEXT,
   type StatusToken,
 } from './status.js';
@@ -176,15 +177,52 @@ describe('every text colour on every ground, both themes (WCAG AA — 4.5:1)', (
   }
 });
 
+describe('control boundaries meet WCAG 1.4.11 non-text contrast (3:1)', () => {
+  // `lineFirm` used to sit in DECORATIVE_KEYS below, exempted from every bar
+  // on the grounds that "it is only a border". Two different things were
+  // wearing that one label. A hairline BETWEEN sections is decoration and is
+  // genuinely exempt — delete it and you lose tidiness. The border AROUND a
+  // text input, select, textarea or button is the only thing that says a
+  // control is there, and WCAG 2.1 §1.4.11 covers exactly that: "visual
+  // information required to identify user interface components", at 3:1.
+  //
+  // Measured before this test existed: 1.41–1.90:1 across all four grounds in
+  // both themes — a form whose fields are effectively borderless. 3:1, not
+  // 4.5:1, because 1.4.11 is a non-text criterion; the value was chosen to
+  // clear it on the WORST ground (dark `surfaceRaised`, light `sunken`),
+  // which is the same lesson the text grid above already learned.
+  const GROUND_KEYS: (keyof ThemeTokens)[] = ['bg', 'surface', 'surfaceRaised', 'sunken'];
+  const CONTROL_BOUNDARY_KEYS: (keyof ThemeTokens)[] = ['lineFirm'];
+
+  for (const mode of THEME_MODES) {
+    for (const key of CONTROL_BOUNDARY_KEYS) {
+      for (const groundKey of GROUND_KEYS) {
+        it(`${mode}.${key} on ${mode}.${groundKey} meets ${WCAG_AA_LARGE_TEXT}:1`, () => {
+          const tokens = THEMES[mode];
+          const ratio = contrastRatio(tokens[key], tokens[groundKey]);
+          expect(
+            ratio >= WCAG_AA_LARGE_TEXT,
+            `${mode}.${key} (${tokens[key]}) on ${mode}.${groundKey} (${tokens[groundKey]}) measured ${ratio.toFixed(2)}:1, needs ${WCAG_AA_LARGE_TEXT}:1 for a control boundary (WCAG 1.4.11)`,
+          ).toBe(true);
+        });
+      }
+    }
+  }
+});
+
 describe('the tokens exempt from the text grid are exempt for a stated reason', () => {
-  // `accentDim`, `line` and `lineFirm` are absent from TEXT_KEYS above, and
-  // that absence is a claim: they are never load-bearing text. WCAG 1.4.3
-  // exempts pure decoration, and these are borders, focus rings and the `// `
+  // `accentDim` and `line` are absent from TEXT_KEYS above, and that absence
+  // is a claim: they are never load-bearing text. WCAG 1.4.3 exempts pure
+  // decoration, and these are section hairlines, focus rings and the `// `
   // sigil `styles.css` prefixes onto headings — removing them loses ornament,
   // not information. This test pins the claim so it cannot rot silently: if
   // one of them is ever promoted to real text, the honest fix is to move it
   // into TEXT_KEYS and retune it, not to quietly leave it unaudited.
-  const DECORATIVE_KEYS: (keyof ThemeTokens)[] = ['accentDim', 'line', 'lineFirm'];
+  //
+  // `lineFirm` used to be on this list and is not any more — see the 1.4.11
+  // block above for why "it is only a border" was covering two different
+  // jobs, one exempt and one not.
+  const DECORATIVE_KEYS: (keyof ThemeTokens)[] = ['accentDim', 'line'];
 
   for (const mode of THEME_MODES) {
     for (const key of DECORATIVE_KEYS) {
@@ -272,6 +310,31 @@ describe('tone classes match the stylesheet (FR-U2)', () => {
       expect(valid.has(statusToneClass(status)), `${status} → ${statusToneClass(status)}`).toBe(
         true,
       );
+    }
+  });
+
+  it('no tone rule fades itself out of the contrast grid it just passed', () => {
+    // The grid above grades the TOKEN. `opacity` on a tone rule means the
+    // browser paints something else: the whole chip — text, border and its
+    // `--ao-sunken` fill — composites toward whatever it happens to sit on,
+    // and both sides of the pair move at once.
+    //
+    // This is not hypothetical. `.status-tone-stopped` carried `opacity: .85`,
+    // which passed the grid at 5.49:1 (dark) and 6.25:1 (light) on the raw
+    // token and rendered at 4.25–4.41:1 — under AA in both themes, on every
+    // surface, for `cancelled` and `skipped`. It is Phase 8's own lesson one
+    // level down: measure the colour the browser paints, not the one the
+    // token holds. Distinguishing a tone is what the glyph and the hue are
+    // for; a tone that needs to be dimmer needs a dimmer VALUE in `tokens.ts`,
+    // where the grid can see it.
+    for (const token of ALL_STATUS_TOKENS) {
+      const toneClass = `status-tone-${token.replace(/^status/, '').toLowerCase()}`;
+      const rule = css.slice(css.indexOf(`.${toneClass} {`));
+      const body = rule.slice(0, rule.indexOf('}'));
+      expect(
+        body,
+        `.${toneClass} sets opacity, so what it renders at is not what the contrast grid measured`,
+      ).not.toContain('opacity');
     }
   });
 

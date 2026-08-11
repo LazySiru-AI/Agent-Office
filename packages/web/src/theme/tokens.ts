@@ -36,7 +36,21 @@ export interface ThemeTokens {
   inkSoft: string;
   inkMute: string;
 
+  /** Hairline dividers between sections. Decoration — carries no information. */
   line: string;
+  /**
+   * The border of an interactive control — text inputs, selects, textareas and
+   * buttons all draw their outline in this.
+   *
+   * That makes it the *boundary of a UI component*, which WCAG 2.1 §1.4.11
+   * requires to clear 3:1 against its adjacent surface, and it did not: at its
+   * original `#2c3746` / `#b3bdc8` it measured 1.41–1.90:1 across the four
+   * grounds in both themes. It had been filed alongside `line` as decorative,
+   * and for a divider that is true; for the edge that tells you where a text
+   * field begins it is not — remove it and there is no other cue that the
+   * field is there at all. `status.test.ts` now grades it against 3:1 on every
+   * ground rather than exempting it.
+   */
   lineFirm: string;
 
   /** The single primary accent. Everything else is status. */
@@ -86,7 +100,7 @@ export const THEMES: Record<ThemeMode, ThemeTokens> = {
     inkMute: '#8394a8',
 
     line: '#1e2732',
-    lineFirm: '#2c3746',
+    lineFirm: '#5b6b80',
 
     accent: '#2ee6d6',
     accentDim: '#1b8f86',
@@ -111,7 +125,7 @@ export const THEMES: Record<ThemeMode, ThemeTokens> = {
     inkMute: '#55616e',
 
     line: '#d3dae2',
-    lineFirm: '#b3bdc8',
+    lineFirm: '#74828f',
 
     accent: '#0b665e',
     accentDim: '#08453f',

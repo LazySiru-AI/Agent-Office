@@ -89,11 +89,25 @@ export function RunList({ runs, selectedRunId, onSelect }: RunListProps): JSX.El
             <button
               type="button"
               className={run.id === selectedRunId ? 'run-list-item selected' : 'run-list-item'}
+              /* Which run is open was carried by an accent border and a glow
+                 and nothing else, so assistive technology had no way to tell
+                 one row from another. `aria-current="true"` rather than
+                 `aria-pressed`: this is "the one you are looking at", not a
+                 toggle that stays on. */
+              {...(run.id === selectedRunId ? { 'aria-current': true as const } : {})}
               onClick={() => onSelect(run.id)}
             >
               <span className="run-list-head">
                 <StatusBadge status={run.status} />
-                {run.live && <span className="live-dot" title="executing in this server process" />}
+                {/* The dot's `title` was its only carrier — not announced, and
+                    gone entirely without colour. The word rides along in the
+                    button's accessible name instead. */}
+                {run.live && (
+                  <>
+                    <span className="live-dot" aria-hidden="true" />
+                    <span className="visually-hidden">executing in this server process</span>
+                  </>
+                )}
                 <span className="run-list-age">{formatAge(run.updatedAt, now)}</span>
               </span>
               <span className="run-list-task" title={run.task}>

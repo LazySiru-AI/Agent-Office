@@ -101,8 +101,13 @@ export function ReplayControls({
       />
 
       {!hasEvents && <p className="muted">This run has no recorded events to replay yet.</p>}
+      {/* `.replay-partial`, not `.muted`. The stylesheet has carried a
+          `.replay-partial` rule — the amber warning tone — since Phase 8 and
+          nothing ever used it, so this notice rendered in the same grey as
+          "Loading…". "What you are watching is missing activity" is a caveat
+          on everything else on screen; grey is the wrong weight for it. */}
       {partial && (
-        <p className="muted">
+        <p className="replay-partial">
           Replay is partial — at least one assignment&apos;s log could not be read; the reconstruction may be
           missing activity.
         </p>

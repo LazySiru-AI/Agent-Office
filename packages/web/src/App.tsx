@@ -110,6 +110,14 @@ export function App(): JSX.Element {
   return (
     <div className="app-shell">
       <aside className="sidebar">
+        {/* The page's only `h1`, and it is here rather than on the run header
+            for two reasons. It names the DOCUMENT — a run id is a name for one
+            thing inside it, not for the page — and it exists before a run is
+            selected, which is when the header renders a `<p>` and the app used
+            to have no top-level heading at all. Everything below is `h2`, so
+            the outline now reads title → sections instead of opening on a
+            section and hitting the `h1` three landmarks later. */}
+        <h1 className="app-title">Agent Office</h1>
         {/* Every run setting is forwarded, not just the two the form used to
             display. The panel had fields for an assignment timeout, a token
             budget and a cost budget; the form built its request from `provider`

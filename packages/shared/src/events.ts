@@ -55,6 +55,26 @@ export const AgentEventSchema = z.discriminatedUnion('t', [
      * mentioned".
      */
     endedAtCleared: z.literal(true).optional(),
+    /**
+     * Dispatch attempt count, as of this transition.
+     *
+     * `dispatcher.ts`'s `executeAssignment` already hands `setStatus` an
+     * `attempts` in the same patch as the opening `briefing` — it was simply
+     * never put on the event, and that omission was the one field replay
+     * could not reconstruct at all: no other variant records a change in
+     * attempt count, so `useReplay.ts`'s fold had to leave `attempts` at
+     * whatever the fetched base `RunState` held (normally the run's FINAL
+     * value) for the whole of playback. A run whose reviewer sent work back
+     * once therefore replayed as though it had always been on its second
+     * attempt, from the first frame.
+     *
+     * Optional for the same reason the three fields above are: every
+     * `.jsonl` line written before this existed parses without it, and absent
+     * must keep meaning "this transition said nothing about `attempts`", not
+     * "reset it to zero". Only `briefing` carries it in practice, because
+     * that is the only transition that changes it.
+     */
+    attempts: z.number().int().nonnegative().optional(),
   }),
   z.object({ ...base, t: z.literal('text'), chunk: z.string() }),
   z.object({
