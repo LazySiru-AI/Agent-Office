@@ -94,6 +94,47 @@ export function resolveMotion(stored: string | undefined, systemPrefersReducedMo
 }
 
 // --------------------------------------------------------------------------
+// Office plate density (FR-S10)
+// --------------------------------------------------------------------------
+
+/**
+ * How much each desk plate states.
+ *
+ * FR-S10 requires the office to show the model, spend and current tool without
+ * a click, and the risk it names is that five facts per desk make the office
+ * less scannable than the table it is supposed to beat. So the amount is a
+ * user control rather than a designer's guess:
+ *
+ * - `minimal` — the agent's name. What the office showed before this phase.
+ * - `normal` — name, model, and the current tool while working. The default:
+ *   these are the facts you cannot get anywhere else without leaving the view,
+ *   and each is at most a short line.
+ * - `verbose` — adds tokens and estimated spend per desk. Genuinely noisy on a
+ *   wide team, and exactly what you want the moment a run surprises you.
+ *
+ * A display preference, so it lives here beside theme and motion rather than
+ * in `useSettings` — `RunSettings` is what a run is started WITH, and this
+ * changes nothing about the run. Getting that wrong would put a rendering
+ * choice on the wire.
+ */
+export type PlateDensity = 'minimal' | 'normal' | 'verbose';
+
+const DENSITY_STORAGE_KEY = 'agent-office.plate-density';
+
+const DEFAULT_PLATE_DENSITY: PlateDensity = 'normal';
+
+export const PLATE_DENSITIES: readonly PlateDensity[] = ['minimal', 'normal', 'verbose'];
+
+function isPlateDensity(value: string): value is PlateDensity {
+  return (PLATE_DENSITIES as readonly string[]).includes(value);
+}
+
+/** Stored value → a density, falling back to the default for anything unrecognised. */
+export function resolvePlateDensity(stored: string | undefined): PlateDensity {
+  return stored !== undefined && isPlateDensity(stored) ? stored : DEFAULT_PLATE_DENSITY;
+}
+
+// --------------------------------------------------------------------------
 // Browser-facing helpers — every one guarded so import-time and call-time
 // never throw outside a browser (Node tests, SSR, private-browsing storage).
 // --------------------------------------------------------------------------
@@ -169,6 +210,11 @@ export interface UseThemeResult {
   /** What's actually in effect right now — 'on' | 'off'. */
   resolvedMotion: ResolvedMotion;
   setMotionPreference: (preference: MotionPreference) => void;
+
+  /** How much each desk plate states (FR-S10). No system preference to resolve
+   *  against, so unlike theme and motion this is simply what was picked. */
+  plateDensity: PlateDensity;
+  setPlateDensity: (density: PlateDensity) => void;
 }
 
 /**
@@ -190,6 +236,10 @@ export function useTheme(): UseThemeResult {
   });
   const [systemPrefersReducedMotion, setSystemPrefersReducedMotion] = useState<boolean>(
     systemPrefersReducedMotionNow,
+  );
+
+  const [plateDensity, setPlateDensityState] = useState<PlateDensity>(() =>
+    resolvePlateDensity(readStorage(DENSITY_STORAGE_KEY)),
   );
 
   // React to the OS-level preference changing while the app stays open
@@ -225,6 +275,11 @@ export function useTheme(): UseThemeResult {
     writeStorage(MOTION_STORAGE_KEY, preference);
   }, []);
 
+  const setPlateDensity = useCallback((density: PlateDensity) => {
+    setPlateDensityState(density);
+    writeStorage(DENSITY_STORAGE_KEY, density);
+  }, []);
+
   return {
     themePreference,
     resolvedTheme,
@@ -232,5 +287,7 @@ export function useTheme(): UseThemeResult {
     motionPreference,
     resolvedMotion,
     setMotionPreference,
+    plateDensity,
+    setPlateDensity,
   };
 }

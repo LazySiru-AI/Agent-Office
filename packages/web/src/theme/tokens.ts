@@ -161,6 +161,18 @@ export const OFFICE = {
   /** Underside of a desk. Darker than `desk`, so furniture reads as solid. */
   deskLeg: '#18202c',
   nameplate: '#9fb2c4',
+  /**
+   * The desk plate's secondary lines — model, current tool, spend (FR-S10).
+   *
+   * Deliberately dimmer than `nameplate`: measured 4.78:1 at worst against the
+   * three grounds it lands on (background, and both floor tiles), against
+   * `nameplate`'s 7.95:1. Both clear WCAG AA for normal text — this is real
+   * information, not decoration, so it is held to the same 4.5:1 bar as the
+   * DOM chrome and `sim/officeText.test.ts` enforces it. The gap between the
+   * two is what makes a floor of desks scannable by name: the name is what you
+   * search for, the detail is what you read once you have found it.
+   */
+  plateDetail: '#78889b',
   /** Sprite outlines and eyes — near-black, but its own token: an outline that
    *  tracked the backdrop would vanish the moment the backdrop was retuned. */
   outline: '#05070a',

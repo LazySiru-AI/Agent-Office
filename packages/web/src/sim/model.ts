@@ -3,9 +3,14 @@ import {
   type AssignmentState,
   type AssignmentStatus,
   type CharacterBehaviour,
+  type LoggedAgentEvent,
   type RunState,
+  type Usage,
 } from '@agent-office/shared';
+import { assignmentCostUsd, effectiveModelFor, formatCostUsd } from '../costModel.js';
 import { SPRITE_RAMP } from '../theme/tokens.js';
+import type { PlateDensity } from '../theme/useTheme.js';
+import type { SpriteAnimation } from './spriteContract.js';
 
 /**
  * The office as data (PLAN.md §1.2, FR-S1–FR-S3).
@@ -179,17 +184,122 @@ export function appearanceFor(agentName: string): AgentAppearance {
   };
 }
 
+/**
+ * Tools that read rather than change things (FR-S11).
+ *
+ * The taxonomy is deliberately a small allowlist of the canonical names
+ * `apiTools.ts` defines, not a heuristic over the string. An unknown tool —
+ * an MCP tool, a future built-in — falls through to the writing animation,
+ * which is the honest default: "this agent is doing something" is true of
+ * every tool, whereas claiming it is reading would be a guess.
+ */
+const READING_TOOLS: ReadonlySet<string> = new Set(['Read', 'Glob', 'Grep']);
+
+export function isReadingTool(toolName: string | undefined): boolean {
+  return toolName !== undefined && READING_TOOLS.has(toolName);
+}
+
+/**
+ * Refine a status-derived animation with the tool actually running.
+ *
+ * This is the whole of FR-S11, and the narrowness is the point. Status still
+ * decides *behaviour* — where the character is, what bubble it shows, whether
+ * it carries paper — and `shared/src/status.ts` remains the only owner of
+ * that. The tool changes exactly one thing: which working loop plays. So the
+ * refinement applies to `type` and nothing else, and a tool arriving while a
+ * character is walking to the Manager cannot make it sit down.
+ *
+ * Living here rather than in `shared` is deliberate. A tool taxonomy is a
+ * rendering concern — `Grep` looks like reading — and the orchestrator has no
+ * business knowing which of its tools look studious. What `shared` owns is
+ * that the animation input came from an orchestrator event at all, which is
+ * FR-S3's actual invariant.
+ */
+export function refineAnimation(
+  animation: SpriteAnimation,
+  currentTool: string | undefined,
+): SpriteAnimation {
+  if (animation !== 'type') return animation;
+  return isReadingTool(currentTool) ? 'read' : 'type';
+}
+
+/**
+ * The most recent `tool` event per assignment, from the persisted event log.
+ *
+ * Pure and exported so it is testable without a canvas or a DOM, matching the
+ * convention `useReplay.ts`'s `foldEvents` and `useSettings.ts`'s parsers
+ * already follow — the web package's tests run under plain Node.
+ *
+ * Events are scanned in order and later ones overwrite earlier ones, so this
+ * does not assume the caller sorted them by anything but arrival. That matches
+ * how both the live stream and replay hand them over.
+ */
+export function latestToolByAssignment(
+  events: readonly LoggedAgentEvent[],
+): Map<string, string> {
+  const latest = new Map<string, string>();
+  for (const logged of events) {
+    if (logged.event.t === 'tool') latest.set(logged.event.assignmentId, logged.event.name);
+  }
+  return latest;
+}
+
+/**
+ * The run facts the office needs but cannot derive from `AssignmentState`
+ * alone — the agent roster's models, the run's provider, and the tool stream.
+ *
+ * All of it already existed in `App.tsx` and stopped at the table. Passing it
+ * in rather than fetching it here keeps `model.ts` a pure function of its
+ * arguments, which is what lets replay drive the identical office from
+ * reconstructed state.
+ */
+export interface SceneContext {
+  /** From `buildAgentModelIndex` — agent name to its catalog `model:` frontmatter. */
+  agentModelByName: Map<string, string | undefined>;
+  /** The provider this run used, which decides only whether it was free. */
+  runProvider: string | undefined;
+  /** From {@link latestToolByAssignment}. */
+  toolByAssignment: Map<string, string>;
+}
+
+const EMPTY_CONTEXT: SceneContext = {
+  agentModelByName: new Map(),
+  runProvider: undefined,
+  toolByAssignment: new Map(),
+};
+
 /** Everything the renderer needs about one character, for one frame. */
 export interface CharacterView {
   assignmentId: string;
   agentName: string;
   status: AssignmentStatus;
   behaviour: CharacterBehaviour;
+  /** `behaviour.animation` after FR-S11's tool refinement. Draw this, not the raw one. */
+  animation: SpriteAnimation;
   appearance: AgentAppearance;
   /** This character's own desk. */
   home: DeskSlot;
   /** Where it should be right now, per `behaviour.location`. */
   target: Point;
+
+  // -- FR-S10: the facts the office used to make you leave to find --------
+
+  /** Catalog model for this agent, or `undefined` for the 8 that declare none. */
+  model: string | undefined;
+  /** Tokens spent so far by this assignment. */
+  usage: Usage;
+  /**
+   * Estimated spend, or `undefined` when the model is unknown or unpriced.
+   *
+   * Computed by `costModel.ts`'s `assignmentCostUsd` — the same function the
+   * assignment table calls, deliberately, and not a second implementation.
+   * Two independent cost calculations disagreeing about one run is precisely
+   * the defect class this project keeps finding, and the office showing a
+   * different number from the table would be the most visible version of it.
+   */
+  costUsd: number | undefined;
+  /** Name of the most recent tool, while this assignment is working. */
+  currentTool: string | undefined;
 }
 
 export interface OfficeScene {
@@ -221,7 +331,10 @@ export function targetFor(
  * replay can call it with reconstructed assignments without having to
  * manufacture a plausible run around them.
  */
-export function buildSceneFromAssignments(assignments: readonly AssignmentState[]): OfficeScene {
+export function buildSceneFromAssignments(
+  assignments: readonly AssignmentState[],
+  context: SceneContext = EMPTY_CONTEXT,
+): OfficeScene {
   const layout = layoutOffice(assignments.length);
 
   const characters = assignments.map((assignment, index) => {
@@ -231,20 +344,120 @@ export function buildSceneFromAssignments(assignments: readonly AssignmentState[
     // total rather than throwing inside a render loop.
     const home = layout.desks[index] ?? layout.managerDesk;
 
+    // Only while the assignment is actually working. A `tool` event is the
+    // last one an assignment emitted, and it stays in the log forever — so
+    // without this guard a finished agent would sit at its desk under a plate
+    // still reading "Grep TODO", describing work that ended minutes ago. The
+    // tool is a statement about the present tense or it is noise.
+    const currentTool =
+      assignment.status === 'working'
+        ? context.toolByAssignment.get(assignment.id)
+        : undefined;
+
     return {
       assignmentId: assignment.id,
       agentName: assignment.agentName,
       status: assignment.status,
       behaviour,
+      animation: refineAnimation(behaviour.animation, currentTool),
       appearance: appearanceFor(assignment.agentName),
       home,
       target: targetFor(behaviour, home, layout),
+      model: effectiveModelFor(assignment, context.agentModelByName, context.runProvider),
+      usage: assignment.usage,
+      costUsd: assignmentCostUsd(assignment, context.agentModelByName, context.runProvider),
+      currentTool,
     };
   });
 
   return { layout, characters };
 }
 
-export function buildScene(run: RunState | undefined): OfficeScene {
-  return buildSceneFromAssignments(run?.assignments ?? []);
+export function buildScene(run: RunState | undefined, context?: SceneContext): OfficeScene {
+  return buildSceneFromAssignments(run?.assignments ?? [], context);
+}
+
+// ---------------------------------------------------------------------------
+// The desk plate (FR-S10)
+// ---------------------------------------------------------------------------
+
+/**
+ * A short, human line describing what an agent is doing right now.
+ *
+ * `LogPane` formats the same fact for its feed and this is deliberately not a
+ * second spelling of it: both call this. A tool line that read `Grep TODO` in
+ * the log and `grep: TODO` on the plate would be two vocabularies for one
+ * event, which is how a UI starts feeling assembled rather than designed.
+ */
+export function formatToolLine(name: string, summary: string): string {
+  const trimmed = summary.trim();
+  return trimmed.length === 0 ? name : `${name} ${trimmed}`;
+}
+
+/**
+ * `inherit`, the catalog's sentinel for "whatever the run is using".
+ *
+ * Not a model, despite living in the `model:` frontmatter field. `provider.ts`
+ * filters it out before it can reach `--model` for exactly that reason.
+ */
+const INHERIT_MODEL = 'inherit';
+
+/** What a plate should call this agent's model. */
+const RUN_DEFAULT_LABEL = 'run default';
+
+/**
+ * Turn a catalog `model:` value into something a reader learns from.
+ *
+ * The first version of this simply printed `view.model ?? '—'`, and the
+ * running app showed it up immediately: two of the five agents on screen said
+ * `inherit`, which names no model and reads like one. **33 of the 156 catalog
+ * agents** are affected — 25 declare `inherit`, 8 declare nothing at all — so
+ * over a fifth of the roster would have shipped a plate that either said
+ * nothing useful or said something false.
+ *
+ * Both cases collapse to one label, deliberately, because operationally they
+ * are one case: an agent declaring `inherit` and an agent declaring no model
+ * both run on whatever the run is using. Distinguishing them on the plate
+ * would be reporting a frontmatter detail rather than what is running, which
+ * is the opposite of what FR-S10 is for.
+ */
+export function formatModelLabel(model: string | undefined): string {
+  if (model === undefined || model === INHERIT_MODEL) return RUN_DEFAULT_LABEL;
+  return model;
+}
+
+/**
+ * The lines of one desk plate, at a given density.
+ *
+ * Pure, exported and returning an array of strings rather than drawing
+ * anything — which is what lets the canvas and the office's screen-reader
+ * alternative render the *same* words from the *same* function. FR-S12 and
+ * the second QA pass's text alternative both depend on that: a plate whose
+ * contents were assembled inside the Pixi renderer could not be read out, and
+ * a text alternative that reassembled them independently would drift.
+ *
+ * Empty strings are never returned — a caller can join the array without
+ * having to filter it.
+ */
+export function plateLines(view: CharacterView, density: PlateDensity): string[] {
+  const lines = [view.agentName];
+  if (density === 'minimal') return lines;
+
+  lines.push(formatModelLabel(view.model));
+
+  if (view.currentTool !== undefined) lines.push(view.currentTool);
+
+  if (density === 'verbose') {
+    const { inputTokens, outputTokens } = view.usage;
+    if (inputTokens > 0 || outputTokens > 0) {
+      lines.push(`${inputTokens}in/${outputTokens}out`);
+    }
+    // Only when it is actually known. `formatCostUsd` renders an unknown cost
+    // as a dash, which is right in the run header where the row exists either
+    // way; here an unpriced agent is better served by one fewer line than by a
+    // line that says nothing.
+    if (view.costUsd !== undefined) lines.push(formatCostUsd(view.costUsd));
+  }
+
+  return lines;
 }

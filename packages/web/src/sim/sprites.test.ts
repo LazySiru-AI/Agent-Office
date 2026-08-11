@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { appearanceFor, type AgentAppearance } from './model.js';
-import { FRAMES_PER_ANIMATION, SPRITE_HEIGHT, SPRITE_WIDTH, type Facing, type PropName, type SpriteAnimation } from './spriteContract.js';
+import { FRAMES_PER_ANIMATION, SPRITE_ANIMATIONS, SPRITE_HEIGHT, SPRITE_WIDTH, type Facing, type PropName } from './spriteContract.js';
 import { SPRITE_MANIFEST } from './sprites.js';
 
 /**
@@ -12,7 +12,12 @@ import { SPRITE_MANIFEST } from './sprites.js';
  * try/catch, so it is tested exhaustively here rather than spot-checked.
  */
 
-const ANIMATIONS: readonly SpriteAnimation[] = ['idle', 'idle_relaxed', 'idle_slumped', 'walk', 'type'];
+// Taken from the contract, not retyped. This list was a hardcoded copy, which
+// meant an animation added to the union was exercised by nothing: every test
+// below iterates this array, so the suite would have stayed green while
+// silently covering one fewer animation than existed. Importing it makes the
+// coverage follow the type.
+const ANIMATIONS = SPRITE_ANIMATIONS;
 const FACINGS: readonly Facing[] = ['down', 'up', 'left', 'right'];
 const PROP_NAMES: readonly PropName[] = [
   'desk',

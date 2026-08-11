@@ -1,6 +1,7 @@
 import { Application, Container, Graphics, Sprite, Text, Texture, type Ticker } from 'pixi.js';
 import {
   layoutOffice,
+  plateLines,
   TILE,
   type AgentAppearance,
   type CharacterView,
@@ -11,6 +12,7 @@ import {
 } from './model.js';
 import type { Facing, PixelGrid, PropName, SpriteAnimation, SpriteManifest } from './spriteContract.js';
 import { OFFICE, toPixiColour } from '../theme/tokens.js';
+import type { PlateDensity } from '../theme/useTheme.js';
 
 /**
  * The pixel-office renderer (PLAN.md §1.2, FR-S1–FR-S7).
@@ -225,13 +227,19 @@ export function hitTest(entities: readonly HitTestEntity[], point: Point): strin
  * Whether a desk should show the work glow (FR-U3's one new affordance for
  * this phase).
  *
- * Reads `behaviour.animation` — the same field `syncCharacters` already uses
- * to pick the body sprite — rather than comparing `status === 'working'`
- * separately. `ASSIGNMENT_BEHAVIOUR` in `@agent-office/shared` is the single
- * place status maps to what's on screen (FR-S3); a second comparison here
- * would be a second source that could quietly drift from the first if the
- * behaviour table ever changed. No new state is introduced — this is a pure
- * read of a `CharacterView` the scene already has.
+ * Reads the RAW `behaviour.animation` rather than the tool-refined
+ * `view.animation` that `syncCharacters` now draws, and the distinction is
+ * load-bearing rather than an oversight. FR-S11 splits the working loop into
+ * `type` and `read` according to which tool is running, but an agent running
+ * `Grep` is working exactly as much as one running `Write` — the glow means
+ * "this desk is busy", so it must survive the split. Keying it on the refined
+ * animation would switch the light off every time an agent read a file.
+ *
+ * Still not `status === 'working'`, for the original reason:
+ * `ASSIGNMENT_BEHAVIOUR` in `@agent-office/shared` is the single place status
+ * maps to what's on screen (FR-S3), and a second comparison here could drift
+ * from it. No new state is introduced — this is a pure read of a
+ * `CharacterView` the scene already has.
  */
 export function isWorkGlowing(behaviour: CharacterView['behaviour']): boolean {
   return behaviour.animation === 'type';
@@ -318,15 +326,29 @@ interface CharacterRenderState {
   bubbleSprite: Sprite;
   paperSprite: Sprite;
   selectionRing: Graphics;
+  /** The whole plate — name line plus however many detail lines the density asks for. */
+  plate: Container;
   nameplate: Text;
+  /** Detail lines under the name, created lazily and reused across renders. */
+  detailLines: Text[];
   /** Tile-space, floating-point — this is the walk-interpolation state (FR-S6). */
   currentPos: Point;
   target: Point;
   facing: Facing;
   animation: SpriteAnimation;
   appearance: AgentAppearance;
-  /** Static desk tile the nameplate is pinned under; does not move when the character walks. */
-  homeDeskTile: Point;
+  /**
+   * Static tile the plate is pinned under; does not move when the character
+   * walks, so a desk stays labelled while its occupant is at the Manager.
+   *
+   * The SEAT, not the desk. Pinning it under the desk tile put the text one
+   * tile above the character's feet — i.e. straight through its body — which
+   * a single short nameplate mostly got away with and a two- or four-line
+   * plate does not: the screenshot that caught this had "run default" printed
+   * across a sprite's chest. The seat's own tile is where the character
+   * stands, so one tile below it is the first row that is reliably clear.
+   */
+  plateAnchorTile: Point;
   frameIndex: number;
   frameElapsedMs: number;
   lastTextureKey: string | undefined;
@@ -342,6 +364,30 @@ const BACKGROUND_COLOUR = toPixiColour(OFFICE.background);
 const NAMEPLATE_GAP_PX = 2;
 const NAMEPLATE_COLOUR = toPixiColour(OFFICE.nameplate);
 const SELECTION_RING_COLOUR = toPixiColour(OFFICE.selection);
+/**
+ * The plate's secondary lines — model, tool, spend (FR-S10).
+ *
+ * Dimmer than the name on purpose. The agent's name is what you scan a floor
+ * of desks for; everything under it is detail you read once you have found the
+ * desk you wanted. Giving all four lines equal weight would make a five-agent
+ * office twenty equally-loud strings, which is the clutter failure the phase's
+ * own risk note calls out.
+ */
+const PLATE_DETAIL_COLOUR = toPixiColour(OFFICE.plateDetail);
+/** Point size of the name line, and of the detail lines beneath it. */
+const PLATE_NAME_SIZE = 10;
+const PLATE_DETAIL_SIZE = 8;
+/** Leading between plate lines, in unscaled pixels. */
+const PLATE_LINE_HEIGHT = 9;
+/**
+ * Hover (and keyboard-focus) ring strength, against selection's full opacity.
+ *
+ * Two strengths for one ring rather than two different shapes, which is the
+ * approach pixel-agents takes for the same problem: hover is a question ("this
+ * one?") and selection is a statement ("this one"), and the reader needs to
+ * tell them apart at a glance without learning a second visual vocabulary.
+ */
+const HOVER_RING_ALPHA = 0.45;
 /** Cast under a desk whose agent is currently `working` — see `isWorkGlowing`. */
 const WORK_GLOW_COLOUR = toPixiColour(OFFICE.workGlow);
 /** Soft, not solid — a glow that competed with the selection ring or a status
@@ -389,6 +435,10 @@ export class OfficeSceneRenderer {
   private lastContainerHeight: number | undefined;
   private selectedId: string | undefined;
   private lastHoverId: string | undefined;
+  private hoveredId: string | undefined;
+  private plateDensity: PlateDensity = 'normal';
+  /** Kept so a density change can redraw plates without waiting for the next scene push. */
+  private latestCharacters: readonly CharacterView[] = [];
 
   private reducedMotion = false;
   private initialized = false;
@@ -487,6 +537,7 @@ export class OfficeSceneRenderer {
 
   private applyScene(scene: OfficeScene): void {
     this.latestLayout = scene.layout;
+    this.latestCharacters = scene.characters;
     this.rebuildFloorAndDesks(scene.layout);
     this.syncCharacters(scene.characters);
     this.rebuildWorkGlows(scene.characters);
@@ -498,8 +549,50 @@ export class OfficeSceneRenderer {
   /** Marks one assignment's character as selected (or none, for `undefined`). */
   setSelected(assignmentId: string | undefined): void {
     this.selectedId = assignmentId;
+    this.refreshHighlights();
+  }
+
+  /**
+   * Marks one character as hovered — by pointer, or by keyboard focus landing
+   * on its button in the office's text alternative (FR-S12).
+   *
+   * Separate from `setSelected` because they mean different things and can be
+   * true at once: selected is "the inspect panel is showing this one", hovered
+   * is "you are pointing at, or focused on, this one". They render at
+   * different strengths for the same reason.
+   */
+  setHovered(assignmentId: string | undefined): void {
+    this.hoveredId = assignmentId;
+    this.refreshHighlights();
+  }
+
+  /** How much of each desk plate to draw (FR-S10). Applies immediately. */
+  setPlateDensity(density: PlateDensity): void {
+    if (this.plateDensity === density) return;
+    this.plateDensity = density;
+    // Redraw from the characters already on screen rather than waiting for the
+    // next scene push: on a finished run there is no next push, and a density
+    // control that only takes effect when something else changes reads as
+    // broken.
+    for (const view of this.latestCharacters) {
+      const state = this.characters.get(view.assignmentId);
+      if (state !== undefined) this.syncPlate(state, view);
+    }
+  }
+
+  /**
+   * One place that decides what each character's ring looks like.
+   *
+   * Selection wins over hover when both point at the same character — the
+   * stronger statement is the true one, and flickering between two ring
+   * alphas as the pointer crosses the selected desk would be noise.
+   */
+  private refreshHighlights(): void {
     for (const [id, state] of this.characters) {
-      state.selectionRing.visible = id === assignmentId;
+      const selected = id === this.selectedId;
+      const hovered = id === this.hoveredId;
+      state.selectionRing.visible = selected || hovered;
+      state.selectionRing.alpha = selected ? 1 : HOVER_RING_ALPHA;
     }
   }
 
@@ -758,11 +851,12 @@ export class OfficeSceneRenderer {
       }
 
       state.target = view.target;
-      state.animation = view.behaviour.animation;
+      // The tool-refined animation (FR-S11), not `behaviour.animation`.
+      state.animation = view.animation;
       state.appearance = view.appearance;
-      state.homeDeskTile = view.home.desk;
+      state.plateAnchorTile = view.home.seat;
 
-      if (state.nameplate.text !== view.agentName) state.nameplate.text = view.agentName;
+      this.syncPlate(state, view);
 
       state.bubbleSprite.visible = view.behaviour.bubble !== 'none';
       if (view.behaviour.bubble !== 'none') {
@@ -774,7 +868,11 @@ export class OfficeSceneRenderer {
     for (const [id, state] of this.characters) {
       if (seen.has(id)) continue;
       state.root.destroy({ children: true });
-      state.nameplate.destroy();
+      // `{ children: true }` — the plate owns the name line and every detail
+      // line, so destroying it destroys them. Before the plate existed this
+      // destroyed the single `nameplate` directly; leaving that call in place
+      // would have leaked one `Text` per detail line per finished run.
+      state.plate.destroy({ children: true });
       this.characters.delete(id);
     }
 
@@ -806,9 +904,16 @@ export class OfficeSceneRenderer {
     const nameplate = new Text({
       text: view.agentName,
       anchor: { x: 0.5, y: 0 },
-      style: { fill: NAMEPLATE_COLOUR, fontFamily: 'monospace', fontSize: 10 },
+      style: { fill: NAMEPLATE_COLOUR, fontFamily: 'monospace', fontSize: PLATE_NAME_SIZE },
     });
-    this.uiLayer?.addChild(nameplate);
+
+    // One container per plate rather than positioning each line against the
+    // desk independently: the plate moves as a unit when the viewport rescales,
+    // and `repositionNameplates` stays a single write per character however
+    // many lines the density asks for.
+    const plate = new Container();
+    plate.addChild(nameplate);
+    this.uiLayer?.addChild(plate);
 
     return {
       root,
@@ -816,25 +921,73 @@ export class OfficeSceneRenderer {
       bubbleSprite,
       paperSprite,
       selectionRing,
+      plate,
       nameplate,
+      detailLines: [],
       currentPos: { ...view.home.seat },
       target: { ...view.target },
       facing: 'down',
-      animation: view.behaviour.animation,
+      animation: view.animation,
       appearance: view.appearance,
-      homeDeskTile: { ...view.home.desk },
+      plateAnchorTile: { ...view.home.seat },
       frameIndex: 0,
       frameElapsedMs: 0,
       lastTextureKey: undefined,
     };
   }
 
+  /**
+   * Bring one character's plate into line with its view (FR-S10).
+   *
+   * `plateLines` decides the words — the same function the office's
+   * screen-reader alternative calls, so the two cannot describe the same desk
+   * differently. This method only decides how many `Text` objects exist and
+   * what they say.
+   *
+   * Lines are pooled rather than recreated: a plate updates on every scene
+   * push, several times a second on a live run, and destroying and rebuilding
+   * three `Text` objects at that rate churns GPU texture uploads for text that
+   * usually has not changed. Surplus lines are hidden rather than destroyed
+   * for the same reason — a density toggle should not cost a reallocation.
+   */
+  private syncPlate(state: CharacterRenderState, view: CharacterView): void {
+    const [name = view.agentName, ...details] = plateLines(view, this.plateDensity);
+
+    if (state.nameplate.text !== name) state.nameplate.text = name;
+
+    for (let i = 0; i < details.length; i += 1) {
+      let line = state.detailLines[i];
+      if (line === undefined) {
+        line = new Text({
+          anchor: { x: 0.5, y: 0 },
+          style: { fill: PLATE_DETAIL_COLOUR, fontFamily: 'monospace', fontSize: PLATE_DETAIL_SIZE },
+        });
+        state.detailLines.push(line);
+        state.plate.addChild(line);
+      }
+      const text = details[i] ?? '';
+      if (line.text !== text) line.text = text;
+      line.visible = true;
+      line.position.set(0, PLATE_LINE_HEIGHT * (i + 1));
+    }
+
+    for (let i = details.length; i < state.detailLines.length; i += 1) {
+      const line = state.detailLines[i];
+      if (line !== undefined) line.visible = false;
+    }
+  }
+
   private repositionNameplates(): void {
     for (const state of this.characters.values()) {
-      const deskPx = tileToPixel(state.homeDeskTile);
-      state.nameplate.position.set(
-        (deskPx.x + TILE / 2) * this.viewport.scale,
-        (deskPx.y + TILE + NAMEPLATE_GAP_PX) * this.viewport.scale,
+      const seatPx = tileToPixel(state.plateAnchorTile);
+      state.plate.position.set(
+        (seatPx.x + TILE / 2) * this.viewport.scale,
+        // One tile below the seat: the character is drawn standing ON the seat
+        // tile with its feet at that tile's bottom edge, so this is the first
+        // row clear of the sprite. `layoutOffice` leaves two spare tiles below
+        // every seat (`DESK_SPACING_Y` is 4), which is what gives a verbose
+        // four-line plate somewhere to go without reaching the next desk.
+        (seatPx.y + TILE * 2 + NAMEPLATE_GAP_PX) * this.viewport.scale,
       );
     }
   }

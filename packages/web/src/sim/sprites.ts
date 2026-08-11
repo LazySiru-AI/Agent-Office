@@ -231,6 +231,33 @@ function poseFor(animation: SpriteAnimation, frameIn: number): Pose {
         hideEyes: false,
       };
     }
+
+    case 'read': {
+      // `working` refined by a reading tool (FR-S11). Both hands meet at
+      // `dx: 0` — dead centre, level with each other, as if holding a page
+      // up. That is the structural tell, and it is unique: `type` crosses
+      // them inward at ±1 on alternating rows, `idle_relaxed` and
+      // `idle_slumped` splay them outward at ±1, `walk` swings them. No other
+      // pose puts a hand on the centre column at all, so `read` cannot be
+      // mistaken for any of them at any frame.
+      //
+      // The motion is a slow scan rather than a hop: the hands drop a pixel
+      // on the second half of the loop and the eyes close on the last frame,
+      // which reads as looking down a page. Deliberately calmer than `type` —
+      // an agent reading should look less busy than one writing, since that
+      // difference is the information this animation exists to carry.
+      const lowered = frame >= 2;
+      return {
+        bodyBob: 0,
+        legLeftLen: NEUTRAL_LEG_LEN,
+        legRightLen: NEUTRAL_LEG_LEN,
+        hands: {
+          left: { dx: 0, dy: lowered ? 2 : 1 },
+          right: { dx: 0, dy: lowered ? 2 : 1 },
+        },
+        hideEyes: frame === 3,
+      };
+    }
   }
 }
 

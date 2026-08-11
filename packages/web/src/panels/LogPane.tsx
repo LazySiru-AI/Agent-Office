@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef } from 'react';
 import type { LoggedAgentEvent } from '@agent-office/shared';
+import { formatToolLine } from '../sim/model.js';
 import type { LogLine } from '../state/useRun.js';
 
 /**
@@ -105,8 +106,11 @@ function formatEvent(logged: LoggedAgentEvent): string {
       return `[${e.assignmentId}] status -> ${e.status}`;
     case 'text':
       return `[${e.assignmentId}] ${truncate(e.chunk, 200)}`;
+    // `formatToolLine` rather than an inline template: the office's desk plate
+    // (FR-S10) states the same fact, and two spellings of one event is how a
+    // UI comes to feel assembled rather than designed.
     case 'tool':
-      return `[${e.assignmentId}] tool: ${e.name} — ${e.summary}`;
+      return `[${e.assignmentId}] tool: ${formatToolLine(e.name, e.summary)}`;
     case 'artifact':
       return `[${e.assignmentId}] artifact: ${e.path}`;
     case 'usage':

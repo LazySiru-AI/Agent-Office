@@ -1,6 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { RunState } from '@agent-office/shared';
-import { buildScene } from './model.js';
+import type { PlateDensity } from '../theme/useTheme.js';
+import { buildScene, plateLines, type CharacterView, type SceneContext } from './model.js';
 import { createOfficeScene, type OfficeSceneRenderer } from './scene.js';
 import { SPRITE_MANIFEST } from './sprites.js';
 
@@ -20,6 +21,14 @@ export interface OfficeCanvasProps {
   run: RunState | undefined;
   onSelectAssignment?: (assignmentId: string) => void;
   selectedAssignmentId?: string;
+  /**
+   * The run facts the office states on each desk (FR-S10) — models, provider,
+   * tool stream. Optional so the component stays renderable without the whole
+   * of `App`'s machinery, matching the convention the panels follow.
+   */
+  context?: SceneContext;
+  /** How much each desk plate states. Defaults to `normal`. */
+  density?: PlateDensity;
 }
 
 /**
@@ -37,8 +46,14 @@ export interface OfficeCanvasProps {
  * do the same thing clicking a character does. That gets 1.1.1 (there is a
  * text alternative), 2.1.1 (selection is reachable by keyboard) and 4.1.2
  * (each character has a name, a role and a state) from one structure instead
- * of three bolted-on attributes — and it cannot drift from the canvas, because
- * both read the same `run.assignments`.
+ * of three bolted-on attributes.
+ *
+ * **It reads the same `CharacterView`s the canvas draws, through the same
+ * `plateLines`.** That is what keeps it honest as the office gains facts:
+ * FR-S10 puts the model, tool and spend on each desk, and a text alternative
+ * assembled separately would have quietly kept saying only the name — the
+ * canvas would have gained information and the accessible path would not.
+ * Adding a line to a plate now adds it to both, or to neither.
  *
  * It is visually hidden rather than shown, because sighted users have the
  * canvas and the Table view already; `visually-hidden-focusable` brings it
@@ -46,16 +61,22 @@ export interface OfficeCanvasProps {
  * never operating a control they cannot see.
  */
 function OfficeTextAlternative({
-  run,
-  onSelectAssignment,
+  characters,
+  density,
   selectedAssignmentId,
-}: OfficeCanvasProps): JSX.Element {
-  const assignments = run?.assignments ?? [];
-
+  onSelectAssignment,
+  onFocusAssignment,
+}: {
+  characters: readonly CharacterView[];
+  density: PlateDensity;
+  selectedAssignmentId: string | undefined;
+  onSelectAssignment: ((assignmentId: string) => void) | undefined;
+  onFocusAssignment: (assignmentId: string | undefined) => void;
+}): JSX.Element {
   return (
     <div className="visually-hidden visually-hidden-focusable office-alt">
       <h3 id="office-alt-heading">Office floor</h3>
-      {assignments.length === 0 ? (
+      {characters.length === 0 ? (
         // `.office-empty` has existed in the stylesheet since Phase 4 and was
         // referenced by nothing: the host div was rendered unconditionally, so
         // an office with no assignments was a silent empty box. It is used
@@ -63,14 +84,24 @@ function OfficeTextAlternative({
         <p className="office-empty">No agents on the floor yet.</p>
       ) : (
         <ul aria-labelledby="office-alt-heading">
-          {assignments.map((a) => (
-            <li key={a.id}>
+          {characters.map((view) => (
+            <li key={view.assignmentId}>
               <button
                 type="button"
-                aria-pressed={a.id === selectedAssignmentId}
-                onClick={() => onSelectAssignment?.(a.id)}
+                aria-pressed={view.assignmentId === selectedAssignmentId}
+                onClick={() => onSelectAssignment?.(view.assignmentId)}
+                /* FR-S12: focusing this button highlights the same character
+                   hovering it would. Without this the phase would have built a
+                   pointer-only affordance directly on top of the keyboard
+                   access this list exists to provide. */
+                onFocus={() => onFocusAssignment(view.assignmentId)}
+                onBlur={() => onFocusAssignment(undefined)}
               >
-                {a.agentName} — {a.status}
+                {/* Status first, then whatever the density adds — the plate's
+                    own lines, joined. Status is not on the plate because the
+                    canvas carries it in the character's pose and bubble, which
+                    is exactly the channel a screen-reader user does not have. */}
+                {view.status}: {plateLines(view, density).join(', ')}
               </button>
             </li>
           ))}
@@ -80,7 +111,13 @@ function OfficeTextAlternative({
   );
 }
 
-export function OfficeCanvas({ run, onSelectAssignment, selectedAssignmentId }: OfficeCanvasProps): JSX.Element {
+export function OfficeCanvas({
+  run,
+  onSelectAssignment,
+  selectedAssignmentId,
+  context,
+  density = 'normal',
+}: OfficeCanvasProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const rendererRef = useRef<OfficeSceneRenderer | undefined>(undefined);
 
@@ -90,12 +127,23 @@ export function OfficeCanvas({ run, onSelectAssignment, selectedAssignmentId }: 
   const onSelectRef = useRef(onSelectAssignment);
   onSelectRef.current = onSelectAssignment;
 
+  // Pointer hover and keyboard focus are one piece of state — "which character
+  // is the user indicating" — so they share it rather than racing to set the
+  // renderer's highlight independently.
+  const [indicatedId, setIndicatedId] = useState<string | undefined>(undefined);
+
+  // Built once per render and shared: the canvas draws these and the text
+  // alternative reads them. Two `buildScene` calls would be two chances to
+  // disagree, which is the whole reason the alternative sits in this file.
+  const scene = useMemo(() => buildScene(run, context), [run, context]);
+
   useEffect(() => {
     const host = hostRef.current;
     if (host === null) return undefined;
 
     const renderer = createOfficeScene(SPRITE_MANIFEST, {
       onSelectAssignment: (assignmentId) => onSelectRef.current?.(assignmentId),
+      onHoverAssignment: (assignmentId) => setIndicatedId(assignmentId),
     });
     rendererRef.current = renderer;
     renderer.mount(host);
@@ -111,12 +159,20 @@ export function OfficeCanvas({ run, onSelectAssignment, selectedAssignmentId }: 
   }, []);
 
   useEffect(() => {
-    rendererRef.current?.update(buildScene(run));
-  }, [run]);
+    rendererRef.current?.update(scene);
+  }, [scene]);
 
   useEffect(() => {
     rendererRef.current?.setSelected(selectedAssignmentId);
   }, [selectedAssignmentId]);
+
+  useEffect(() => {
+    rendererRef.current?.setHovered(indicatedId);
+  }, [indicatedId]);
+
+  useEffect(() => {
+    rendererRef.current?.setPlateDensity(density);
+  }, [density]);
 
   // The canvas is `aria-hidden`: it carries no information the list beside it
   // does not, and leaving it exposed would announce an unlabelled graphic
@@ -125,9 +181,11 @@ export function OfficeCanvas({ run, onSelectAssignment, selectedAssignmentId }: 
     <div className="office-canvas">
       <div ref={hostRef} className="office-stage" aria-hidden="true" />
       <OfficeTextAlternative
-        run={run}
-        {...(onSelectAssignment === undefined ? {} : { onSelectAssignment })}
-        {...(selectedAssignmentId === undefined ? {} : { selectedAssignmentId })}
+        characters={scene.characters}
+        density={density}
+        selectedAssignmentId={selectedAssignmentId}
+        onSelectAssignment={onSelectAssignment}
+        onFocusAssignment={setIndicatedId}
       />
     </div>
   );

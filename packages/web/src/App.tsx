@@ -15,6 +15,7 @@ import { RunList } from './panels/RunList.js';
 import { SettingsPanel } from './panels/SettingsPanel.js';
 import { TaskForm } from './panels/TaskForm.js';
 import { OfficeCanvas } from './sim/OfficeCanvas.js';
+import { latestToolByAssignment } from './sim/model.js';
 import { useReplay } from './state/useReplay.js';
 import { useAgentOffice } from './state/useRun.js';
 import { useSettings } from './state/useSettings.js';
@@ -103,6 +104,20 @@ export function App(): JSX.Element {
 
   const selectedAssignment = shownRun?.assignments.find((a) => a.id === selectedAssignmentId);
 
+  // FR-S10: the facts the office states on each desk. All three already
+  // existed here and stopped at the assignment table — which is why the app's
+  // default view was its least informative one. Memoised on the pieces rather
+  // than rebuilt per render, because `OfficeCanvas` keys its scene on this
+  // object's identity.
+  const sceneContext = useMemo(
+    () => ({
+      agentModelByName,
+      runProvider: office.selectedRunProvider,
+      toolByAssignment: latestToolByAssignment(shownEvents),
+    }),
+    [agentModelByName, office.selectedRunProvider, shownEvents],
+  );
+
   // A finished run is the only thing there is to replay; a live one is already
   // showing you the same thing in real time.
   const canReplay = office.selectedRunId !== undefined && !office.live;
@@ -166,6 +181,8 @@ export function App(): JSX.Element {
           motionPreference={theme.motionPreference}
           resolvedMotion={theme.resolvedMotion}
           onMotionPreferenceChange={theme.setMotionPreference}
+          plateDensity={theme.plateDensity}
+          onPlateDensityChange={theme.setPlateDensity}
         />
       </aside>
 
@@ -232,6 +249,8 @@ export function App(): JSX.Element {
                 <OfficeCanvas
                   run={shownRun}
                   onSelectAssignment={setSelectedAssignmentId}
+                  context={sceneContext}
+                  density={theme.plateDensity}
                   {...(selectedAssignmentId === undefined ? {} : { selectedAssignmentId })}
                 />
               </section>

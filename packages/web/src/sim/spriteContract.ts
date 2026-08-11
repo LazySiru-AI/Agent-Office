@@ -24,7 +24,33 @@ export const SPRITE_HEIGHT = 16;
 /** Frames in every animation loop. Uniform so the renderer needs no table. */
 export const FRAMES_PER_ANIMATION = 4;
 
-export type SpriteAnimation = 'idle' | 'idle_relaxed' | 'idle_slumped' | 'walk' | 'type';
+/**
+ * Every animation loop the manifest can draw.
+ *
+ * A `const` array with the union derived from it, rather than the union
+ * written by hand — the same shape `shared/src/status.ts` uses for the status
+ * vocabularies, and for the same reason. `sprites.test.ts` used to carry its
+ * own hardcoded copy of this list, so an animation added to the type was
+ * simply never exercised by the suite: the tests would still pass, having
+ * quietly tested one fewer thing. Now the list has one home and the tests
+ * iterate it.
+ *
+ * `read` is the newest and is the only one not selected by assignment status
+ * alone. Status picks `type` for `working`; the current tool then refines it
+ * to `read` (FR-S11). See `toolAnimation` in `model.ts` — the refinement lives
+ * there, not here, because this file knows about pixels and nothing about what
+ * an agent is doing.
+ */
+export const SPRITE_ANIMATIONS = [
+  'idle',
+  'idle_relaxed',
+  'idle_slumped',
+  'walk',
+  'type',
+  'read',
+] as const;
+
+export type SpriteAnimation = (typeof SPRITE_ANIMATIONS)[number];
 export type Facing = 'down' | 'up' | 'left' | 'right';
 
 /**

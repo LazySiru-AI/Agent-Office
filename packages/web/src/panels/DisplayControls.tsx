@@ -1,4 +1,9 @@
-import type { MotionPreference, ResolvedMotion, ThemePreference } from '../theme/useTheme.js';
+import type {
+  MotionPreference,
+  PlateDensity,
+  ResolvedMotion,
+  ThemePreference,
+} from '../theme/useTheme.js';
 import type { ThemeMode } from '../theme/tokens.js';
 
 /**
@@ -30,6 +35,10 @@ export interface DisplayControlsProps {
   motionPreference: MotionPreference;
   resolvedMotion: ResolvedMotion;
   onMotionPreferenceChange: (preference: MotionPreference) => void;
+
+  /** How much each office desk plate states (FR-S10). */
+  plateDensity: PlateDensity;
+  onPlateDensityChange: (density: PlateDensity) => void;
 }
 
 const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
@@ -43,6 +52,17 @@ const MOTION_OPTIONS: { value: MotionPreference; label: string }[] = [
   { value: 'off', label: 'Off' },
 ];
 
+/**
+ * Labelled by what each shows rather than by its internal name, because
+ * "normal" tells a reader nothing about what they will get. The order matches
+ * `PLATE_DENSITIES` — least to most.
+ */
+const DENSITY_OPTIONS: { value: PlateDensity; label: string; hint: string }[] = [
+  { value: 'minimal', label: 'Name', hint: 'agent name only' },
+  { value: 'normal', label: '+ Model', hint: 'name, model, and the current tool' },
+  { value: 'verbose', label: '+ Cost', hint: 'adds tokens and estimated spend' },
+];
+
 export function DisplayControls({
   themePreference,
   resolvedTheme,
@@ -50,6 +70,8 @@ export function DisplayControls({
   motionPreference,
   resolvedMotion,
   onMotionPreferenceChange,
+  plateDensity,
+  onPlateDensityChange,
 }: DisplayControlsProps): JSX.Element {
   return (
     <div className="display-controls">
@@ -79,6 +101,25 @@ export function DisplayControls({
             type="button"
             aria-pressed={motionPreference === option.value}
             onClick={() => onMotionPreferenceChange(option.value)}
+          >
+            {option.label}
+          </button>
+        ))}
+      </div>
+
+      <div role="group" aria-label="Office desk plates" className="display-controls-group">
+        <span className="display-controls-label">Desk plates</span>
+        {DENSITY_OPTIONS.map((option) => (
+          <button
+            key={option.value}
+            type="button"
+            aria-pressed={plateDensity === option.value}
+            /* The hint is the accessible description, not a `title`: a
+               tooltip on a control is not announced and does not survive a
+               keyboard-only path, and "+ Model" alone does not say what will
+               appear. */
+            aria-label={`${option.label} — ${option.hint}`}
+            onClick={() => onPlateDensityChange(option.value)}
           >
             {option.label}
           </button>
