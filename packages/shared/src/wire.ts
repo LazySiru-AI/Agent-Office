@@ -51,6 +51,12 @@ export const API = {
    * to come off disk rather than out of memory.
    */
   runEvents: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/events`,
+  /**
+   * The finished PDF (FR-P5). Served as a binary download rather than JSON, so
+   * the client can point an anchor at it and let the browser do the saving —
+   * no blob juggling, and the filename comes from `Content-Disposition`.
+   */
+  runPdf: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/pdf`,
   /** WebSocket endpoint (NFR-3: push, never polling). */
   socket: () => '/ws',
 } as const;

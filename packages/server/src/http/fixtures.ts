@@ -10,6 +10,7 @@ import {
 import { ScriptedProvider, type ScriptedResponse } from '../providers/scripted.js';
 import type { AgentProvider } from '../providers/types.js';
 import { buildRegistry, type Registry } from '../registry/index.js';
+import type { ExecuteRunDeps } from '../orchestrator/runner.js';
 import type { RunSupervisor } from './supervisor.js';
 
 /**
@@ -170,4 +171,24 @@ export async function waitFor(
 
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A `produceDeliverable` stand-in for tests (Phase 5).
+ *
+ * The real one launches headless Chrome, which costs a couple of seconds per
+ * run and needs a browser installed. Neither is appropriate for tests about
+ * dispatch, event fan-out or run state, so those inject this instead. The
+ * deliverable pipeline has its own coverage in `src/reports/`, against a real
+ * browser.
+ *
+ * It reports no `pdfPath`, which is the honest shape of "no PDF was produced" —
+ * so any test asserting on a PDF has to opt into the real thing rather than
+ * accidentally passing against a fake one.
+ */
+export function stubDeliverable(): NonNullable<ExecuteRunDeps['produceDeliverable']> {
+  return async () => ({
+    theme: 'engineering',
+    rationale: 'stubbed in tests; no model was called and no browser was launched',
+  });
 }

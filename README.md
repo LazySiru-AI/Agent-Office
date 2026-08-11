@@ -18,12 +18,15 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2, 3 and 4 are done and verified.** 467 tests pass, typecheck is
+**Phases 0, 2, 3, 4 and 5 are done and verified.** 590 tests pass, typecheck is
 clean, the registry indexes 154 agents, and you can drive a run from the browser
 — watch the team work in a pixel office, click a character to inspect it,
-refresh mid-run without losing it, cancel it, read the reports in-app, and
-replay a finished run offline. See `PROGRESS.md` for what had to be repaired to
-get there.
+refresh mid-run without losing it, cancel it, read the reports in-app, replay a
+finished run offline, and download a themed PDF. See `PROGRESS.md` for what had
+to be repaired to get there.
+
+The PDF needs no extra dependency: it is printed by the Chrome or Edge already
+installed on the machine, fully offline.
 
 | Phase | What | Status |
 |---|---|---|
@@ -32,7 +35,8 @@ get there.
 | 2 | Orchestrator core (headless) | done |
 | 3 | Web shell + live wiring | done |
 | 4 | Pixel office sim | done |
-| 5–7 | PDF export, domain breadth, more providers | not started |
+| 5 | Designer step + PDF export | done |
+| 6–7 | Domain breadth, more providers | not started |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
 has been driven against the real CLI — real spawn, real argv, real stream-json —

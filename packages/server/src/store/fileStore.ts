@@ -248,6 +248,17 @@ export class FileRunStore implements RunStore {
     }
   }
 
+  async readBinary(runId: string, relativePath: string): Promise<Buffer> {
+    const target = resolveWithin(this.runDir(runId), relativePath);
+    try {
+      // No encoding argument: `readFile` returns a Buffer, and asking for utf8
+      // here is exactly how a PDF arrives at the browser corrupted.
+      return await readFile(target);
+    } catch (error) {
+      throw new Error(`cannot read artifact at ${target}: ${describeError(error)}`, { cause: error });
+    }
+  }
+
   async appendEvent(runId: string, assignmentId: string, event: AgentEvent): Promise<void> {
     const file = this.logFile(runId, assignmentId);
     const entry: LoggedAgentEvent = LoggedAgentEventSchema.parse({ ts: this.now(), event });

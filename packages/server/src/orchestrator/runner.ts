@@ -22,6 +22,7 @@ import {
   synthesiseReport,
   type AssignmentReport,
 } from './manager.js';
+import { produceDeliverable } from '../reports/deliverable.js';
 
 /**
  * The end-to-end run (PLAN.md Phase 2).
@@ -48,6 +49,16 @@ export interface ExecuteRunDeps {
   onEvent?: (event: AgentEvent) => void;
   onStateChange?: (run: RunState) => void;
   logger?: (message: string) => void;
+  /**
+   * The `designing` step (FR-P2–FR-P5). Defaults to the real one.
+   *
+   * Injectable because the real implementation spawns a headless browser, and
+   * that is the wrong dependency for a test about event fan-out or run state:
+   * it makes every such test cost a browser launch and quietly requires Chromium
+   * to be installed wherever the suite runs. Production keeps the real default;
+   * only tests substitute.
+   */
+  produceDeliverable?: typeof produceDeliverable;
 }
 
 export interface ExecuteRunResult {
@@ -182,11 +193,36 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
     await deps.store.writeReport(run.id, SYNTHESIS_REPORT_PATH, report);
     run.reportPath = SYNTHESIS_REPORT_PATH;
 
-    // --- Design (Phase 5) ---
-    // The designer agent does not exist yet. The state is still entered and left
-    // so the run-level machine stays honest: Phase 5 fills this step in without
-    // changing the surrounding transitions.
+    // --- Design and export (Phase 5, FR-P2–FR-P5) ---
     await setStatus('designing');
+
+    // Everything expensive is already on disk. `produceDeliverable` therefore
+    // degrades rather than throwing: a machine with no Chromium still finishes
+    // the run, with the reports intact and a reason recorded for the missing
+    // PDF (NFR-8). Only cancellation escapes, and it is handled by the catch.
+    const deliverable = await (deps.produceDeliverable ?? produceDeliverable)({
+      run,
+      plan,
+      registry: deps.registry,
+      provider: deps.provider,
+      store: deps.store,
+      synthesisMarkdown: report,
+      appendices: reports.map((entry) => ({
+        agentName: entry.agentName,
+        // The report's own path, printed under each appendix header so a reader
+        // can find the source file. `collectReports` drops it, so it is looked
+        // up here rather than widening that type for one caller.
+        path:
+          run.assignments.find((a) => a.id === entry.assignmentId)?.reportPath ?? entry.assignmentId,
+        markdown: entry.markdown,
+      })),
+      signal,
+      logger: log,
+    });
+
+    run.theme = deliverable.theme;
+    run.designRationale = deliverable.rationale;
+    if (deliverable.pdfPath !== undefined) run.pdfPath = deliverable.pdfPath;
 
     await setStatus('report_ready');
     await setStatus('done');

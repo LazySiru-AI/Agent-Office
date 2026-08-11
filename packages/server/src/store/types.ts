@@ -58,6 +58,17 @@ export interface RunStore {
   /** Read a previously written report. Same path constraints as `writeReport`. */
   readReport(runId: string, relativePath: string): Promise<string>;
 
+  /**
+   * Read a run artifact as bytes, e.g. `report.pdf` (FR-P5).
+   *
+   * Separate from `readReport` because a PDF is not text and decoding it as
+   * UTF-8 corrupts it. It exists on the store rather than being read with `fs`
+   * at the HTTP layer so the containment guarantee stays in one place: the path
+   * still originates in generated content, and the route that serves it must
+   * not be the thing deciding what is inside the run directory (NFR-1).
+   */
+  readBinary(runId: string, relativePath: string): Promise<Buffer>;
+
   /** Append one event to `runs/<id>/logs/<assignmentId>.jsonl`. */
   appendEvent(runId: string, assignmentId: string, event: AgentEvent): Promise<void>;
 

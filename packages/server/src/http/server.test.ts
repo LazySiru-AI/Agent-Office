@@ -7,6 +7,7 @@ import { buildServer } from './server.js';
 import { RunSupervisor } from './supervisor.js';
 import {
   TEST_SYNTHESIS,
+  stubDeliverable,
   testProviderFactory,
   testRegistry,
   waitFor,
@@ -43,6 +44,7 @@ async function setup(
     store,
     makeProvider: testProviderFactory(overrides),
     onWarning: () => undefined,
+    produceDeliverable: stubDeliverable(),
   });
   const app = await buildServer({ registry, store, supervisor });
   await app.ready();

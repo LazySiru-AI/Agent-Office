@@ -7,7 +7,13 @@ import {
 import { MemoryRunStore } from '../store/memoryStore.js';
 import type { RunStore } from '../store/types.js';
 import { RingBuffer, RunSupervisor } from './supervisor.js';
-import { testProviderFactory, testRegistry, waitFor, waitForTerminal } from './fixtures.js';
+import {
+  stubDeliverable,
+  testProviderFactory,
+  testRegistry,
+  waitFor,
+  waitForTerminal,
+} from './fixtures.js';
 
 /**
  * The supervisor is the only part of Phase 3 that owns *time*: a run outlives
@@ -26,6 +32,7 @@ function makeSupervisor(
     store,
     makeProvider: testProviderFactory(overrides),
     onWarning: (message) => warnings.push(message),
+    produceDeliverable: stubDeliverable(),
   });
   return { supervisor, store, warnings };
 }
@@ -212,7 +219,12 @@ describe('RunSupervisor subscriptions', () => {
     // A subscription is per-run: the second run must not reach the first's
     // listener, or a tab watching one run gets every other run's firehose.
     expect(received).toHaveLength(countAtUnsubscribe);
-  });
+    // Two full orchestrator runs, back to back. Vitest's 5s default is tight
+    // for that on its own, and Phase 5 added a suite that launches a real
+    // browser in a parallel worker — enough CPU contention to tip this over.
+    // The generous budget is about scheduling, not about waiting for anything:
+    // every wait in here polls at 5ms and returns as soon as its condition holds.
+  }, 30_000);
 
   it('carries on when a subscriber throws', async () => {
     // One socket failing mid-send must not abort the run producing the events,
@@ -323,6 +335,7 @@ function bindStore(store: RunStore): RunStore {
     workspaceDir: (runId) => store.workspaceDir(runId),
     writeReport: (runId, relativePath, content) => store.writeReport(runId, relativePath, content),
     readReport: (runId, relativePath) => store.readReport(runId, relativePath),
+    readBinary: (runId, relativePath) => store.readBinary(runId, relativePath),
     appendEvent: (runId, assignmentId, event) => store.appendEvent(runId, assignmentId, event),
     readEvents: (runId, assignmentId) => store.readEvents(runId, assignmentId),
   };

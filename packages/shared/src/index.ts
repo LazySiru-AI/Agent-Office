@@ -100,3 +100,18 @@ export {
   type ClientMessage,
   type ServerMessage,
 } from './wire.js';
+
+export {
+  DesignChoiceSchema,
+  REPORT_HTML_PATH,
+  REPORT_PDF_PATH,
+  REPORT_THEME_BRIEFS,
+  REPORT_THEME_IDS,
+  ReportDocumentSchema,
+  ReportThemeIdSchema,
+  RosterEntrySchema,
+  type DesignChoice,
+  type ReportDocument,
+  type ReportThemeId,
+  type RosterEntry,
+} from './report.js';

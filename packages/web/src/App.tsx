@@ -5,6 +5,7 @@ import { buildAgentModelIndex } from './costModel.js';
 import { AssignmentTable } from './panels/AssignmentTable.js';
 import { InspectPanel } from './panels/InspectPanel.js';
 import { LogPane } from './panels/LogPane.js';
+import { PdfDownload } from './panels/PdfDownload.js';
 import { ReplayControls } from './panels/ReplayControls.js';
 import { ReportViewer } from './panels/ReportViewer.js';
 import { RunHeader } from './panels/RunHeader.js';
@@ -179,6 +180,17 @@ export function App(): JSX.Element {
             <section>
               <h2>Activity</h2>
               <LogPane logs={office.logs} events={shownEvents} />
+            </section>
+
+            <section>
+              <h2>Deliverable</h2>
+              <PdfDownload
+                runId={office.selectedRunId}
+                pdfPath={shownRun.pdfPath}
+                theme={shownRun.theme}
+                rationale={shownRun.designRationale}
+                runStatus={shownRun.status}
+              />
             </section>
 
             <ReportViewer

@@ -498,3 +498,32 @@ button:disabled {
   color: #8a6d1f;
   font-size: 0.75rem;
 }
+
+/* --- Phase 5: PDF deliverable (FR-P5) --- */
+
+.pdf-download {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.pdf-button {
+  display: inline-block;
+  padding: 0.45rem 0.9rem;
+  background: #1f2933;
+  color: #fff;
+  text-decoration: none;
+  border-radius: 3px;
+  font-size: 0.9rem;
+}
+
+.pdf-button:hover,
+.pdf-button:focus-visible {
+  background: #33414f;
+}
+
+.pdf-theme {
+  font-size: 0.8rem;
+  color: #666;
+}

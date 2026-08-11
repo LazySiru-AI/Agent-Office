@@ -74,6 +74,7 @@ const ROUTES = {
   runReport: toPattern(API.runReport(RUN_ID_PLACEHOLDER)),
   assignmentReport: toPattern(API.assignmentReport(RUN_ID_PLACEHOLDER, 'x')),
   runEvents: toPattern(API.runEvents(RUN_ID_PLACEHOLDER)),
+  runPdf: toPattern(API.runPdf(RUN_ID_PLACEHOLDER)),
   socket: API.socket(),
 } as const;
 
@@ -231,6 +232,33 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
     // the path against the run directory and rejects anything that escapes it,
     // which is the check that actually matters here (NFR-1).
     return readReport(deps, runId, query.data.path);
+  });
+
+  // --- PDF download (FR-P5) ------------------------------------------------
+  app.get(ROUTES.runPdf, async (request, reply) => {
+    const runId = parseRunId(request.params);
+    const run = await loadRun(deps, runId);
+
+    if (run.pdfPath === undefined) {
+      // Distinguished from a missing run so the client can say "not ready yet"
+      // rather than "no such run" — the difference matters while a run is still
+      // working its way to `designing`.
+      throw new HttpError(
+        404,
+        `run "${runId}" has no PDF yet (status: ${run.status})`,
+      );
+    }
+
+    const bytes = await deps.store.readBinary(runId, run.pdfPath);
+
+    // `attachment` rather than `inline`: FR-P5 asks for a download, and a
+    // filename carrying the run id is what makes several exported runs
+    // distinguishable in a downloads folder.
+    return reply
+      .type('application/pdf')
+      .header('Content-Disposition', `attachment; filename="agent-office-${runId}.pdf"`)
+      .header('Content-Length', String(bytes.byteLength))
+      .send(bytes);
   });
 
   // --- Event history (NFR-7 replay) ----------------------------------------

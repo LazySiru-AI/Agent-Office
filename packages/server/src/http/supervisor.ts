@@ -11,7 +11,7 @@ import {
 } from '@agent-office/shared';
 import type { Registry } from '../registry/index.js';
 import type { DispatchOptions } from '../orchestrator/dispatcher.js';
-import { executeRun } from '../orchestrator/runner.js';
+import { executeRun, type ExecuteRunDeps } from '../orchestrator/runner.js';
 import { makeProvider as defaultMakeProvider } from '../providers/factory.js';
 import type { AgentProvider } from '../providers/types.js';
 import { ProviderUnavailableError } from '../providers/types.js';
@@ -98,6 +98,14 @@ export interface SupervisorDeps {
    * live UI and reattach behaviour can be exercised by hand.
    */
   stepDelayMs?: number;
+
+  /**
+   * Override for the `designing` step (Phase 5). Defaults to the real one.
+   *
+   * Present so tests can drive a supervisor without launching a browser per
+   * run; see `ExecuteRunDeps.produceDeliverable` for the reasoning.
+   */
+  produceDeliverable?: ExecuteRunDeps['produceDeliverable'];
   /** Applied to every run; a request's own values win where it sets them. */
   dispatchDefaults?: Partial<DispatchOptions>;
   /** Where background failures go. Defaults to stderr. */
@@ -159,8 +167,10 @@ interface RunEntry {
 export class RunSupervisor {
   // `stepDelayMs` is excluded because it is consumed at construction — folded
   // into the default `makeProvider` closure — and never read again.
-  private readonly deps: Required<Omit<SupervisorDeps, 'dispatchDefaults' | 'stepDelayMs'>> &
-    Pick<SupervisorDeps, 'dispatchDefaults'>;
+  private readonly deps: Required<
+    Omit<SupervisorDeps, 'dispatchDefaults' | 'stepDelayMs' | 'produceDeliverable'>
+  > &
+    Pick<SupervisorDeps, 'dispatchDefaults' | 'produceDeliverable'>;
 
   /**
    * Insertion-ordered, which is what makes {@link RETAINED_FINISHED_RUNS}
@@ -272,6 +282,9 @@ export class RunSupervisor {
             this.emit(entry.runId, { t: 'log', runId: entry.runId, line, ts });
           },
           dispatch: dispatchOptionsFor(request, this.deps.dispatchDefaults),
+          ...(this.deps.produceDeliverable === undefined
+            ? {}
+            : { produceDeliverable: this.deps.produceDeliverable }),
         });
 
         if (entry !== undefined) {
@@ -499,6 +512,7 @@ function withCreateRunHook(store: RunStore, onCreated: (run: RunState) => void):
     workspaceDir: (runId) => store.workspaceDir(runId),
     writeReport: (runId, relativePath, content) => store.writeReport(runId, relativePath, content),
     readReport: (runId, relativePath) => store.readReport(runId, relativePath),
+    readBinary: (runId, relativePath) => store.readBinary(runId, relativePath),
     appendEvent: (runId, assignmentId, event) => store.appendEvent(runId, assignmentId, event),
     readEvents: (runId, assignmentId) => store.readEvents(runId, assignmentId),
   };

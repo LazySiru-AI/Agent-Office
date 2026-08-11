@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { runTotalUsage, totalUsage } from '@agent-office/shared';
 import { MemoryRunStore } from '../store/memoryStore.js';
-import { testProviderFactory, testRegistry } from '../http/fixtures.js';
+import { stubDeliverable, testProviderFactory, testRegistry } from '../http/fixtures.js';
 import { executeRun } from './runner.js';
 
 /**
@@ -21,6 +21,7 @@ describe('executeRun — run provenance', () => {
       store: new MemoryRunStore(),
       task: 'record the provider',
       logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
     });
 
     expect(run.status).toBe('done');
@@ -38,6 +39,7 @@ describe('executeRun — manager token accounting (NFR-5)', () => {
       store: new MemoryRunStore(),
       task: 'count the manager',
       logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
     });
 
     expect(run.status).toBe('done');
@@ -52,6 +54,7 @@ describe('executeRun — manager token accounting (NFR-5)', () => {
       store: new MemoryRunStore(),
       task: 'separate the totals',
       logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
     });
 
     // `totalUsage` scopes the FR-M8 dispatch budget and must stay
@@ -76,6 +79,7 @@ describe('executeRun — manager token accounting (NFR-5)', () => {
       store: new MemoryRunStore(),
       task: 'bill planning anyway',
       logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
     });
 
     expect(run.status).toBe('failed');

@@ -94,6 +94,20 @@ export class MemoryRunStore implements RunStore {
     return content;
   }
 
+  /**
+   * Binary artifacts are not modelled in memory.
+   *
+   * The only one is the PDF, and it is produced by headless Chrome writing to a
+   * real path — there is nothing for an in-memory store to hold. Failing
+   * explicitly beats returning an empty buffer that would surface later as a
+   * corrupt download.
+   */
+  async readBinary(runId: string, relativePath: string): Promise<Buffer> {
+    throw new Error(
+      `MemoryRunStore holds no binary artifacts (asked for "${relativePath}" in run "${assertValidRunId(runId)}")`,
+    );
+  }
+
   async appendEvent(runId: string, assignmentId: string, event: AgentEvent): Promise<void> {
     const byAssignment = this.logs.get(assertValidRunId(runId)) ?? new Map<string, LoggedAgentEvent[]>();
     const entries = byAssignment.get(assignmentId) ?? [];

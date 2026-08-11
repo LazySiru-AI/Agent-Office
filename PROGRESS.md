@@ -12,7 +12,7 @@ written, not executed) · **blocked** · **not started**.
 | 2 — Orchestrator core (headless) | **done** | yes |
 | 3 — Web shell + live wiring | **done** | yes |
 | 4 — Pixel office sim | **done** | yes |
-| 5 — Designer step + PDF export | not started | — |
+| 5 — Designer step + PDF export | **done** | yes |
 | 6 — Domain breadth | not started | — |
 | 7 — Provider expansion + polish | not started | — |
 
@@ -669,3 +669,121 @@ consumes. A fresh run now persists 12 transitions where it persisted none.
 - Hover nameplates show the name only; category and description are in the
   inspect panel rather than a hover tooltip (FR-S4 partially).
 - `permission_denials` from Phase 1 is still not surfaced as events.
+
+---
+
+## Phase 5 — Designer step + PDF export
+
+**Status: done.** Both exit criteria met: a run ends with a downloadable PDF,
+and a legal-domain run visibly differs in styling from a software one.
+
+### The decision that shaped the phase
+
+PLAN.md's FR-P3 asks for "headless Chromium, fully offline", which normally
+means adding Puppeteer and a ~150MB Chromium download. Before writing anything,
+Chrome's own CLI was tested directly:
+
+```
+chrome --headless --disable-gpu --no-pdf-header-footer --print-to-pdf=out.pdf file:///in.html
+```
+
+That produced a valid 28,662-byte, 2-page PDF (`Skia/PDF m151`) with `@page`
+margins and `break-after: page` both honoured. So the whole PDF pipeline needs
+**zero new runtime dependencies** and reuses the binary-resolution and Windows
+tree-kill work from Phase 1. The only package added is `marked` (zero
+dependencies) for markdown.
+
+Two details that cost time and are now recorded: `--print-to-pdf` requires an
+absolute path, and a relative one fails with `Access is denied. (0x5)` — a
+misleading error for what is a path problem.
+
+### What was built
+
+Contract first (`shared/src/report.ts`), then four agents in parallel:
+`reports/markdown.ts` (markdown → HTML), `reports/themes.ts` (four print
+stylesheets), `reports/pdf.ts` (Chrome resolution + print), `reports/designer.ts`
+(theme choice). Assembly (`document.ts`), the pipeline (`deliverable.ts`) and
+the runner wiring were integrated afterwards.
+
+The theme set is closed deliberately. FR-P2 asks a *model* to name a theme, and
+a model will eventually invent one — so the choice is validated against the
+union and falls back, the same discipline FR-M3 applies to agent names. The
+briefs describing each theme are shared between the designer's prompt and the
+stylesheets, so a theme cannot be chosen for a reason its styling does not
+reflect.
+
+### Findings
+
+**1. A contract gap I left, caught by the design that anticipated it.** The
+themes and the markdown renderer were written simultaneously, and the class
+names connecting them were never pinned — I fixed the theme *ids* in the
+contract but not the *class names*. The theme author guessed `.md-table-wrap`;
+the emitter produces `.ao-table-wrapper`. Reconciled at integration, and it cost
+nothing because the theme author had hedged correctly: visual styling targets
+bare `table`/`pre` selectors, and the wrapper classes carry only overflow rules,
+so a mismatch loses the overflow safety net rather than the theme. The lesson is
+recorded in the file: styling that only works when two independently written
+modules agree on a string is styling that will silently vanish.
+
+**2. Adding a real browser to every run broke a unit test.** Once the designing
+step was wired in, a supervisor test about event fan-out timed out — it was
+launching Chrome on every run. Raising the timeout would have been the wrong
+fix: it would also have made the suite require Chromium wherever it runs.
+`produceDeliverable` is now an injectable dep on `ExecuteRunDeps` with the real
+implementation as the default, and the shared test fixtures inject a stub. The
+deliverable pipeline keeps its own coverage against a real browser.
+
+**3. `--print-to-pdf` does not create its output directory** — Chrome exits 0
+and writes nothing. Found by the agent building it, not by reasoning.
+
+**4. Cleanup races the kill.** `killTree` is fire-and-forget, so on the timeout
+path the browser's teardown can still hold the temp profile directory when
+cleanup runs, producing a transient `EBUSY`. Fixed with `rm`'s retry options.
+
+**5. "reliability" contains "liability".** A refactoring task routed to the
+legal team, because the scripted provider's keyword router does substring
+matching. It is a demo stub and documented as one, but it is a good illustration
+of why it must not grow into a planner.
+
+### Deliberate design choices
+
+- **`store.readBinary` rather than `fs` in the route.** `server.ts` holds an
+  invariant that it never touches the filesystem, so containment lives in one
+  place (NFR-1). Serving a PDF needed bytes, so the store grew a method instead.
+  The `RunStore` adapter in `supervisor.ts` forwards methods explicitly with a
+  comment saying a missing key there is a compile error rather than a silent
+  gap — and that is exactly what caught the new method.
+- **The themed HTML is kept beside the PDF.** It is what the PDF was made from,
+  so a styling complaint can be investigated without re-running anything, and it
+  is a usable fallback on a machine with no browser.
+- **Nothing in the design step can fail the run.** By the time it executes, the
+  agents have run and the synthesis is on disk. A missing browser is a missing
+  attachment, not a failed run (NFR-8) — the reason is recorded and shown.
+
+### Verified end to end
+
+- Two real runs produced valid PDFs: **76,406 bytes / 5 pages** (legal) and
+  **75,581 bytes / 5 pages** (software), both `%PDF-`.
+- **The exit criterion**: the legal run renders in Cambria serif, the software
+  run in Segoe UI sans — different themes, chosen per domain.
+- Document structure in both: 1 cover, 3 roster rows, 1 synthesis, 3 appendices,
+  a single inline `<style>` block and **no external references** (FR-P3).
+- `GET /api/runs/:id/pdf` returns 200, `application/pdf`,
+  `Content-Disposition: attachment` with a run-specific filename, and the exact
+  76,406 bytes on disk. A run without a PDF returns 404 rather than an empty file.
+- The UI shows the download button, the chosen theme and its rationale.
+
+590 tests pass; typecheck is clean.
+
+### Known gaps carried forward
+
+- **No model has ever chosen a theme.** The scripted provider cannot emit a valid
+  `DesignChoice`, so every run so far fell back to the domain mapping — honestly
+  labelled in the rationale, but the model path is unexercised until Phase 1's
+  CLI is signed in.
+- **FR-P6 (markdown/per-agent export) and FR-P7 (user theme override) are not
+  built.** Both are `should`/`could`.
+- Links render as text plus URL, since a printed page cannot be clicked; images
+  become text placeholders rather than being fetched.
+- The cover shows estimated cost only when the caller computes one; the CLI path
+  does not, so it prints an em dash.

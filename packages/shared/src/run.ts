@@ -91,6 +91,17 @@ export const RunStateSchema = z.object({
   reportPath: z.string().min(1).optional(),
   /** Run-relative path to the exported PDF (Phase 5). */
   pdfPath: z.string().min(1).optional(),
+  /**
+   * The theme the designer step chose, and why (FR-P2).
+   *
+   * Persisted rather than recomputed because the choice is a model's, and a
+   * regenerated PDF that silently changed appearance would be indistinguishable
+   * from a styling bug. Kept as a plain string here so `run.ts` does not depend
+   * on `report.ts`; it is validated against the closed theme set at the point
+   * the designer produces it.
+   */
+  theme: z.string().min(1).optional(),
+  designRationale: z.string().optional(),
   /** Failure reason, when status is `failed`. */
   error: z.string().optional(),
 });
