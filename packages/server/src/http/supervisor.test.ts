@@ -58,9 +58,11 @@ function makeSupervisor(
  * the status the run was stuck in, which is a far more useful failure than a
  * bare vitest timeout ever was.
  */
-// `hookTimeout` too — `testTimeout` does not cover hooks, which kept vitest's
-// 10s default for any teardown that drains a still-running supervisor. See the
-// fuller note in `server.test.ts`.
+// `hookTimeout` is set for any hook added below this line — note that it does
+// not reach one registered ABOVE it, since a hook takes its budget when it is
+// registered. This file has no hooks today; when one is added, check which side
+// of this line it lands on. See the fuller note in `server.test.ts`, where that
+// ordering cost two misdiagnosed full-suite runs.
 vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS, hookTimeout: SLOW_RUN_TIMEOUT_MS });
 describe('RingBuffer', () => {
   it('keeps the newest entries and reports that it dropped the rest', () => {

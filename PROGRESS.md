@@ -1265,11 +1265,20 @@ so it is bounded by one round's `max_tokens`, not by zero.
   replay inferred them. `endedAtCleared` is explicit, because absence already
   means "unchanged" everywhere else. A revised assignment used to replay as
   `briefing` beside a stale `endedAt` — finishing before it restarted.
-- **`vi.setConfig({ testTimeout })` does not cover hooks.** A test that asserted
-  in milliseconds failed at exactly 10s in its *teardown*, where a still-running
-  supervisor is drained, reported against the test body. That is the third
-  instance of one pattern in this file's history: an explicit budget set in one
-  place while a tighter unstated one governed elsewhere.
+- **`vi.setConfig({ testTimeout })` does not cover hooks — and setting
+  `hookTimeout` there does not fix an already-registered one.** A test that
+  asserted in milliseconds failed at exactly 10s in its *teardown*, where a
+  still-running supervisor is drained, reported against the test body.
+  Adding `hookTimeout` to the `setConfig` call looked like the fix and was not:
+  a hook takes its budget when it is REGISTERED, and that registration sits
+  above the `setConfig` line. Three green runs seemed to confirm the wrong fix
+  before the failure returned at roughly one run in three. Reading the error
+  text — "Hook timed out in 10000ms" — settled in seconds what two rounds of
+  inference had got wrong. The budget is now an argument to `afterEach`, the
+  only form that cannot be outrun by evaluation order.
+  Fourth instance of one pattern here: a budget set in one place while a
+  tighter, unstated one governed elsewhere. `waitForTerminal`'s ceiling, then
+  `waitFor`'s, then the hook default, then the ordering.
 
 ### `exactOptionalPropertyTypes` was false the whole time
 

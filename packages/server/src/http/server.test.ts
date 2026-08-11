@@ -37,7 +37,19 @@ afterEach(async () => {
     await supervisor.shutdown();
     await app.close();
   }
-});
+  // The timeout is an ARGUMENT here, not left to `vi.setConfig` further down
+  // the file, and that is the whole fix. A hook takes its budget when it is
+  // REGISTERED; this registration runs at line 34 and the `setConfig` call runs
+  // at line ~90, so the config arrived too late and this hook silently kept
+  // vitest's 10s default. It failed roughly one full-suite run in three, at
+  // 10,060ms, reported against whichever test happened to precede it — which
+  // sent me looking at that test twice before looking here.
+  //
+  // `shutdown()` waits for every in-flight run to unwind rather than killing it
+  // mid-`saveRun`, so under load this hook genuinely needs the same budget the
+  // tests do. Passing it explicitly is the only form that cannot be outrun by
+  // module evaluation order.
+}, SLOW_RUN_TIMEOUT_MS);
 
 async function setup(
   overrides: Parameters<typeof testProviderFactory>[0] = {},
@@ -76,17 +88,23 @@ function expectApiError(body: string): string {
  * cannot hang, and `RUN_POLL_TIMEOUT_MS` still fires first with a message
  * naming the status a stuck run was in.
  */
-// `hookTimeout` as well as `testTimeout`, and the second is not decoration.
-// `testTimeout` does not cover hooks, so the `afterEach` above kept vitest's
-// 10s default — and that hook is where every still-running supervisor is
-// drained. A test that asserted in milliseconds and left a run executing could
-// therefore fail at 10s in its TEARDOWN under load, reported against the test
-// body, which is where it was first mistaken for a slow assertion.
+// `hookTimeout` is set here too, and it does NOT on its own fix the hook above
+// — that is worth stating plainly, because an earlier version of this comment
+// claimed it did and was wrong for two more full-suite runs before the error
+// text was actually read.
 //
-// Third time this pattern has bitten in this file's history: an explicit
-// budget was set in one place while a tighter, unstated one governed
-// elsewhere. `waitForTerminal`'s own ceiling was the first, `waitFor`'s the
-// second. Setting both here from one constant is the point.
+// A hook takes its budget when it is registered. `afterEach` is registered at
+// the top of this file and this call runs further down, so the config lands
+// after the hook already has its default. The `SLOW_RUN_TIMEOUT_MS` argument
+// passed directly to `afterEach` is what actually governs it. This line still
+// earns its place for `testTimeout` — every `it` in the file is registered
+// below it — and `hookTimeout` is kept so any hook added AFTER this point
+// inherits the right budget rather than quietly getting 10s.
+//
+// Fourth instance of one pattern in this file's history: a budget set in one
+// place while a tighter, unstated one governed elsewhere. `waitForTerminal`'s
+// own ceiling, then `waitFor`'s, then the hook default, then this. The lesson
+// each time is the same — the explicit argument beats the ambient setting.
 vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS, hookTimeout: SLOW_RUN_TIMEOUT_MS });
 
 describe('GET /api/health', () => {
