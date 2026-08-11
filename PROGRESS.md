@@ -1581,3 +1581,30 @@ instead of quietly certifying a limitation that no longer exists.
   knowing, because someone who cancels a long run and reads `$0.00` will
   believe it. The honest fix is upstream — `total_cost_usd` and incremental
   accounting the CLI does not currently expose mid-turn.
+- **The `claude-code` adapter has no filesystem sandbox, and a real run has now
+  demonstrated it.** Found while committing Phase 9's plan: an untracked
+  `reports/03-product-manager.md` was sitting in the REPO ROOT, written 04:23
+  during run `20260811-042057-37po`. It is not a stray copy of that run's own
+  report — different content, different hash — it is a second document the
+  agent wrote itself, outside its run directory, into the user's repository.
+  That run's `workspace/` is empty, so nothing landed where the sandbox is.
+
+  The mechanism is not a bug in the adapter so much as a boundary that was
+  never drawn. `provider.ts` spawns the CLI with `cwd: request.workspaceDir`
+  and `--permission-mode acceptEdits`. A cwd is not containment: an absolute or
+  `../` path is unaffected by it, and `acceptEdits` means nothing stops to ask.
+  The asymmetry is the finding — `apiTools.ts` gives the raw API adapters a
+  real sandbox, with traversal, absolute-path, UNC, NUL-truncation and
+  prefix-sibling defences, all tested against a live filesystem. The adapter
+  most likely to be used by default has none of that, because tool execution
+  belongs to the CLI.
+
+  Not fixed here, because the fix is a genuine design decision rather than a
+  patch: many useful tasks legitimately need to read the repository, so the
+  answer is a deliberate policy (`--add-dir` with an explicit read set, a
+  stricter `--permission-mode`, or accepting the CLI's own boundary and saying
+  so in NFR-1) and not a quiet tightening. It should be decided before the
+  default provider is pointed at anything that matters. The stray file is left
+  in place rather than deleted — it is another session's output, and `runs/`
+  is gitignored while a repo-root `reports/` is not, which is its own small
+  hazard: one `git add -A` from being committed.
