@@ -510,7 +510,15 @@ describe.runIf(realBrowser !== undefined)('renderPdf — real headless browser',
 
     const info = await stat(outputPath);
     expect(info.size).toBe(result.bytes);
-  }, 30_000);
+    // 60s, not the 30s this carried before. A measurement pass over five
+    // full-suite runs observed this at 27.5s — 92% of its own budget, the
+    // narrowest margin anywhere in the suite. It launches a real browser and
+    // waits for a real render, so the cost is a cold process start competing
+    // with everything else the suite is doing; a machine slower than this one,
+    // or one whose scanner takes an interest in a new chrome.exe, goes over.
+    // Nothing here can hang silently — `renderPdf` carries its own
+    // `timeoutMs` — so this budget only has to be generous enough not to lie.
+  }, 60_000);
 });
 
 if (realBrowser === undefined) {

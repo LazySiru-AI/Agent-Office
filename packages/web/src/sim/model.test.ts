@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { ASSIGNMENT_BEHAVIOUR, type AssignmentState, type AssignmentStatus } from '@agent-office/shared';
+import {
+  ASSIGNMENT_BEHAVIOUR,
+  ASSIGNMENT_STATUSES,
+  type AssignmentState,
+  type AssignmentStatus,
+} from '@agent-office/shared';
 import {
   appearanceFor,
   buildSceneFromAssignments,
@@ -144,8 +149,15 @@ describe('buildSceneFromAssignments (FR-S3)', () => {
 
   it('covers every assignment status without a gap', () => {
     // A status with no behaviour would render as a frozen character, which is
-    // exactly the drift FR-S3 exists to prevent.
-    const statuses = Object.keys(ASSIGNMENT_BEHAVIOUR) as AssignmentStatus[];
+    // exactly the drift FR-S3 exists to prevent. The list under test must be
+    // the canonical `ASSIGNMENT_STATUSES` (shared/src/status.ts), not
+    // `Object.keys(ASSIGNMENT_BEHAVIOUR)` — deriving the expected set from the
+    // very map being checked means a status missing from that map is also
+    // missing from the check, so the test can never observe the gap it
+    // claims to guard against. `status.test.ts:105`'s "animation binding"
+    // describe block does the equivalent check the same way, for the same
+    // reason.
+    const statuses = ASSIGNMENT_STATUSES;
     const scene = buildSceneFromAssignments(
       statuses.map((status, i) => assignment(`a${String(i)}`, `agent-${status}`, status)),
     );

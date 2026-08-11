@@ -2,6 +2,7 @@ import {
   estimateCostUsd,
   formatCostUsd,
   runTotalUsage,
+  FREE_MODELS,
   type AgentSummary,
   type AssignmentState,
   type RunState,
@@ -18,11 +19,15 @@ import {
  * strings the registry emits (`sonnet` / `haiku` / `opus`).
  *
  * `runProvider` is `RunState.provider` — the provider that actually executed
- * the run, recorded server-side. When it names a free provider, every
- * assignment is costed as free regardless of the agent's catalog model, which
- * is what makes a scripted run read as $0.00 as NFR-5 requires. A run
- * persisted before that field existed has no provider, and falls back to the
- * catalog model per assignment.
+ * the run, recorded server-side. It is a PROVIDER id (`claude-code`,
+ * `anthropic`, `openai`, `deepseek`, `scripted`, `none`), never a pricing
+ * key — `DEFAULT_PRICING` is keyed by CATALOG MODEL names (`sonnet` /
+ * `haiku` / `opus`) and knows nothing about provider ids. The only thing the
+ * provider legitimately decides is whether the run is free: `scripted` and
+ * `none` call no model at all, so every assignment underneath them must
+ * price at zero regardless of what the catalog says the agent would have
+ * used. Every other provider is priced off the agent's catalog model, same
+ * as a run with no recorded provider at all.
  */
 
 export function buildAgentModelIndex(agents: AgentSummary[]): Map<string, string | undefined> {
@@ -35,7 +40,15 @@ export function effectiveModelFor(
   agentModelByName: Map<string, string | undefined>,
   runProvider: string | undefined,
 ): string | undefined {
-  if (runProvider !== undefined) return runProvider;
+  // Previously this substituted `runProvider` for the pricing key whenever it
+  // was set, which happens to work for `scripted`/`none` (they are also
+  // FREE_MODELS entries) but silently breaks every real provider: `sonnet`'s
+  // price never gets looked up because `DEFAULT_PRICING['claude-code']` does
+  // not exist, so the run reports `partial` and shows "—" even though the
+  // agent's model is priced. Only branch on the provider when it actually
+  // means "this run is free" — otherwise fall through to the catalog model,
+  // exactly as if no provider had been recorded at all.
+  if (runProvider !== undefined && FREE_MODELS.has(runProvider)) return runProvider;
   return agentModelByName.get(assignment.agentName);
 }
 

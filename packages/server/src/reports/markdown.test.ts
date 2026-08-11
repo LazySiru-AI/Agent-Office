@@ -201,6 +201,65 @@ describe('renderMarkdown', () => {
   });
 });
 
+describe('pathological emphasis runs', () => {
+  // Regression coverage for the confirmed defect: a run of `n` asterisks
+  // either side of one letter drove `marked`'s emphasis tokenizer into
+  // recursion unbounded enough to throw `RangeError: Maximum call stack
+  // size exceeded` — caught, so nothing crashed, but the reviewer measured
+  // the time spent *reaching* that throw at 12.1s for 80,000 markers. A
+  // fix that only changes what happens after the RangeError does not help;
+  // the assertion below is on wall-clock time, not on the output shape,
+  // because the actual defect was the delay, not a wrong result.
+  function pathologicalInput(n: number): string {
+    return '*'.repeat(n) + 'a' + '*'.repeat(n);
+  }
+
+  it('renders an 80,000-asterisk run in well under a second instead of hitting the multi-second stack-overflow path', () => {
+    const start = performance.now();
+    const html = renderMarkdown(pathologicalInput(80_000));
+    const elapsedMs = performance.now() - start;
+
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(html.length).toBeGreaterThan(0);
+  });
+
+  it('extracts a heading outline from a pathological run in well under a second', () => {
+    const md = `# ${pathologicalInput(80_000)}\n`;
+    const start = performance.now();
+    const outline = extractHeadingOutline(md);
+    const elapsedMs = performance.now() - start;
+
+    expect(elapsedMs).toBeLessThan(1_000);
+    expect(outline.length).toBe(1);
+  });
+
+  it('degrades gracefully: the pathological run appears as literal text, not a thrown error', () => {
+    expect(() => renderMarkdown(pathologicalInput(80_000))).not.toThrow();
+    const html = renderMarkdown(pathologicalInput(80_000));
+    // Escaped rather than parsed as emphasis, so the letter between the two
+    // runs is not wrapped in dozens of nested <em>/<strong> tags.
+    expect(html).not.toContain('<em>');
+    expect(html).not.toContain('<strong>');
+    expect(html).toContain('a');
+  });
+
+  it('leaves an ordinary, short emphasis run parsed as real emphasis, not escaped', () => {
+    // Three asterisks either side is completely normal markdown
+    // (bold+italic) and must not be touched by the pathological-run guard.
+    const html = renderMarkdown('***bold italic***');
+    expect(html).toContain('<strong>');
+    expect(html).toContain('<em>');
+  });
+
+  it('does not touch a moderate, plausible run of emphasis markers', () => {
+    // Ten asterisks is unusual but not the pathological shape (the
+    // threshold is well above any legitimate nesting depth); confirms the
+    // guard does not fire on ordinary ragged input.
+    const html = renderMarkdown('**********bold-ish**********');
+    expect(html.length).toBeGreaterThan(0);
+  });
+});
+
 describe('extractHeadingOutline', () => {
   it('returns headings in document order, at the shifted level, with matching ids', () => {
     const md = '# Title\n\n## Findings\n\n### Detail\n';

@@ -206,6 +206,46 @@ describe('a plain text turn', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Usage — must be reported once, not once per chunk that carries it
+// ---------------------------------------------------------------------------
+
+describe('usage reporting', () => {
+  it('yields exactly one usage event with the true totals when a stream repeats the same cumulative usage across two chunks', async () => {
+    // The defect this reproduces: some deployments attach the same running
+    // total to more than one chunk in a stream (here, the finish-reason
+    // chunk and the trailing empty-choices chunk that follows it). A naive
+    // per-chunk yield handed both copies downstream, and both the dispatcher
+    // and the web replay fold usage events with `+=`, turning a true 100/50
+    // into a reported 200/100.
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] }),
+          chunkLine({
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          }),
+          chunkLine({
+            choices: [],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProvider(server);
+      const events = await collect(provider.run(makeRequest()));
+
+      const usage = events.filter((e) => e.t === 'usage');
+      expect(usage).toEqual([{ t: 'usage', assignmentId: 'asg-1', inputTokens: 100, outputTokens: 50 }]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tool-call fragment reassembly — the test that matters most
 // ---------------------------------------------------------------------------
 
@@ -353,6 +393,43 @@ describe('streamed tool-call reassembly', () => {
       ]);
       expect(events.filter((e) => e.t === 'tool')).toHaveLength(2);
       expect(events.some((e) => e.t === 'error')).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reporting a run-wide model override (defect 6 coverage — resolveAgentModel
+// itself is covered exhaustively in apiConfig.test.ts; this proves the
+// adapter actually surfaces what that function returns).
+// ---------------------------------------------------------------------------
+
+describe('reporting a run-wide model override', () => {
+  it('yields exactly one non-fatal error event when a run-wide model overrides the agent catalog model, and still completes the run normally', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = new OpenAiCompatibleProvider('openai', {
+        model: 'gpt-4o-mini',
+        deps: {
+          env: { OPENAI_API_KEY: 'test-openai-key', OPENAI_BASE_URL: server.url },
+          tools: () => stubTools({ catalog: [] }),
+        },
+      });
+      const events = await collect(provider.run(makeRequest({ model: 'sonnet' })));
+
+      const warnings = events.filter((e) => e.t === 'error' && !e.fatal);
+      expect(warnings).toHaveLength(1);
+      const message = warnings[0]?.t === 'error' ? warnings[0].message : '';
+      expect(message).toContain('sonnet');
+      expect(message).toContain('gpt-4o-mini');
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'ok')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+
+      const body = server.requests[0]!.bodyJson as { model: string };
+      expect(body.model).toBe('gpt-4o-mini');
     });
   });
 });

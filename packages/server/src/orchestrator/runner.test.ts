@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { runTotalUsage, totalUsage } from '@agent-office/shared';
 import { MemoryRunStore } from '../store/memoryStore.js';
 import { stubDeliverable, testProviderFactory, testRegistry } from '../http/fixtures.js';
+import { MANAGER_PLAN_ASSIGNMENT_ID, MANAGER_SYNTHESIS_ASSIGNMENT_ID } from './manager.js';
 import { executeRun } from './runner.js';
 
 /**
@@ -57,8 +58,15 @@ describe('executeRun — manager token accounting (NFR-5)', () => {
       produceDeliverable: stubDeliverable(),
     });
 
-    // `totalUsage` scopes the FR-M8 dispatch budget and must stay
-    // assignments-only; `runTotalUsage` is what a user is shown.
+    // `totalUsage` is assignments-only; `runTotalUsage` adds the Manager's own
+    // turns. This test is about that difference existing at all — that manager
+    // spend is recorded somewhere rather than vanishing.
+    //
+    // It used to add that `totalUsage` "scopes the FR-M8 dispatch budget and
+    // must stay assignments-only". It no longer does, and the claim was the
+    // defect: a run whose Manager alone blew the budget completed anyway. The
+    // budget now checks `runTotalUsage`, which is what "per-run token budget"
+    // meant all along.
     const assignments = totalUsage(run);
     const whole = runTotalUsage(run);
 
@@ -85,5 +93,75 @@ describe('executeRun — manager token accounting (NFR-5)', () => {
     expect(run.status).toBe('failed');
     expect(run.managerUsage?.inputTokens).toBe(120);
     expect(run.managerUsage?.outputTokens).toBe(40);
+  });
+});
+
+describe('executeRun — manager event log (NFR-7 replay)', () => {
+  // Before this fix, `manager.ts`'s `runManagerTurn` never called
+  // `store.appendEvent` — only `dispatcher.ts` did, and only for the
+  // assignments it dispatches. Planning and synthesis streamed `usage` and
+  // `text` events live through `onEvent`, but none of them ever reached
+  // `logs/*.jsonl`, so `GET /api/runs/:id/events` (NFR-7 replay) reconstructed
+  // total silence for the two turns that, on this very fixture, spend more
+  // tokens (320 in / 100 out) than the whole team combined.
+
+  it('persists the planning turn into logs/manager-plan.jsonl', async () => {
+    const store = new MemoryRunStore();
+    const { run } = await executeRun({
+      registry: testRegistry(),
+      provider: testProviderFactory()(),
+      store,
+      task: 'log the planning turn',
+      logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
+    });
+
+    expect(run.status).toBe('done');
+    const planEvents = await store.readEvents(run.id, MANAGER_PLAN_ASSIGNMENT_ID);
+    expect(planEvents.length).toBeGreaterThan(0);
+    expect(planEvents.some((logged) => logged.event.t === 'usage')).toBe(true);
+    expect(planEvents.some((logged) => logged.event.t === 'text')).toBe(true);
+    expect(planEvents.every((logged) => logged.event.assignmentId === MANAGER_PLAN_ASSIGNMENT_ID)).toBe(
+      true,
+    );
+  });
+
+  it('persists the synthesis turn into logs/manager-synthesis.jsonl', async () => {
+    const store = new MemoryRunStore();
+    const { run } = await executeRun({
+      registry: testRegistry(),
+      provider: testProviderFactory()(),
+      store,
+      task: 'log the synthesis turn',
+      logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
+    });
+
+    expect(run.status).toBe('done');
+    const synthesisEvents = await store.readEvents(run.id, MANAGER_SYNTHESIS_ASSIGNMENT_ID);
+    expect(synthesisEvents.length).toBeGreaterThan(0);
+    expect(synthesisEvents.some((logged) => logged.event.t === 'usage')).toBe(true);
+    expect(synthesisEvents.some((logged) => logged.event.t === 'text')).toBe(true);
+  });
+
+  it('keeps manager events out of every real assignment\'s own log', async () => {
+    // The reserved ids must land in their own files, never mixed into an
+    // assignment's log — otherwise replay would attribute the Manager's text
+    // to whichever agent happens to log around the same moment.
+    const store = new MemoryRunStore();
+    const { run } = await executeRun({
+      registry: testRegistry(),
+      provider: testProviderFactory()(),
+      store,
+      task: 'keep manager and assignment logs separate',
+      logger: () => undefined,
+      produceDeliverable: stubDeliverable(),
+    });
+
+    expect(run.assignments.length).toBeGreaterThan(0);
+    for (const assignment of run.assignments) {
+      const events = await store.readEvents(run.id, assignment.id);
+      expect(events.every((logged) => logged.event.assignmentId === assignment.id)).toBe(true);
+    }
   });
 });

@@ -4,7 +4,7 @@ import {
   canTransitionAssignment,
   dependenciesUnreachable,
   findAssignment,
-  totalUsage,
+  runTotalUsage,
   type AgentEvent,
   type AssignmentState,
   type AssignmentStatus,
@@ -134,6 +134,23 @@ interface DispatchContext {
    * would mean a resumed run carrying a critique it had already acted on.
    */
   pendingRevisionNotes: Map<string, string>;
+  /**
+   * Single-flight claim on "decide, then redispatch" per target assignment id,
+   * guarding `applyReviewVerdict` against two reviewers of the same target
+   * both deciding to redispatch it (see the comment there for the race this
+   * closes). A `Set` rather than a lock with waiters because nothing needs to
+   * wait: the loser is refused outright, not queued.
+   */
+  targetsBeingRevised: Set<string>;
+  /**
+   * Tripped the moment `enforceTokenBudget` judges the run over budget, so
+   * assignments already mid-flight can be cut short via the same abort-signal
+   * machinery used for cancellation and per-assignment timeouts, instead of
+   * being left to run to completion after the run has already decided to stop
+   * spending. See `enforceTokenBudget` for the honest bound on how much this
+   * does and does not prevent.
+   */
+  haltController: AbortController;
 }
 
 export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
@@ -154,7 +171,20 @@ export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
     onEvent: deps.onEvent,
     onStateChange: deps.onStateChange,
     pendingRevisionNotes: new Map(),
+    targetsBeingRevised: new Set(),
+    haltController: new AbortController(),
   };
+
+  // Checked once here, before any phase runs, not only after each assignment
+  // completes: Manager planning spend (FR-M8, NFR-5) is already banked into
+  // `run.managerUsage` by the time dispatch begins (see `runTotalUsage`'s doc
+  // comment in `shared/src/run.ts`). Without this eager check, a run whose
+  // planning turn alone had already exceeded the budget would still dispatch
+  // and pay for its first assignment before `enforceTokenBudget` ever got a
+  // chance to run — the phase loop below only calls it after an assignment
+  // finishes. This way, the loop's own `if (ctx.halted !== undefined) break`
+  // sees the halt on its very first iteration and nothing is dispatched at all.
+  await enforceTokenBudget(ctx);
 
   for (const phase of plan.phases) {
     if (ctx.signal.aborted) {
@@ -182,7 +212,30 @@ export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
 
     await runPool(runnable, limit, async (assignment) => {
       if (ctx.signal.aborted || ctx.halted !== undefined) return;
-      await executeAssignment(ctx, assignment.id);
+      try {
+        await executeAssignment(ctx, assignment.id);
+      } catch (error) {
+        // Defensive containment, not a substitute for the single-flight guard
+        // in `applyReviewVerdict` — that guard is what makes the concurrent-
+        // reviewer race impossible in the first place. This catch is a
+        // backstop for whatever *other* stray throw might one day reach here
+        // (a future illegal `setStatus` transition, or anything else). We
+        // deliberately leave `setStatus`'s contract of throwing on an illegal
+        // transition alone — it is a real programming-invariant check, worth
+        // keeping loud during development — but a bug in one assignment's
+        // lifecycle must not be able to discard every other assignment's
+        // already-completed report, which is exactly what used to happen: the
+        // throw escaped this `Promise.all`, unwound out of `dispatchRun`, and
+        // `executeRun`'s top-level catch marked the whole run failed. Every
+        // other per-assignment failure in this file is recorded as state
+        // rather than thrown; this makes a stray throw no exception to that.
+        ctx.onEvent?.({
+          t: 'error',
+          assignmentId: assignment.id,
+          message: `assignment "${assignment.id}" errored outside normal failure handling: ${describe(error)}`,
+          fatal: false,
+        });
+      }
       await enforceTokenBudget(ctx);
     });
   }
@@ -245,7 +298,10 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
 
   const timeout = new AbortController();
   const timer = setTimeout(() => timeout.abort(), ctx.options.assignmentTimeoutMs);
-  const linked = anySignal([ctx.signal, timeout.signal]);
+  // `ctx.haltController.signal` joins the linked signal so a lane already
+  // mid-assignment gets cut short as soon as the token budget trips elsewhere,
+  // rather than running to completion regardless (FR-M8; see `enforceTokenBudget`).
+  const linked = anySignal([ctx.signal, timeout.signal, ctx.haltController.signal]);
 
   let text = '';
   let fatalError: string | undefined;
@@ -264,6 +320,12 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
       allowedTools: agent.tools,
       workspaceDir: await ctx.store.workspaceDir(ctx.run.id),
       signal: linked.signal,
+      // The catalog's per-agent `model:`, forwarded verbatim. The dispatcher
+      // does not interpret it — `sonnet` and `inherit` mean different things to
+      // different engines, and deciding here would put provider knowledge back
+      // in the orchestrator. Absent for the 8 agents that declare no model,
+      // which every adapter reads as "use whatever the run is using".
+      ...(agent.model === undefined ? {} : { model: agent.model }),
     })) {
       await ctx.store.appendEvent(ctx.run.id, assignmentId, event);
       ctx.onEvent?.(event);
@@ -293,8 +355,54 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
     return;
   }
   if (ctx.signal.aborted) {
-    // Cancelled mid-flight. Leave the assignment in `working` so the persisted
-    // run shows where it was interrupted rather than misreporting a failure.
+    // FR-M9: cancelled mid-flight. This used to `return` here and leave the
+    // assignment in `working`, on the reasoning that the persisted run would
+    // then show where it was interrupted. The intent was reasonable but
+    // nothing ever revisited it: the RUN reaches terminal `cancelled` while
+    // this assignment sits in `working` forever, and `working` renders as
+    // "seated, typing loop" (`shared/src/status.ts`'s `ASSIGNMENT_BEHAVIOUR`),
+    // so every reload or replay of a cancelled run showed that agent still
+    // typing, indefinitely, for a run that was long over.
+    //
+    // `working`'s only legal onward transitions are `reporting` (this run did
+    // not produce one) and `blocked` (also not terminal — see
+    // `canTransitionAssignment` in `shared/src/status.ts`, which this package
+    // may not edit). The sole terminal status reachable from `working` is
+    // `failed`, via that function's "anything not otherwise reachable may
+    // still fail" fallback. Calling it a failure is an imperfect fit — a
+    // cancellation is not really an error — but it is the only terminal option
+    // the state machine offers without changing `status.ts`, and the original
+    // intent survives in the error text and `endedAt` below: a reader can
+    // still see exactly which assignment was in flight when the cancel landed,
+    // instead of inferring it from a character that never stops typing.
+    await failAssignment(
+      ctx,
+      assignmentId,
+      'cancelled: run was stopped while this assignment was in progress',
+    );
+    return;
+  }
+  if (ctx.haltController.signal.aborted && text.trim() === '') {
+    // Unlike the timeout and cancellation checks above, this one is
+    // deliberately guarded on `text.trim() === ''` rather than firing
+    // unconditionally. `haltController` is shared across every lane in the
+    // run (see `enforceTokenBudget`), so by the time this assignment reaches
+    // this line, some *other* lane's completion may have tripped it moments
+    // after this one's provider loop had already finished cleanly with a full
+    // report in hand. Failing that assignment anyway would discard a
+    // completed, already-paid-for report over an abort that never actually
+    // touched it — the exact kind of collateral loss FR-M8's "partial results
+    // preserved" promises against. Checking `text` limits this branch to
+    // assignments that were genuinely cut short: some providers throw on an
+    // aborted signal (caught above as a generic error) and some — like the
+    // scripted test provider — simply notice `signal.aborted` and stop
+    // yielding events quietly, which would otherwise fall through to a
+    // misleading "produced no report" instead of naming the real cause.
+    await failAssignment(
+      ctx,
+      assignmentId,
+      'halted: run token budget exceeded while this assignment was in progress',
+    );
     return;
   }
   if (fatalError !== undefined) {
@@ -353,13 +461,44 @@ async function applyReviewVerdict(
 
   const outcome = parseReviewVerdict(reportText);
   const target = findAssignment(ctx.run, targetId);
-  const decision = decideRevision({ reviewer, outcome, target });
+
+  // Single-flight guard (CRITICAL, confirmed 4/8 against the real
+  // `FileRunStore` on real disk): nothing used to serialise "decide, then
+  // redispatch" against the same section running for a second reviewer of the
+  // SAME target — exactly the shape of two reviewers over one lead, in one
+  // parallel phase. Both would read `target.status === 'done'` before either
+  // had redispatched, both would decide `redispatch: true`, the first would
+  // flip the target `done -> briefing`, and the second's own
+  // `setStatus(target, 'briefing')` would then throw —
+  // `canTransitionAssignment('briefing', 'briefing')` is false. That throw was
+  // uncaught: it escaped `runPool`'s `Promise.all`, unwound `dispatchRun`, and
+  // landed in `executeRun`'s top-level catch, which failed the WHOLE RUN and
+  // discarded every completed report — for a situation FR-M10 says should
+  // simply be refused.
+  //
+  // `alreadyClaimed` is read, and the claim below is taken, with no `await` in
+  // between — this whole stretch, from `parseReviewVerdict` above through
+  // `targetsBeingRevised.add` below, is synchronous. JS never preempts a
+  // synchronous stretch of code, so whichever reviewer's `applyReviewVerdict`
+  // reaches the claim first is guaranteed to see it unclaimed and win it before
+  // the other reviewer's synchronous stretch can even begin. Everything after
+  // the claim is genuinely async and free to interleave; that is fine, because
+  // only the winner ever gets there — the loser has already returned, refused,
+  // by the time any of it runs.
+  const alreadyClaimed = ctx.targetsBeingRevised.has(targetId);
+  const decision = decideRevision({
+    reviewer,
+    outcome,
+    target,
+    concurrentRevisionInFlight: alreadyClaimed,
+  });
 
   if (!decision.redispatch) {
     // A refusal is worth surfacing but is not a failure: the run continues with
     // the work as it stands, and the reviewer's critique is still in its report
     // for a human to read. Silence here would make an exhausted revision budget
-    // indistinguishable from an approval.
+    // — or, now, a lost race for the same target — indistinguishable from an
+    // approval.
     if (decision.refusedBecause !== undefined) {
       ctx.onEvent?.({
         t: 'error',
@@ -371,23 +510,35 @@ async function applyReviewVerdict(
     return;
   }
 
-  if (ctx.signal.aborted || ctx.halted !== undefined) return;
+  ctx.targetsBeingRevised.add(targetId);
+  try {
+    if (ctx.signal.aborted || ctx.halted !== undefined) return;
 
-  ctx.pendingRevisionNotes.set(
-    targetId,
-    buildRevisionNote({
-      reviewerAgentName: reviewer.agentName,
-      critique: outcome.critique ?? '',
-    }),
-  );
+    ctx.pendingRevisionNotes.set(
+      targetId,
+      buildRevisionNote({
+        reviewerAgentName: reviewer.agentName,
+        critique: outcome.critique ?? '',
+      }),
+    );
 
-  // `endedAt` is cleared first because the assignment has not ended any more —
-  // leaving the old timestamp would make the replay show it finishing before it
-  // restarted. Then it goes back through `executeAssignment` unchanged: that
-  // function opens with `done -> briefing`, which `shared/src/status.ts` permits
-  // for exactly this, and it will pick the critique out of the map itself.
-  await patchAssignment(ctx, targetId, { endedAt: undefined });
-  await executeAssignment(ctx, targetId);
+    // `endedAt` is cleared first because the assignment has not ended any more —
+    // leaving the old timestamp would make the replay show it finishing before it
+    // restarted. Then it goes back through `executeAssignment` unchanged: that
+    // function opens with `done -> briefing`, which `shared/src/status.ts` permits
+    // for exactly this, and it will pick the critique out of the map itself.
+    await patchAssignment(ctx, targetId, { endedAt: undefined });
+    await executeAssignment(ctx, targetId);
+  } finally {
+    // Released once this redispatch has run its course. With
+    // `MAX_REVIEW_REVISIONS` at 1 nothing will ever consult this claim again
+    // for this target in practice — `decideRevision`'s own attempt-budget
+    // check refuses a further revision on its merits — but leaving the claim
+    // set would leave a stale flag behind that outlives the thing it was
+    // guarding, which is its own kind of bug waiting for a future reviewer
+    // shape this file does not anticipate yet.
+    ctx.targetsBeingRevised.delete(targetId);
+  }
 }
 
 /** Load the reports this assignment declared a dependency on, in order. */
@@ -410,13 +561,55 @@ async function loadUpstreamReports(
   return reports;
 }
 
+/**
+ * FR-M8's per-run token budget, checked after every assignment completes.
+ *
+ * Two defects lived here.
+ *
+ * MAJOR (confirmed): this used `totalUsage` — assignments only — so Manager
+ * spend (planning, repair, synthesis) escaped the budget entirely. Measured
+ * with `runTokenBudget: 400`: 225 tokens of assignment spend, 420 of Manager
+ * spend, 645 true total — 61% over — and `haltedBecause` never fired, because
+ * 225 alone never crosses 400. FR-M8 says "per-run token budget"; a user who
+ * sets a limit means the run, not the slice of it the dispatcher happens to
+ * own. Now checked against `runTotalUsage`, which is assignments plus
+ * `run.managerUsage` — see that function's doc comment in `shared/src/run.ts`
+ * for the full accounting, including why Manager planning spend counts
+ * immediately here while synthesis spend, happening after dispatch ends,
+ * cannot be pre-empted by this check at all.
+ *
+ * MODERATE (confirmed): even with the right total, this only runs *after* an
+ * assignment finishes, and — before this fix — lanes already in flight when
+ * the budget tripped ran to completion regardless. Measured at concurrency 3,
+ * budget 12,000, six 10,000-token assignments: the run spent 40,000 — 28,000
+ * over — before halting. A lane that has not started a *new* assignment yet
+ * was already safe (the `ctx.halted !== undefined` check at the top of the
+ * `runPool` worker in `dispatchRun` sees the halt and skips it), but that
+ * alone does not bound the overshoot: any lane already mid-assignment, plus
+ * any lane that slipped past that same check moments earlier because the halt
+ * had not been observed yet, kept running unconstrained.
+ *
+ * The fix here is `ctx.haltController.abort()`: it reuses the same
+ * abort-signal machinery already wired through `executeAssignment` for
+ * cancellation and per-assignment timeouts, so every lane currently awaiting a
+ * provider chunk gets the same signal a moment after this function trips. That
+ * reduces the overshoot but cannot make it exact, and pretending otherwise
+ * would be dishonest: usage is only known after a provider event reports it,
+ * so a lane already past its last checkpoint can still bank tokens between
+ * "the budget tripped" and "the provider noticed its signal aborted" — and a
+ * provider that does not honour cancellation promptly (or at all) is not
+ * bounded by this code no matter what it does. The only guarantee FR-M8
+ * actually makes is the one it states: the run halts and partial results are
+ * preserved, not that spend stays under the number.
+ */
 async function enforceTokenBudget(ctx: DispatchContext): Promise<void> {
   const budget = ctx.options.runTokenBudget;
   if (budget === undefined || ctx.halted !== undefined) return;
 
-  const used = totalUsage(ctx.run);
+  const used = runTotalUsage(ctx.run);
   if (used.inputTokens + used.outputTokens > budget) {
     ctx.halted = 'token-budget';
+    ctx.haltController.abort();
   }
 }
 

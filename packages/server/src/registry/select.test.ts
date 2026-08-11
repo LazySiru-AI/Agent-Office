@@ -1,7 +1,16 @@
 import { existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+/**
+ * Same reason as `registry/index.test.ts`: the routing matrix loads and ranks
+ * the real 156-agent catalog off disk, and a measurement pass found several of
+ * these tests sitting at 60-75% of vitest's 5s default — passing, but only
+ * because nothing else happened to be contending at that moment. A test that
+ * passes on margin is a test that will fail on somebody else's machine.
+ */
+vi.setConfig({ testTimeout: 20_000 });
 import type { AgentDef } from '@agent-office/shared';
 import { buildRegistry, buildRosterDigest, estimateTokens, loadRegistry } from './index.js';
 import { DEFAULT_CANDIDATE_LIMIT, rankCandidates, selectCandidates } from './select.js';

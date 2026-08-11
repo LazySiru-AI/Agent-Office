@@ -5,8 +5,13 @@ import { StatusBadge } from './StatusBadge.js';
 
 /**
  * Run summary strip: status, cancel button, and the per-run NFR-5 cost
- * counters (`totalUsage` + `estimateCostUsd` from `shared`, joined against
- * the agent roster — see `costModel.ts` for why that join is necessary).
+ * counters.
+ *
+ * The figures come from `summariseRunCost`, which is built on `runTotalUsage`
+ * — assignments plus the Manager's own planning and synthesis turns — joined
+ * against the agent roster. See `costModel.ts` for why that join is necessary
+ * and why the run's provider decides only whether the run was free, not what
+ * its model was priced as.
  */
 export interface RunHeaderProps {
   run: RunState | undefined;

@@ -89,6 +89,71 @@ async function setup(scripted: ScriptedProviderOptions = {}, plan: RunPlan = two
   return { store, provider, run };
 }
 
+/**
+ * A `MemoryRunStore` whose `saveRun` takes 8ms, standing in for real disk.
+ *
+ * The concurrent-reviewers race (CRITICAL defect below) needs two lanes to
+ * genuinely interleave around the same target's status, not just run one
+ * after the other quickly enough that they never overlap. `MemoryRunStore`'s
+ * `saveRun` resolves almost immediately, which under-tests exactly the
+ * scenario that broke against the real `FileRunStore` on real disk. The QA
+ * reproduction that found the defect used a store with this same 8ms
+ * `saveRun` latency — `fileStore.ts`'s own `renameWithRetry` backoff exists
+ * because that latency is real, not a test artefact.
+ */
+class SlowRunStore extends MemoryRunStore {
+  override async saveRun(run: RunState): Promise<void> {
+    await new Promise<void>((resolve) => setTimeout(resolve, 8));
+    await super.saveRun(run);
+  }
+}
+
+/** One assignment reviewed by two others in the same parallel phase. */
+function reviewedByTwoPlan(): RunPlan {
+  return RunPlanSchema.parse({
+    summary: 'Two reviewers review one lead.',
+    domain: 'software',
+    reportStyle: 'engineering',
+    phases: [
+      {
+        id: 'lead',
+        name: 'Lead',
+        parallel: true,
+        assignments: [
+          {
+            id: 'lead-a',
+            agentName: 'alpha',
+            objective: 'Produce the lead work.',
+            deliverable: 'reports/01-alpha.md',
+            dependsOn: [],
+          },
+        ],
+      },
+      {
+        id: 'review',
+        name: 'Review',
+        parallel: true,
+        assignments: [
+          {
+            id: 'review-1',
+            agentName: 'beta',
+            objective: 'Review the lead work.',
+            deliverable: 'reports/02-beta.md',
+            dependsOn: ['lead-a'],
+          },
+          {
+            id: 'review-2',
+            agentName: 'gamma',
+            objective: 'Also review the lead work.',
+            deliverable: 'reports/03-gamma.md',
+            dependsOn: ['lead-a'],
+          },
+        ],
+      },
+    ],
+  });
+}
+
 describe('materialiseAssignments', () => {
   it('flattens phases in execution order and stamps the phase id', () => {
     const assignments = materialiseAssignments(twoPhasePlan());
@@ -328,29 +393,18 @@ describe('dispatchRun — failure handling', () => {
   });
 
   it('fails an assignment whose deliverable path escapes the run directory', async () => {
-    const plan = RunPlanSchema.parse({
-      summary: 's',
-      domain: 'software',
-      reportStyle: 'engineering',
-      phases: [
-        {
-          id: 'only',
-          name: 'Only',
-          parallel: true,
-          assignments: [
-            {
-              id: 'evil',
-              agentName: 'alpha',
-              objective: 'work',
-              deliverable: '../../../escaped.md',
-              dependsOn: [],
-            },
-          ],
-        },
-      ],
-    });
-
-    const { store, provider, run } = await setup({ fallback: { text: 'payload' } }, plan);
+    // The escaping deliverable is injected AFTER plan validation, not through
+    // it, because `RunPlanSchema` now refuses this value outright (see the test
+    // below, and `DeliverablePath` in `shared/src/plan.ts`). That makes this
+    // test defence-in-depth rather than the first line it used to be: it proves
+    // the store still refuses a path that escapes even if a future caller ever
+    // reaches the dispatcher without going through plan validation. Both checks
+    // are worth having — the schema one gives a Manager a repairable error
+    // (FR-M2), the store one is what actually protects the filesystem (NFR-1).
+    const { store, provider, run } = await setup({ fallback: { text: 'payload' } });
+    const target = run.assignments[0];
+    if (target === undefined) throw new Error('the fixture plan produced no assignments');
+    target.deliverable = '../../../escaped.md';
 
     await dispatchRun({
       run,
@@ -360,9 +414,49 @@ describe('dispatchRun — failure handling', () => {
       signal: new AbortController().signal,
     });
 
-    expect(run.assignments[0]?.status).toBe('failed');
-    expect(run.assignments[0]?.error).toContain('could not write report');
-    expect(store.reportsFor(run.id).size).toBe(0);
+    expect(target.status).toBe('failed');
+    expect(target.error).toContain('could not write report');
+    // The escaping path specifically wrote nothing. Not "the run wrote
+    // nothing" — this fixture's other assignments are independent of the one
+    // sabotaged here and go on succeeding, which is itself the correct
+    // behaviour: one bad deliverable fails its own assignment, not the run.
+    const written = [...store.reportsFor(run.id).keys()];
+    expect(written).not.toContain('../../../escaped.md');
+    expect(written.some((reportPath) => reportPath.includes('escaped'))).toBe(false);
+  });
+
+  it('refuses a plan whose deliverable is not a markdown file inside reports/', () => {
+    // The demonstrated defect: `deliverable` was only `z.string().min(1)`, and
+    // the store's containment check treats the run's own directory as the
+    // boundary — so `run.json` sat inside it and a plan naming it overwrote the
+    // run's state file with markdown. `logs/<id>.jsonl` would have destroyed
+    // that assignment's replay log the same way.
+    const planWith = (deliverable: string): unknown => ({
+      summary: 's',
+      domain: 'software',
+      reportStyle: 'engineering',
+      phases: [
+        {
+          id: 'only',
+          name: 'Only',
+          parallel: true,
+          assignments: [{ id: 'evil', agentName: 'alpha', objective: 'work', deliverable, dependsOn: [] }],
+        },
+      ],
+    });
+
+    for (const deliverable of [
+      'run.json',
+      'logs/evil.jsonl',
+      '../../../escaped.md',
+      'workspace/notes.md',
+      'reports/nested/deep.md',
+      'reports/notes.txt',
+    ]) {
+      expect(RunPlanSchema.safeParse(planWith(deliverable)).success).toBe(false);
+    }
+
+    expect(RunPlanSchema.safeParse(planWith('reports/01-alpha.md')).success).toBe(true);
   });
 });
 
@@ -422,6 +516,216 @@ describe('dispatchRun — budgets and cancellation (FR-M8, FR-M9)', () => {
 
     expect(result.haltedBecause).toBe('cancelled');
     expect(result.completed).toBeLessThan(3);
+  });
+
+  it('gives a cancelled assignment a terminal status instead of leaving it stuck in `working` forever (FR-M9)', async () => {
+    // MAJOR defect: cancelling mid-flight used to `return` early and leave the
+    // assignment in `working`. The RUN reached terminal `cancelled`, but the
+    // assignment never did — and `working` renders as "seated, typing loop",
+    // so every reload of a cancelled run showed an agent still typing on a
+    // run that was long over. `hang: true` never produces a terminal event on
+    // its own, so the only way this assignment ever leaves `working` is via
+    // the cancellation path under test.
+    const controller = new AbortController();
+    const { store, provider, run } = await setup({
+      byAssignment: { a: { hang: true } },
+      fallback: { text: 'ok' },
+    });
+
+    const dispatchPromise = dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: controller.signal,
+      options: { maxConcurrency: 1 },
+    });
+
+    // Let `a` reach `working` before cancelling it mid-flight.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+
+    const result = await dispatchPromise;
+
+    expect(result.haltedBecause).toBe('cancelled');
+    const a = run.assignments.find((assignment) => assignment.id === 'a');
+    // Not `working` — a terminal status, so replay stops rendering it as
+    // still in progress once the run itself is over.
+    expect(a?.status).toBe('failed');
+    expect(a?.error).toContain('cancelled');
+    expect(a?.endedAt).toBeDefined();
+  });
+
+  it('cuts an in-flight lane short once the token budget trips, instead of letting it run to completion (FR-M8)', async () => {
+    // MODERATE defect: `enforceTokenBudget` only ran after an assignment
+    // completed, and lanes already mid-flight when it tripped kept running
+    // regardless — measured at concurrency 3, budget 12,000, six 10,000-token
+    // assignments: 40,000 spent, 28,000 over, before halting. `w0` and `w1`
+    // are fast and push the total over budget as soon as both land; `w2` and
+    // `w3` are slow enough (50ms) to still be mid-pause at that moment, which
+    // is exactly the "already in flight" lane this fix targets — before the
+    // fix both finished anyway and banked their full usage.
+    const plan = RunPlanSchema.parse({
+      summary: 's',
+      domain: 'software',
+      reportStyle: 'engineering',
+      phases: [
+        {
+          id: 'wide',
+          name: 'Wide',
+          parallel: true,
+          assignments: ['alpha', 'beta', 'gamma', 'delta'].map((agentName, index) => ({
+            id: `w${index}`,
+            agentName,
+            objective: 'work',
+            deliverable: `reports/0${index}-${agentName}.md`,
+            dependsOn: [],
+          })),
+        },
+      ],
+    });
+
+    // `w0` has no delay, so it lands first and — because nothing has told it
+    // to stop yet — the lane picks up `w2` immediately afterwards, which then
+    // sits in a real 50ms pause. `w1` has a small delay of its own, so it
+    // finishes *after* `w2` is already mid-pause: that is what makes `w2` a
+    // genuinely "already in flight" lane at the moment `w1`'s completion pushes
+    // the total over budget, rather than a lane that simply never got to start.
+    const { store, provider, run } = await setup(
+      {
+        byAssignment: {
+          w0: { text: 'fast', usage: { inputTokens: 500, outputTokens: 500 } },
+          w1: { text: 'fast', usage: { inputTokens: 500, outputTokens: 500 }, delayMs: 5 },
+          w2: { text: 'slow', usage: { inputTokens: 500, outputTokens: 500 }, delayMs: 50 },
+          w3: { text: 'slow', usage: { inputTokens: 500, outputTokens: 500 }, delayMs: 50 },
+        },
+      },
+      plan,
+    );
+
+    const result = await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+      options: { maxConcurrency: 2, runTokenBudget: 1600 },
+    });
+
+    expect(result.haltedBecause).toBe('token-budget');
+
+    const byId = (id: string) => run.assignments.find((a) => a.id === id);
+    expect(byId('w0')?.status).toBe('done');
+    expect(byId('w1')?.status).toBe('done');
+
+    // The point of the fix: at least one lane already mid-assignment when the
+    // budget tripped was cut short via the shared abort signal, rather than
+    // left to finish and bank its full usage. Before the fix, both `w2` and
+    // `w3` always reached `done` regardless of the halt.
+    const stillFinished = [byId('w2'), byId('w3')].filter((a) => a?.status === 'done');
+    expect(stillFinished.length).toBeLessThan(2);
+
+    const cutShort = [byId('w2'), byId('w3')].find(
+      (a) => a?.status === 'failed' && a.error?.includes('halted'),
+    );
+    expect(cutShort).toBeDefined();
+
+    const totalSpent = run.assignments.reduce(
+      (sum, a) => sum + a.usage.inputTokens + a.usage.outputTokens,
+      0,
+    );
+    // Without the fix this reaches 4000 (all four assignments' full usage).
+    expect(totalSpent).toBeLessThan(4000);
+  });
+
+  it('halts before dispatching anything when Manager planning spend alone already exceeds the run token budget (NFR-5)', async () => {
+    // MAJOR defect: the budget was checked with `totalUsage` (assignments
+    // only), so Manager spend — which is real spend, recorded in
+    // `run.managerUsage` before dispatch ever begins — escaped the budget
+    // entirely. Measured with `runTokenBudget: 400`: 225 assignment tokens,
+    // 420 Manager tokens, 645 true total, 61% over, and `haltedBecause` never
+    // fired. Here the Manager alone is already over budget and no assignment
+    // has run at all, which is the sharpest version of the bug: the old code
+    // would still have dispatched every assignment before ever noticing.
+    const { store, provider, run } = await setup({
+      fallback: { text: 'ok', usage: { inputTokens: 10, outputTokens: 10 } },
+    });
+    run.managerUsage = { inputTokens: 300, outputTokens: 200 };
+    await store.saveRun(run);
+
+    const result = await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+      options: { runTokenBudget: 400 },
+    });
+
+    expect(result.haltedBecause).toBe('token-budget');
+    expect(provider.requests).toHaveLength(0);
+    expect(run.assignments.every((a) => a.status === 'pending')).toBe(true);
+  });
+});
+
+describe('dispatchRun — two reviewers of one target (FR-M10 concurrency)', () => {
+  const REVISION_MARKER = '[[REVIEW_VERDICT: REVISIONS_REQUESTED]]';
+
+  it('does not throw when two reviewers of the same target both request revisions concurrently, redispatches the target exactly once, and reports the loser’s refusal', async () => {
+    // CRITICAL defect, confirmed 4/8 against the real `FileRunStore` on real
+    // disk: two reviewers of one target, in the same parallel phase, could
+    // both read `target.status === 'done'` before either had redispatched,
+    // both decide to redispatch, and the second's own `setStatus` then threw
+    // on an illegal `briefing -> briefing` transition — uncaught, escaping
+    // `runPool`'s `Promise.all` and failing the WHOLE RUN, discarding every
+    // completed report. `SlowRunStore` reproduces the real-disk latency that
+    // widens the window enough for the two lanes to genuinely interleave
+    // instead of resolving in lockstep.
+    const store = new SlowRunStore();
+    const provider = new ScriptedProvider({
+      byAssignment: {
+        'review-1': { text: `Needs work from reviewer one.\n\n${REVISION_MARKER}` },
+        'review-2': { text: `Needs work from reviewer two.\n\n${REVISION_MARKER}` },
+      },
+      fallback: { text: 'Findings.' },
+    });
+    const plan = reviewedByTwoPlan();
+    const run = makeRun(plan);
+    await store.saveRun(run);
+
+    const nonFatalErrors: string[] = [];
+
+    const result = await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+      options: { maxConcurrency: 2 },
+      onEvent: (event) => {
+        if (event.t === 'error' && !event.fatal) nonFatalErrors.push(event.message);
+      },
+    });
+
+    // The headline assertion: this used to throw and fail the whole run. If
+    // it throws, `dispatchRun` rejects and this `await` fails the test.
+    expect(result.completed).toBe(3);
+    expect(result.failed).toBe(0);
+
+    const target = run.assignments.find((a) => a.id === 'lead-a');
+    // Redispatched exactly once, no matter which reviewer's request won.
+    expect(target?.attempts).toBe(2);
+    expect(target?.status).toBe('done');
+
+    const leadRequests = provider.requests.filter((r) => r.assignmentId === 'lead-a');
+    expect(leadRequests).toHaveLength(2);
+
+    // The losing reviewer's request must be refused visibly, not silently
+    // dropped — silence here would make a lost race indistinguishable from an
+    // approval.
+    expect(
+      nonFatalErrors.some((message) => message.includes('but not applied')),
+    ).toBe(true);
   });
 });
 

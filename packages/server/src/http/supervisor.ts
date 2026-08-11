@@ -2,6 +2,7 @@ import {
   EVENT_BUFFER_LIMIT,
   LOG_BUFFER_LIMIT,
   RunStateSchema,
+  isRunTerminal,
   type AgentEvent,
   type CreateRunRequest,
   type LoggedAgentEvent,
@@ -206,6 +207,80 @@ export class RunSupervisor {
       ...(deps.dispatchDefaults === undefined ? {} : { dispatchDefaults: deps.dispatchDefaults }),
     };
     this.knownAgentNames = new Set(deps.registry.agents.map((agent) => agent.name));
+  }
+
+  /**
+   * NFR-2, the server-restart half: find runs a *previous* process in this
+   * server left non-terminal and close them out.
+   *
+   * DEFECT FIXED: nothing ever called `store.listRuns()` on startup. A
+   * `run.json` written with `status: 'running'` (an assignment stuck at
+   * `working`, exactly the shape a crash leaves) was, on disk, indistinguishable
+   * from a run this fresh process is genuinely executing — `liveRunIds()` never
+   * lists it (nothing here ever called `startRun` for it), so `cancelRun`
+   * returns `false` and the HTTP route answers 409 "not executing in this
+   * server process" forever. NFR-2 promises "a browser refresh **or server
+   * restart** reattaches to a live run rather than losing it"; only the refresh
+   * half was true.
+   *
+   * READING IMPLEMENTED — the honest minimum: mark every non-terminal run
+   * `failed` with a reason that says the process restarted, so it stops lying
+   * about its own status. A run's `status` field is now a threeway of "genuinely
+   * executing here", "finished", or "known to have died with the process" —
+   * never again "who knows".
+   *
+   * READING NOT IMPLEMENTED — resuming dispatch: replaying a plan from
+   * `run.json` and re-entering `dispatchRun` at the assignment a crash
+   * interrupted. That needs more than this store persists: which tool calls (if
+   * any) were mid-flight inside that assignment's provider call, whether a
+   * partial response was ever durably committed anywhere the provider itself
+   * would recognise on a fresh call, and a provider adapter able to resume a
+   * conversation rather than only start one (`AgentProvider.run` takes a task
+   * string, no conversation id). A half-finished assignment cannot simply be
+   * re-awaited; building real resumption is a provider-and-store feature, not a
+   * few lines in the supervisor, so it is out of scope here and the gap is
+   * recorded rather than quietly narrowed.
+   *
+   * MUST be awaited before the HTTP server starts accepting connections (see
+   * `serve.ts`'s `main()`) — calling this after `listen()` would race a
+   * client's own `POST /api/runs`: `store.listRuns()` could observe a
+   * brand-new, genuinely-live run created in that gap and misfile it as
+   * crashed, since at construction time `this.entries` (this process's record
+   * of what it is actually executing) is always empty.
+   *
+   * @returns the ids reconciled, for the startup log line.
+   */
+  async reconcileCrashedRuns(): Promise<string[]> {
+    const summaries = await this.deps.store.listRuns();
+    const reconciled: string[] = [];
+
+    for (const summary of summaries) {
+      if (isRunTerminal(summary.status)) continue;
+      if (this.entries.has(summary.id)) continue; // defensive; see the doc comment
+
+      try {
+        // Re-load rather than trusting the summary: `listRuns` reads whatever
+        // fields it keeps for the history browser, and re-fetching the full
+        // `RunState` means `saveRun` below round-trips through the same schema
+        // validation every other write does, instead of hand-building a patch.
+        const run = await this.deps.store.loadRun(summary.id);
+        if (isRunTerminal(run.status)) continue; // settled between the two reads
+
+        run.status = 'failed';
+        run.error =
+          'the server process restarted while this run was in progress; it cannot be resumed and was marked failed';
+        run.updatedAt = this.deps.now();
+        await this.deps.store.saveRun(run);
+        reconciled.push(run.id);
+      } catch (error) {
+        // One unreconcilable run (corrupt `run.json`, a store that cannot
+        // write) must not stop every other crashed run from being closed out,
+        // and must not stop the server from starting at all.
+        this.deps.onWarning(`could not reconcile run ${summary.id} left over from a previous process`, error);
+      }
+    }
+
+    return reconciled;
   }
 
   /**

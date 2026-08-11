@@ -16,6 +16,7 @@ import {
   extractPlanJson,
   planRun,
   synthesiseReport,
+  truncateReport,
   type AssignmentReport,
 } from './manager.js';
 
@@ -854,6 +855,54 @@ describe('buildSynthesisPrompt', () => {
     expect(prompt).toContain('50 of 60 characters omitted');
     expect(prompt).toContain('short');
     expect(prompt.match(/\[TRUNCATED BY AGENT OFFICE:/g) ?? []).toHaveLength(1);
+  });
+});
+
+describe('truncateReport (defect: surrogate pairs and open code fences)', () => {
+  it('never cuts a surrogate pair in half', () => {
+    // U+1F600 "😀" is encoded as the surrogate pair 0xD83D 0xDE00. Slicing at
+    // index 5 (`'AAAAA' + '😀'` -> index 5 is right between the two halves)
+    // used to yield an unpaired high surrogate, which has no valid UTF-8
+    // encoding and becomes U+FFFD wherever this text is next encoded (a
+    // process's stdin, a network body) — corrupting the character at exactly
+    // the truncation boundary.
+    const markdown = `AAAAA${'\u{1F600}'}BBBBB`; // 'A'x5, then the emoji, then 'B'x5
+    expect(markdown.length).toBe(12); // 5 + 2 (surrogate pair) + 5
+
+    const result = truncateReport(markdown, 6); // cuts inside the surrogate pair
+
+    const kept = result.split('\n\n[TRUNCATED')[0] ?? '';
+    // The old `slice(0, 6)` would produce 'AAAAA\uD83D' — an unpaired high
+    // surrogate as the last character. Neither half of the pair should survive
+    // a cut that falls between them.
+    expect(kept).toBe('AAAAA');
+
+    // The defect as it actually bites: `TextEncoder` (used wherever this
+    // prompt is next encoded — a process's stdin, a network body) replaces any
+    // lone surrogate with U+FFFD while producing valid UTF-8. Round-tripping
+    // through it is exactly the corruption the bug report describes; against
+    // the old `slice(0, maxChars)` this assertion fails.
+    const roundTripped = new TextDecoder().decode(new TextEncoder().encode(result));
+    expect(roundTripped).not.toContain('�');
+  });
+
+  it('closes a code fence left open by the cut', () => {
+    const markdown = ['before', '```ts', 'const x = 1;', 'more code here', '```', 'after'].join('\n');
+    // Cut inside the fence, after "const x = 1;" but before the closing ```.
+    const cut = markdown.indexOf('more code');
+    const result = truncateReport(markdown, cut);
+
+    const fenceCount = (result.match(/```/g) ?? []).length;
+    // An odd count means the fence is still open — everything after it,
+    // including our own truncation marker, would be parsed as code by
+    // whatever reads this prompt next. That is worse than losing a character:
+    // it changes how the *rest* of the prompt is interpreted.
+    expect(fenceCount % 2).toBe(0);
+  });
+
+  it('leaves a report untouched when it already has balanced fences and fits', () => {
+    const markdown = '```ts\nconst x = 1;\n```';
+    expect(truncateReport(markdown, 1_000)).toBe(markdown);
   });
 });
 

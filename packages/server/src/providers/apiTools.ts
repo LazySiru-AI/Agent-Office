@@ -122,12 +122,17 @@ const MAX_GREP_MATCHES = 200;
 /** Grep: cap each matched line's text so one huge line can't dominate the output. */
 const MAX_GREP_LINE_CHARS = 300;
 /**
- * Grep: wall-clock budget for the whole search. A model-supplied regex is
- * untrusted input; catastrophic backtracking on an adversarial pattern is a
- * denial-of-service vector even though it never touches the filesystem
- * sandbox. Bailing out after this many milliseconds trades a possibly
- * incomplete result for a bounded one, which is the same trade every other
- * cap in this file makes.
+ * Grep: wall-clock budget for the whole search, checked between files and
+ * between lines in {@link grepWalk}. This bounds an honest search over a lot
+ * of legitimate content — it does NOT and cannot bound a single pathological
+ * `regex.test()` call, because JS gives no way to interrupt a `RegExp` once
+ * `.test()` has started; a check on either side of a call already in progress
+ * never gets to run until that call returns on its own. Catastrophic
+ * backtracking is refused before compilation instead — see
+ * {@link hasCatastrophicBacktrackingShape} — so this budget's job is only ever
+ * "a lot of matching to do," never "one match that will not finish." That
+ * division of labour holds for every shape the gate recognises; the shapes it
+ * does not are enumerated on the gate itself.
  */
 const MAX_GREP_MS = 5_000;
 
@@ -645,6 +650,181 @@ async function handleGlob(workspaceDir: string, input: unknown): Promise<ToolRes
 }
 
 // ---------------------------------------------------------------------------
+// Grep — catastrophic-backtracking rejection
+// ---------------------------------------------------------------------------
+
+/**
+ * True if `source` contains a "nested quantifier" — a parenthesised group
+ * that is itself repeated (`+`, `*`, or an open-ended `{n,}`) and whose own
+ * content also contains an unbounded repetition, e.g. `(a+)+`, `(a*)*`,
+ * `(x+y*)+`.
+ *
+ * This is the textbook engine of catastrophic backtracking, and it is why the
+ * `MAX_GREP_MS` deadline below cannot be trusted on its own: `grepWalk` checks
+ * `Date.now() > deadline` between files and between lines, but the match
+ * itself — `regex.test(line)` — is one synchronous call a JS `RegExp` gives
+ * no way to interrupt once started. On `^(a+)+$` against `"a".repeat(40) +
+ * "!"`, that single call ran past 120 seconds in testing; the deadline check
+ * never got another turn to run because the call it would have interrupted
+ * never returned control to it. A budget that can be blown through by one
+ * call is not a budget — this function is what makes the budget real, by
+ * refusing the pattern before any `.test()` call happens at all.
+ *
+ * A repeated group is equally lethal when its alternatives OVERLAP, with no
+ * inner quantifier anywhere: `(a|a)*` against `"a".repeat(40) + "!"` wedged
+ * this process past 25 seconds, and `(a|aa)+` took 6.2 seconds — over the
+ * budget this gate exists to make real. The engine is the same in both cases
+ * (many distinct ways to divide one input among the repetitions) and only the
+ * spelling differs, so the first version of this check — which looked solely
+ * for an inner repetition — passed both straight through to `.test()`. Two
+ * alternatives can overlap only if they can begin with the same thing, so
+ * that is what {@link hasOverlappingAlternation} compares.
+ *
+ * Deliberately conservative: this is a structural scan of the pattern's
+ * *source text*, not an analysis of what it can actually match, so it will
+ * refuse some patterns that would in fact run quickly (a literal prefix that
+ * narrows the inner repetition, say). That is the right side to err on for a
+ * denial-of-service gate — a model that gets a clear "rewrite this pattern"
+ * error can retry with something else; a wedged server cannot serve anyone
+ * until it is killed.
+ *
+ * NOT a complete ReDoS detector, and the limits are worth stating rather than
+ * leaving a reader to assume the gate is total — no static check over
+ * arbitrary regex syntax can be complete, and these are the known holes:
+ *
+ * - Alternatives that overlap without sharing a first character, e.g.
+ *   `(ab|a?b)+`. The first-token comparison cannot see that.
+ * - Repetition-free polynomial blowup such as `a*a*a*b`, which has no group at
+ *   all. That is quadratic rather than exponential, so `MAX_GREP_MS` — checked
+ *   between lines — does still bound it in aggregate.
+ *
+ * The only complete fix is running the match somewhere it can be killed (a
+ * worker thread, whose termination V8 can deliver into a backtracking loop).
+ * That is a real architectural change and is recorded in PROGRESS.md rather
+ * than pretended away here.
+ */
+function hasCatastrophicBacktrackingShape(source: string): boolean {
+  const masked = maskLiteralRegions(source);
+  const groupStarts: number[] = [];
+
+  for (let i = 0; i < masked.length; i += 1) {
+    const c = masked[i];
+    if (c === '(') {
+      groupStarts.push(i);
+      continue;
+    }
+    if (c !== ')') continue;
+    const start = groupStarts.pop();
+    if (start === undefined) continue; // unbalanced — RegExp compilation already rejects this
+    if (!isQuantifiedAt(masked, i + 1)) continue;
+    if (
+      containsUnboundedQuantifier(masked, start + 1, i) ||
+      hasOverlappingAlternation(masked, start + 1, i)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Do the top-level alternatives of `masked[from, to)` overlap — can two of them
+ * begin with the same thing?
+ *
+ * Compares first characters of the masked source, which is exactly the right
+ * granularity here: `maskLiteralRegions` has already collapsed every escape and
+ * character class to `x`, so `\d|\w` compares equal (and they do overlap), while
+ * `foo|bar` compares `f` against `b` and is correctly allowed through — a
+ * repeated group of genuinely disjoint alternatives is a normal, fast pattern
+ * and refusing it would make this gate a nuisance rather than a guard.
+ *
+ * An empty alternative counts as overlapping too. It makes the group able to
+ * match nothing at every position, which is the same "many ways to divide the
+ * input" problem wearing a different hat.
+ *
+ * Only DEPTH-ZERO `|` separates alternatives of this group; a `|` inside a
+ * nested group belongs to that group, which the caller's own loop reaches
+ * separately on its way out.
+ */
+function hasOverlappingAlternation(masked: string, from: number, to: number): boolean {
+  const firsts: string[] = [];
+  let depth = 0;
+  let branchStart = from;
+
+  const noteBranch = (end: number): void => {
+    const branch = masked.slice(branchStart, end);
+    firsts.push(branch.length === 0 ? '' : branch[0] ?? '');
+  };
+
+  for (let i = from; i < to; i += 1) {
+    const c = masked[i];
+    if (c === '(') depth += 1;
+    else if (c === ')') depth -= 1;
+    else if (c === '|' && depth === 0) {
+      noteBranch(i);
+      branchStart = i + 1;
+    }
+  }
+  noteBranch(to);
+
+  if (firsts.length < 2) return false;
+  return new Set(firsts).size < firsts.length;
+}
+
+/**
+ * Replace escaped pairs (`\+`, `\(`, …) and the bodies of character classes
+ * (`[+*()]`, where every one of those is a literal) with neutral `x`
+ * characters, length-preserving, so the structural scan above cannot mistake
+ * a literal metacharacter for real regex structure.
+ */
+function maskLiteralRegions(source: string): string {
+  let out = '';
+  let i = 0;
+  while (i < source.length) {
+    const c = source[i];
+    if (c === '\\' && i + 1 < source.length) {
+      out += 'xx';
+      i += 2;
+      continue;
+    }
+    if (c === '[') {
+      let j = i + 1;
+      if (source[j] === '^') j += 1;
+      if (source[j] === ']') j += 1; // a leading ] inside a class is literal
+      while (j < source.length && source[j] !== ']') {
+        j += source[j] === '\\' ? 2 : 1;
+      }
+      const end = j < source.length ? j + 1 : j;
+      out += 'x'.repeat(end - i);
+      i = end;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** Does an unbounded quantifier (`+`, `*`, or a comma-bearing `{m,}` / `{m,n}`) start at `masked[index]`? */
+function isQuantifiedAt(masked: string, index: number): boolean {
+  const c = masked[index];
+  if (c === '+' || c === '*') return true;
+  if (c === '{') {
+    const end = masked.indexOf('}', index);
+    return end !== -1 && masked.slice(index + 1, end).includes(',');
+  }
+  return false;
+}
+
+/** Does `masked[from, to)` contain an unbounded quantifier anywhere? */
+function containsUnboundedQuantifier(masked: string, from: number, to: number): boolean {
+  for (let i = from; i < to; i += 1) {
+    if (isQuantifiedAt(masked, i)) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Grep
 // ---------------------------------------------------------------------------
 
@@ -660,6 +840,21 @@ async function handleGrep(workspaceDir: string, input: unknown): Promise<ToolRes
     return {
       isError: true,
       content: `Grep: "${pattern}" is not a valid regular expression: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  // Reject before a single `.test()` call happens — see
+  // {@link hasCatastrophicBacktrackingShape} for why the deadline below cannot
+  // do this job on its own.
+  if (hasCatastrophicBacktrackingShape(pattern)) {
+    return {
+      isError: true,
+      content:
+        `Grep: "${pattern}" is refused: it repeats a group that can match one input many ` +
+        `different ways — either a repetition inside a repetition (e.g. "(a+)+") or ` +
+        `alternatives that can start the same way (e.g. "(a|aa)+"). Both can take ` +
+        'exponential time on some inputs. Rewrite it so the repeated group has one ' +
+        'unambiguous way to match, or search for a literal substring instead.',
     };
   }
 
@@ -989,6 +1184,30 @@ const TOOL_DEFS: readonly ToolDefinition[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Error-reporting helpers (kept path-blind: see the `execute()` catch-all)
+// ---------------------------------------------------------------------------
+
+/** `error.code` for Node's errno exceptions, without an `any` cast. */
+function errorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === 'string' ? code : undefined;
+}
+
+/**
+ * Best-effort extraction of the caller-supplied `path` from a tool call's raw
+ * input, for the `execute()` catch-all to name in its error message. Reads
+ * whatever the model sent — unvalidated, unresolved — which is exactly why it
+ * is safe to echo: it never became an absolute filesystem path in the first
+ * place.
+ */
+function inputPath(input: unknown): string | undefined {
+  if (typeof input !== 'object' || input === null || !('path' in input)) return undefined;
+  const value = (input as { path?: unknown }).path;
+  return typeof value === 'string' ? value : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -1016,8 +1235,21 @@ export function createSandboxedTools(
 
   return {
     schemas(requested: readonly string[]): ToolSchema[] {
+      // `requested` alone used to decide what got advertised, which meant the
+      // constructor's `allowedTools` only ever constrained execute() — the two
+      // call sites in this repo happen to pass the same list to both, so
+      // nothing here ever surfaced, but that was luck, not enforcement. FR-M5
+      // says the agent's tools frontmatter is a permission boundary; a model
+      // told about a tool it is not permitted to run will still try it, then
+      // burn a round trip on the "not available" refusal from execute(). What
+      // is advertised must be a subset of what is permitted, not merely equal
+      // to it by convention.
       const wanted = new Set(requested.map((name) => name.toLowerCase()));
-      return TOOL_DEFS.filter((def) => wanted.has(def.name.toLowerCase())).map((def) => ({
+      return TOOL_DEFS.filter(
+        (def) =>
+          wanted.has(def.name.toLowerCase()) &&
+          (permitted === undefined || permitted.has(def.name.toLowerCase())),
+      ).map((def) => ({
         name: def.name,
         description: def.description,
         inputSchema: def.inputSchema,
@@ -1055,12 +1287,27 @@ export function createSandboxedTools(
       } catch (error) {
         // Belt and braces: the contract promises execute() never throws. Every
         // handler above already catches what it expects to go wrong; this is
-        // the net under that net for anything unanticipated. Safe to surface
-        // the raw message because every fs call above only ever targets a
-        // path already confirmed to be inside the workspace.
+        // the net under that net for anything unanticipated.
+        //
+        // This used to surface `error.message` raw, on the theory that every
+        // fs call above only ever targets a path already confirmed to be
+        // inside the workspace, so there was nothing to hide. That is true of
+        // the check, not the message: an fs error names the path it actually
+        // tried, which is the *resolved absolute* one —
+        // `ENOENT: ... open 'C:\Users\<name>\...\workspace\<path>'` — not the
+        // caller-supplied relative path. And unlike the sibling leak fixed in
+        // `server.ts`'s `loadRun` (an HTTP 404 body read by whoever is poking
+        // the API), this string is a TOOL RESULT: it goes straight back into
+        // the model's context and, for the raw-API providers, over the
+        // network to the model vendor. Report the caller-supplied relative
+        // path and the error's `code`, never what the path resolved to.
+        const rawPath = inputPath(input);
+        const code = errorCode(error);
+        const where = rawPath === undefined ? '' : ` for "${rawPath}"`;
+        const suffix = code === undefined ? '' : ` (${code})`;
         return {
           isError: true,
-          content: `"${name}" failed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+          content: `"${name}" failed unexpectedly${where}${suffix}.`,
         };
       }
     },

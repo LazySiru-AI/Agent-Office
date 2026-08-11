@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import type { AgentEvent } from '@agent-office/shared';
 import { ProviderUnavailableError } from '../types.js';
 import { spawnClaude } from './childProcess.js';
-import { ClaudeCodeProvider, buildArgs } from './provider.js';
+import { ClaudeCodeProvider, buildArgs, describeModelOverride } from './provider.js';
 import { resolveClaudeCodeTools } from './tools.js';
 
 /**
@@ -190,6 +190,57 @@ describe('ClaudeCodeProvider — degradation and cancellation', () => {
   });
 });
 
+describe('run() — reporting a run-wide model override (defect 4)', () => {
+  function providerWithModel(model: string, spawn: typeof spawnClaude): ClaudeCodeProvider {
+    return new ClaudeCodeProvider({
+      model,
+      deps: {
+        spawn,
+        checkAvailability: async () => ({ ok: true }),
+        resolveBinary: async () => ({ path: process.execPath }),
+      },
+    });
+  }
+
+  it('yields exactly one non-fatal error event when a run-wide model overrides the agent\'s catalog model, and the run still completes normally', async () => {
+    const provider = providerWithModel('claude-opus-5', replaySpawn(fixture('synthetic-success.jsonl')));
+    const events = await collect(provider, makeRequest({ model: 'sonnet' }));
+
+    const warnings = events.filter((e) => e.t === 'error' && !e.fatal);
+    expect(warnings).toHaveLength(1);
+    const message = warnings[0]?.t === 'error' ? warnings[0].message : '';
+    expect(message).toContain('sonnet');
+    expect(message).toContain('claude-opus-5');
+
+    expect(events.some((e) => e.t === 'text')).toBe(true);
+    expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+  });
+
+  it('reports nothing when the agent catalog model is "inherit", which is not a substitution', async () => {
+    const provider = providerWithModel('claude-opus-5', replaySpawn(fixture('synthetic-success.jsonl')));
+    const events = await collect(provider, makeRequest({ model: 'inherit' }));
+    expect(events.some((e) => e.t === 'error' && !e.fatal)).toBe(false);
+  });
+
+  it('reports nothing when no run-wide model was set, even though the agent has its own catalog model', async () => {
+    const events = await collect(
+      providerWith(replaySpawn(fixture('synthetic-success.jsonl'))),
+      makeRequest({ model: 'sonnet' }),
+    );
+    expect(events.some((e) => e.t === 'error' && !e.fatal)).toBe(false);
+  });
+});
+
+describe('describeModelOverride', () => {
+  it('reports a substitution only when both a run-wide model and a non-inherit agent model are present', () => {
+    expect(describeModelOverride({ model: 'claude-opus-5' }, 'sonnet')).toContain('sonnet');
+    expect(describeModelOverride({ model: 'claude-opus-5' }, 'sonnet')).toContain('claude-opus-5');
+    expect(describeModelOverride({ model: 'claude-opus-5' }, 'inherit')).toBeUndefined();
+    expect(describeModelOverride({ model: 'claude-opus-5' }, undefined)).toBeUndefined();
+    expect(describeModelOverride({}, 'sonnet')).toBeUndefined();
+  });
+});
+
 describe('buildArgs', () => {
   const tools = resolveClaudeCodeTools(['Read', 'Write'], { platform: 'win32' });
 
@@ -232,6 +283,26 @@ describe('buildArgs', () => {
     expect(buildArgs({ systemPromptPath: 'sp.md', tools, options: { model: 'sonnet' } })).toContain(
       '--model',
     );
+  });
+
+  it('a catalog model reaches --model when there is no run-wide override', () => {
+    const args = buildArgs({ systemPromptPath: 'sp.md', tools, options: {}, requestModel: 'sonnet' });
+    expect(args[args.indexOf('--model') + 1]).toBe('sonnet');
+  });
+
+  it('the catalog\'s "inherit" never reaches --model either, even with no run-wide override at all', () => {
+    const args = buildArgs({ systemPromptPath: 'sp.md', tools, options: {}, requestModel: 'inherit' });
+    expect(args).not.toContain('--model');
+  });
+
+  it('a run-wide model wins over the agent\'s own catalog model when both are set', () => {
+    const args = buildArgs({
+      systemPromptPath: 'sp.md',
+      tools,
+      options: { model: 'opus' },
+      requestModel: 'sonnet',
+    });
+    expect(args[args.indexOf('--model') + 1]).toBe('opus');
   });
 
   it('passes the spend cap when set (FR-M8)', () => {

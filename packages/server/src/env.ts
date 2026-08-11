@@ -78,7 +78,17 @@ function applyManually(file: string): void {
     const eq = line.indexOf('=');
     if (eq <= 0) continue;
 
-    const key = line.slice(0, eq).trim();
+    // `export KEY=value` is common in `.env` files copied from a shell
+    // profile, and `process.loadEnvFile` (the primary path above, live on
+    // Node 20.12+) handles it correctly. This fallback only runs on Node
+    // versions between the package's declared minimum (20.0.0) and 20.12, so
+    // without stripping `export ` here the fallback silently diverges from
+    // the primary path: it would set a variable literally named
+    // `export ANTHROPIC_API_KEY` instead of `ANTHROPIC_API_KEY`, and the key
+    // the user can plainly see in the file reads as "not set".
+    const rawKey = line.slice(0, eq).trim();
+    const key = rawKey.replace(/^export\s+/, '');
+    if (key === '') continue;
     let value = line.slice(eq + 1).trim();
 
     // Quotes are stripped only as a matched pair, so a value that genuinely

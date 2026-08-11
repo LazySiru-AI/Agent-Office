@@ -187,4 +187,42 @@ describe('readSse — cancellation and limits', () => {
       }
     }).rejects.toThrow(/exceeded/);
   });
+
+  it('trips the byte cap on real byte count for a multi-byte stream, not on the decoded string length', async () => {
+    // The defect this reproduces: comparing a *decoded string's* `.length`
+    // against a byte figure silently swaps units. `.length` counts UTF-16
+    // code units, and a 3-byte-per-character CJK stream has three real bytes
+    // for every one of those units, so a cap that reads `.length` lets
+    // roughly 3x the advertised 32 MiB accumulate before firing (up to 2x
+    // for emoji, which are 4 bytes but 2 code units).
+    //
+    // Chosen so the two measurements disagree about whether the cap should
+    // have tripped yet: `charCount` code units alone sits comfortably under
+    // 32 MiB, so a `.length`-based cap would NOT fire here — but the same
+    // characters are `charCount * 3` real UTF-8 bytes, which DOES exceed it.
+    // Sent as a single unterminated chunk, matching the reviewer's
+    // reproduction: no blank line anywhere, so the only way this stream
+    // stops growing the buffer is the cap itself.
+    const CJK_CHAR = '中'; // U+4E2D, "middle" — 3 bytes in UTF-8, 1 UTF-16 code unit.
+    expect(new TextEncoder().encode(CJK_CHAR).length).toBe(3);
+
+    const MAX_EVENT_BYTES = 32 * 1024 * 1024;
+    const charCount = 15_000_000;
+    expect(charCount).toBeLessThan(MAX_EVENT_BYTES); // a code-unit-based cap would not have fired yet
+    expect(charCount * 3).toBeGreaterThan(MAX_EVENT_BYTES); // the real byte count already has
+
+    const bytes = new TextEncoder().encode(CJK_CHAR.repeat(charCount));
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+
+    await expect(async () => {
+      for await (const _event of readSse(stream)) {
+        // No blank line anywhere in the payload — the cap must fire first.
+      }
+    }).rejects.toThrow(/exceeded/);
+  });
 });

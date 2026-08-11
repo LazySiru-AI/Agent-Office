@@ -17,14 +17,46 @@ const Id = z
   .max(64)
   .regex(idPattern, 'ids must be lowercase kebab-case');
 
+/**
+ * A deliverable is a markdown file directly inside `reports/`, and nothing else.
+ *
+ * This used to be `z.string().min(1)`, with the `reports/NN-agent.md` shape
+ * living only in the prompt that asks the Manager for a plan — which is to say,
+ * as a request rather than a rule. The dispatcher hands the value to
+ * `store.writeReport`, and the store's own check is "does this stay inside the
+ * run directory", which the run's own state file satisfies: a plan naming
+ * `run.json` as a deliverable overwrote it with markdown, and one naming
+ * `logs/<id>.jsonl` would destroy that assignment's replay log. Both were
+ * demonstrated, not theorised.
+ *
+ * The plan is a language model's output, so it is untrusted input in the
+ * ordinary sense, and the fix belongs here at the boundary where it enters
+ * rather than at each place it is later used. FR-M2 already repairs and retries
+ * an invalid plan, so a Manager that ignores the instruction now gets corrected
+ * instead of obeyed.
+ *
+ * Deliberately narrow — one directory deep, no nesting, `.md` only. Nothing has
+ * ever needed more, a report that is not markdown would break the synthesis and
+ * the PDF alike, and every character allowed here is a character that has to be
+ * safe on Windows, in a URL query, and inside a markdown link.
+ */
+const DeliverablePath = z
+  .string()
+  .min(1)
+  .max(200)
+  .regex(
+    /^reports\/[a-z0-9][a-z0-9._-]*\.md$/i,
+    'deliverable must be a markdown file directly inside reports/, e.g. "reports/03-security-auditor.md"',
+  );
+
 export const AssignmentSpecSchema = z.object({
   id: Id,
   /** Must resolve against the registry — enforced by validatePlanAgainstRegistry. */
   agentName: z.string().min(1),
   /** What this specific agent must produce. Not the overall task. */
   objective: z.string().min(1),
-  /** Expected report path, e.g. `reports/03-security-auditor.md`. */
-  deliverable: z.string().min(1),
+  /** Where this agent's report is written. See {@link DeliverablePath}. */
+  deliverable: DeliverablePath,
   /** Assignment ids this one consumes the reports of. Earlier phases only. */
   dependsOn: z.array(Id).default([]),
 });

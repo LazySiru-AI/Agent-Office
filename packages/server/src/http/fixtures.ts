@@ -129,6 +129,40 @@ export function testProviderFactory(
 }
 
 /**
+ * Vitest budget for any test that drives a whole run end to end.
+ *
+ * Lives here, beside the helpers those tests wait on, because it used to live
+ * in two test files as a private constant while the helpers carried their own
+ * separate, tighter defaults — and the two drifted in exactly the way that
+ * arrangement invites. Three tests were given an explicit 20s budget in Phase 7
+ * to stop them failing under load; they went on failing, because
+ * {@link waitForTerminal} gave up at its own hardcoded 10s first and no call
+ * site passed anything else. The raised budget changed the error message and
+ * nothing else. One constant, one place, so that cannot happen again.
+ *
+ * 45s is set from measurement rather than taste: across five full-suite runs
+ * the slowest end-to-end test was observed at 20.2s, and it is the aggregate
+ * load of ~1,000 other tests contending for the same disk that puts it there,
+ * not any single slow operation. Roughly 2x the worst observation leaves room
+ * for a machine busier than the one this was measured on, while still failing
+ * a genuine hang in under a minute.
+ */
+export const SLOW_RUN_TIMEOUT_MS = 45_000;
+
+/**
+ * How long the pollers below wait before giving up.
+ *
+ * Deliberately BELOW {@link SLOW_RUN_TIMEOUT_MS}, and that ordering is the
+ * point rather than an accident: whichever deadline fires first is the one that
+ * writes the failure message, and "did not finish within 40000ms (status:
+ * designing)" tells you where a run got stuck, whereas vitest's own timeout
+ * tells you only that something took too long. The helper should always win
+ * that race — but it must not win it so early that a merely-loaded machine
+ * looks like a hang, which is what the old 10s did.
+ */
+export const RUN_POLL_TIMEOUT_MS = 40_000;
+
+/**
  * Poll until the run reaches a terminal status.
  *
  * Polling rather than a subscription because the point of most of these tests is
@@ -138,7 +172,7 @@ export function testProviderFactory(
 export async function waitForTerminal(
   supervisor: RunSupervisor,
   runId: string,
-  timeoutMs = 10_000,
+  timeoutMs = RUN_POLL_TIMEOUT_MS,
 ): Promise<RunState> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -160,7 +194,7 @@ export async function waitForTerminal(
 export async function waitFor(
   predicate: () => boolean | Promise<boolean>,
   what: string,
-  timeoutMs = 10_000,
+  timeoutMs = RUN_POLL_TIMEOUT_MS,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!(await predicate())) {

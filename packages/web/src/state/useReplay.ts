@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  canTransitionAssignment,
   isAssignmentTerminal,
   EMPTY_USAGE,
   type AssignmentState,
@@ -65,6 +66,29 @@ import { fetchRun, fetchRunEvents } from '../api.js';
  * makes "seek backwards" trivially correct: it is not a special code path,
  * it is the same pure function called with a smaller `atTs`. See
  * `useReplay.test.ts`'s "seeking backwards" test.
+ *
+ * **Duplicate log lines: exact-entry dedupe, and the trade-off it accepts.**
+ * A `.jsonl` line can appear twice — a crash mid-append that gets retried on
+ * restart, or a provider that re-emits an identical `usage` payload. Folding
+ * it twice silently doubles that entry's contribution, which for a `usage`
+ * event means a doubled token count feeding straight into NFR-5's cost
+ * figure. Nothing in `events.ts` carries an idempotency key, so there is no
+ * principled way to say "this is a re-send of that" — the only signal
+ * available is that the two log lines are identical. `foldEvents` therefore
+ * treats two `{ts, event}` entries as "the same line" when they are
+ * field-for-field identical, and applies only the first occurrence. This is
+ * deliberately whole-entry equality, not a looser key like "same assignment
+ * + same ts": a looser key would also collapse two *different* events that
+ * merely happen to land in the same millisecond, which is not a duplicate at
+ * all and would be a worse bug than the one being fixed. The trade-off this
+ * does accept: two genuinely separate emissions that happen to be
+ * byte-identical (same assignment, same millisecond, same token counts — not
+ * impossible for a provider that reports usage in fixed-size chunks) are
+ * indistinguishable from a duplicated line and get collapsed to one,
+ * silently *under*-counting by exactly that entry. `useReplay.test.ts` pins
+ * both sides of this: the duplicate case (must not double-count) and the
+ * collision case (documents that a legitimate byte-identical repeat is, in
+ * fact, collapsed too).
  *
  * ## Static vs derived-from-events fields
  *
@@ -161,6 +185,28 @@ function applyEvent(
   const { ts, event } = logged;
   switch (event.t) {
     case 'status': {
+      if (!canTransitionAssignment(assignment.status, event.status)) {
+        // The live orchestrator only ever emits edges `canTransitionAssignment`
+        // allows (shared/src/status.ts owns that table precisely so the sim
+        // never has to invent a behaviour for a state it can't reach). An
+        // event claiming an edge outside that table — e.g. `done -> working`,
+        // which is not the FR-M10 `done -> briefing` revision — did not
+        // happen on a real run; it is a corrupted or hand-edited log entry.
+        // Per the fold's "never throws" contract (see the unknown-assignment
+        // branch in `foldEvents`), this degrades rather than crashes replay:
+        // the illegal entry is dropped and the assignment holds its last
+        // known-good status. The alternative — apply it anyway but clear
+        // `startedAt`/`endedAt` to match — was rejected because it fabricates
+        // a state with even less basis in reality than simply not moving:
+        // there is no way to know what a corrupted entry's "real" status
+        // would have been, only that this one isn't it. Dropping it also
+        // closes the specific bug this guards against: `endedAt` is set once
+        // on the first terminal status and (by design) never cleared, so
+        // applying an illegal regression away from a terminal status used to
+        // leave a non-terminal `status` sitting next to a stale `endedAt` — a
+        // combination the live system can never produce.
+        break;
+      }
       if (assignment.startedAt === undefined && event.status !== 'pending') {
         assignment.startedAt = ts;
       }
@@ -228,9 +274,16 @@ export function foldEvents(base: RunState, events: readonly LoggedAgentEvent[], 
   const result = resetAssignmentsForReplay(base);
   const byId = new Map(result.assignments.map((a) => [a.id, a]));
   const lastFatalErrorByAssignment = new Map<string, string>();
+  // Exact-entry idempotency guard — see the file header's "Duplicate log
+  // lines" note for why this is whole-entry equality rather than a looser,
+  // value-based key, and what that trade-off gets wrong.
+  const seenEntries = new Set<string>();
 
   for (const logged of sortEventsForReplay(events)) {
     if (logged.ts > atTs) break; // ascending sort: nothing after this can qualify either
+    const dedupeKey = JSON.stringify(logged);
+    if (seenEntries.has(dedupeKey)) continue; // a byte-identical line already applied — see file header
+    seenEntries.add(dedupeKey);
     const assignment = byId.get(logged.event.assignmentId);
     if (assignment === undefined) continue; // unknown assignment id: ignored, not thrown
     applyEvent(assignment, logged, lastFatalErrorByAssignment);

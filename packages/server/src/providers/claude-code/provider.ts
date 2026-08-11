@@ -19,17 +19,18 @@ import { resolveClaudeCodeTools, toArgvToken } from './tools.js';
 
 export interface ClaudeCodeProviderOptions {
   /**
-   * Passed to `--model`. Omitted entirely when unset.
+   * Passed to `--model`, overriding the agent's own catalog `model:`.
    *
-   * Deliberately provider-level rather than per-assignment: `AgentRunRequest`
-   * carries no model, so the catalog's per-agent `model:` frontmatter cannot
-   * reach here today. That is a real gap for NFR-5 — the cost display already
-   * joins agent → model client-side — and it is recorded in PROGRESS.md rather
-   * than papered over with a lookup the seam does not support.
+   * Run-wide, and deliberately the stronger of the two: this is set by someone
+   * passing `--model` or choosing one in the settings panel, which is a direct
+   * instruction about this run, whereas `AgentRunRequest.model` is the catalog's
+   * standing default for that agent. Unset — the usual case — lets each agent's
+   * frontmatter through.
    *
    * Never pass the catalog's `inherit` value: it is a catalog convention, not a
    * model alias. The CLI accepts the flag but the API is what ultimately
-   * resolves the name, and 25 agents use it.
+   * resolves the name, and 25 agents use it. `buildArgs` filters it from both
+   * sources rather than trusting the caller.
    */
   model?: string;
 
@@ -151,10 +152,29 @@ export class ClaudeCodeProvider implements AgentProvider {
     try {
       await writeFile(systemPromptPath, request.systemPrompt, 'utf8');
 
+      // Same fact the Anthropic and OpenAI adapters already report as a
+      // non-fatal `error` event (see `apiConfig.ts`'s `resolveAgentModel`):
+      // which model an agent actually ran on changes both its cost and its
+      // output, so a run-wide override silently beating the agent's own
+      // catalog `model:` must not be visible on two engines and invisible on
+      // the third. `buildArgs` stays pure and returns only argv (its own
+      // doc comment is explicit about that), so the substitution is decided
+      // here, by the caller, before `buildArgs` is asked to act on it.
+      const modelOverrideMessage = describeModelOverride(this.options, request.model);
+      if (modelOverrideMessage !== undefined) {
+        yield {
+          assignmentId: request.assignmentId,
+          t: 'error',
+          fatal: false,
+          message: modelOverrideMessage,
+        };
+      }
+
       const args = buildArgs({
         systemPromptPath,
         tools,
         options: this.options,
+        ...(request.model === undefined ? {} : { requestModel: request.model }),
       });
 
       const spawnProcess = this.options.deps?.spawn ?? spawnClaude;
@@ -291,6 +311,39 @@ interface BuildArgsInput {
   systemPromptPath: string;
   tools: ReturnType<typeof resolveClaudeCodeTools>;
   options: ClaudeCodeProviderOptions;
+  /**
+   * `AgentRunRequest.model` — the catalog's per-agent frontmatter.
+   *
+   * This adapter is the one engine that can take the catalog's vocabulary
+   * unchanged: `sonnet` and `haiku` are the CLI's own aliases. `inherit` is not,
+   * and is dropped rather than forwarded.
+   */
+  requestModel?: string;
+}
+
+/**
+ * Whether a run-wide `--model` will silently beat this agent's own catalog
+ * `model:`, and if so, the sentence to report it with.
+ *
+ * Split out of `buildArgs` rather than folded into it because `buildArgs` is
+ * a pure function returning argv (see its own doc comment) and reporting a
+ * substitution means yielding an `AgentEvent`, which only `run` can do.
+ * Mirrors `buildArgs`'s own precedence exactly, so the two never disagree
+ * about when a substitution actually happened: an explicit run-wide model
+ * always wins, and `inherit` is not a substitution because the agent asked
+ * for nothing in particular.
+ */
+export function describeModelOverride(
+  options: ClaudeCodeProviderOptions,
+  requestModel: string | undefined,
+): string | undefined {
+  if (options.model === undefined) return undefined;
+  if (requestModel === undefined || requestModel === 'inherit') return undefined;
+
+  return (
+    `this agent's catalog model "${requestModel}" was not used: ` +
+    `the run explicitly specifies "${options.model}", which takes precedence.`
+  );
 }
 
 /**
@@ -334,8 +387,16 @@ export function buildArgs(input: BuildArgsInput): string[] {
     args.push('--allowedTools', token);
   }
 
-  if (options.model !== undefined && options.model !== 'inherit') {
-    args.push('--model', options.model);
+  // An explicit provider-level model wins over the catalog's frontmatter: the
+  // first is an instruction about this run, the second is the agent's standing
+  // default. `inherit` is filtered from both — it is a catalog convention
+  // meaning "whatever the run is using", and 25 agents declare it, so forwarding
+  // it would send a non-model to `--model` on a sixth of every run.
+  const model = [options.model, input.requestModel].find(
+    (candidate) => candidate !== undefined && candidate !== 'inherit',
+  );
+  if (model !== undefined) {
+    args.push('--model', model);
   }
 
   if (options.maxCostUsd !== undefined) {

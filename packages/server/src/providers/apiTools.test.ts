@@ -105,6 +105,19 @@ describe('schemas', () => {
     expect(result.some((s) => s.name === 'Edit')).toBe(false);
   });
 
+  it('intersects with the constructor allowlist, so schemas() cannot advertise more than execute() will run', () => {
+    // Previously `schemas(requested)` filtered only by its own argument and
+    // never consulted `permitted` (the constructor's `allowedTools`). Both call
+    // sites in this repo happen to pass the same list to both, so the gap
+    // never showed up in practice — but advertising and executing are meant to
+    // be separate decisions (see the constructor's own doc comment), and this
+    // left half of that unenforced: nothing stopped a caller from asking
+    // schemas() for more than the agent was permitted to run.
+    const tools = createSandboxedTools(root, ['Read']);
+    const result = tools.schemas(['Read', 'Write']);
+    expect(result.map((s) => s.name)).toEqual(['Read']);
+  });
+
   it('describes every implemented tool with a JSON Schema object', () => {
     const tools = createSandboxedTools(root);
     const all = tools.schemas(['Read', 'Write', 'Edit', 'Glob', 'Grep', 'LS']);
@@ -447,6 +460,88 @@ describe('Grep', () => {
     expect(result.content).toMatch(/showing first 200 matches/i);
   });
 
+  it('refuses a catastrophic-backtracking pattern instead of hanging the process', async () => {
+    // The exact reproduction from the field report: a workspace file
+    // containing "a".repeat(40) + "!" and Grep({ pattern: "^(a+)+$" }). Under
+    // the old code — a `MAX_GREP_MS` deadline checked only between files and
+    // between lines — this call ran past 120 seconds before it had to be
+    // killed, because the deadline check never got a turn to run: the single
+    // synchronous `regex.test(line)` call it was supposed to interrupt cannot
+    // be interrupted by anything in plain JS. This server is one Node process
+    // serving every run and every websocket client, so that was not a slow
+    // tool call, it was the whole application wedged.
+    //
+    // The fix rejects the pattern's nested-quantifier shape before a single
+    // `.test()` call happens (see `hasCatastrophicNestedQuantifier` in
+    // apiTools.ts), so this must return in well under the 5-second
+    // MAX_GREP_MS budget — the test's own timeout below is generous
+    // precisely so that if this fix ever regressed back to "wait for the
+    // deadline check," the test would hang and fail loudly rather than pass
+    // by accident.
+    const dir = newWorkspace();
+    await fsp.writeFile(path.join(dir, 'evil.txt'), `${'a'.repeat(40)}!`);
+    const tools = createSandboxedTools(dir);
+
+    const start = Date.now();
+    const result = await tools.execute('Grep', { pattern: '^(a+)+$' });
+    const elapsedMs = Date.now() - start;
+
+    expect(elapsedMs).toBeLessThan(4_000);
+    expect(result.isError).toBe(true);
+    expect(result.content).toMatch(/nested|adjacent|repetition|backtrack/i);
+  }, 10_000);
+
+  it('refuses a repeated group whose alternatives can start the same way', async () => {
+    // The first version of this gate looked only for a repetition INSIDE a
+    // repetition, and both patterns below slipped straight through it — proven
+    // by running them against the real tool: `(a|a)*` wedged the process past
+    // 25 seconds and had to be killed from outside, and `(a|aa)+` took 6.2
+    // seconds, over the very budget the gate exists to make real.
+    //
+    // The lesson is worth keeping next to the test: `(a+)+` and `(a|a)*` are
+    // the same defect wearing different spellings — many distinct ways to
+    // divide one input among the repetitions — and a check written against one
+    // spelling covers neither. Neither pattern has a quantifier inside the
+    // group at all.
+    const dir = newWorkspace();
+    await fsp.writeFile(path.join(dir, 'evil.txt'), `${'a'.repeat(40)}!`);
+    const tools = createSandboxedTools(dir);
+
+    for (const pattern of ['^(a|a)*$', '^(a|aa)+$']) {
+      const start = Date.now();
+      const result = await tools.execute('Grep', { pattern });
+      expect(Date.now() - start).toBeLessThan(4_000);
+      expect(result.isError).toBe(true);
+      expect(result.content).toMatch(/alternatives|repetition|many different ways/i);
+    }
+  }, 15_000);
+
+  it('still runs a repeated group whose alternatives are genuinely distinct', async () => {
+    // The counterweight to the test above. `(foo|bar)+` cannot blow up — no
+    // input can be divided between those alternatives more than one way — and
+    // refusing it would make this gate a nuisance an agent has to work around
+    // rather than a guard it rarely notices.
+    const dir = newWorkspace();
+    await fsp.writeFile(path.join(dir, 'ok.txt'), 'foobarfoo');
+    const tools = createSandboxedTools(dir);
+
+    const result = await tools.execute('Grep', { pattern: '(foo|bar)+' });
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe('ok.txt:1: foobarfoo');
+  });
+
+  it('still runs a benign grouped-and-repeated pattern that is not nested', async () => {
+    // Pins that the rejection is specific to nested/adjacent unbounded
+    // repetition, not "any pattern with a group and a +/*".
+    const dir = newWorkspace();
+    await fsp.writeFile(path.join(dir, 'ok.txt'), 'foofoofoo bar');
+    const tools = createSandboxedTools(dir);
+
+    const result = await tools.execute('Grep', { pattern: '(foo)+' });
+    expect(result.isError).toBe(false);
+    expect(result.content).toBe('ok.txt:1: foofoofoo bar');
+  });
+
   it('skips binary files rather than returning garbage matches', async () => {
     const dir = newWorkspace();
     await fsp.writeFile(path.join(dir, 'data.bin'), Buffer.from([0x00, 0x41, 0x00, 0x42]));
@@ -731,6 +826,31 @@ describe('sandbox escapes', () => {
     // would hand back real directory names the model has no business seeing.
     expect(result.content).not.toContain(path.resolve(dir));
     expect(result.content).not.toContain(os.tmpdir());
+  });
+
+  it('does not leak the resolved absolute path when an unexpected fs failure reaches the execute() catch-all', async () => {
+    // A path this long clears every containment check above (it is a plain
+    // relative filename, no traversal, no symlink) but blows Windows' MAX_PATH
+    // once resolved, so `fsp.writeFile` itself throws ENOENT naming the
+    // resolved absolute path. `execute()`'s catch-all used to forward
+    // `error.message` verbatim — and unlike a rejected-target message, this one
+    // is a genuine TOOL RESULT handed back to the model (and, for the raw-API
+    // providers, sent over the network to the model vendor), so the leak here
+    // is worse than the one in `server.ts`'s `loadRun`, not merely a duplicate
+    // of it.
+    const dir = newWorkspace();
+    const tools = createSandboxedTools(dir);
+    const longName = `${'a'.repeat(300)}.txt`;
+
+    const result = await tools.execute('Write', { path: longName, content: 'pwned?' });
+
+    expect(result.isError).toBe(true);
+    expect(result.content).not.toContain(path.resolve(dir));
+    expect(result.content).not.toContain(os.tmpdir());
+    // The relative path the caller actually sent, and the error code, are fine
+    // to report — the model already knows what it typed.
+    expect(result.content).toContain(longName);
+    expect(result.content).toMatch(/ENOENT/);
   });
 });
 

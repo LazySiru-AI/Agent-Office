@@ -440,13 +440,17 @@ function artifactPathFor(name: string, input: Record<string, unknown> | undefine
 }
 
 function eventsForResult(frame: ResultFrame, assignmentId: string): AgentEvent[] {
+  // Denials are reported on success and on failure alike, and are gathered
+  // before the `is_error` branch for exactly that reason.
+  const events: AgentEvent[] = eventsForPermissionDenials(frame, assignmentId);
+
   if (frame.is_error !== true) {
     // A successful result frame's `usage`/`total_cost_usd` are cumulative
     // totals for the whole session, not an increment. Every assistant frame
     // along the way already emitted its own incremental usage event; turning
     // the total into a second event here would double it against whatever
-    // sums the stream for NFR-5, so this deliberately produces nothing.
-    return [];
+    // sums the stream for NFR-5, so this deliberately produces no usage event.
+    return events;
   }
 
   // `is_error` is the authority, not `subtype` — protocol.ts documents a real
@@ -454,5 +458,59 @@ function eventsForResult(frame: ResultFrame, assignmentId: string): AgentEvent[]
   // simultaneously, because `subtype` describes how the CLI terminated, not
   // whether the run succeeded.
   const message = frame.result ?? frame.terminal_reason ?? 'the Claude Code CLI reported a failure with no message';
-  return [{ t: 'error', assignmentId, message, fatal: true }];
+  events.push({ t: 'error', assignmentId, message, fatal: true });
+  return events;
+}
+
+/**
+ * Surface the result frame's `permission_denials` as non-fatal error events.
+ *
+ * These were parsed and then dropped, which made a denial invisible: an agent
+ * that asked for `Bash`, was refused by the permission mode, and worked around
+ * it produced a report indistinguishable from one written by an agent that
+ * simply never wanted `Bash`. That difference matters — a denied tool is the
+ * most likely explanation for a thin or hedged report, and it is the operator's
+ * own configuration causing it (`permissionMode` defaults to `acceptEdits`,
+ * see `provider.ts`), so it is fixable once seen.
+ *
+ * Non-fatal, matching how `provider.ts` already reports a tool it could not
+ * grant: the agent kept working, so this is a degraded run rather than a failed
+ * one (NFR-8).
+ *
+ * The ENTRY SHAPE IS NOT VERIFIED. `protocol.ts` types this as
+ * `z.array(z.unknown())` because both captured fixtures carry an empty array —
+ * a real denial has never been observed on this wire format. So each entry is
+ * read defensively for any of the field names the CLI plausibly uses, and an
+ * entry that yields none of them still produces an event saying a denial
+ * happened without inventing a tool name for it. Reporting "something was
+ * denied" is worth more than silence, and far more than a confident wrong name.
+ */
+function eventsForPermissionDenials(frame: ResultFrame, assignmentId: string): AgentEvent[] {
+  const denials = frame.permission_denials ?? [];
+
+  return denials.map((denial) => {
+    const named = toolNameOf(denial);
+    return {
+      t: 'error' as const,
+      assignmentId,
+      message:
+        named === undefined
+          ? 'a tool call was denied by the permission mode (the CLI did not name the tool)'
+          : `tool "${named}" was denied by the permission mode; the agent continued without it`,
+      fatal: false,
+    };
+  });
+}
+
+const DENIAL_NAME_FIELDS = ['tool_name', 'toolName', 'tool', 'name'] as const;
+
+function toolNameOf(denial: unknown): string | undefined {
+  const record = asRecord(denial);
+  if (record === undefined) return typeof denial === 'string' ? denial : undefined;
+
+  for (const field of DENIAL_NAME_FIELDS) {
+    const value = record[field];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
 }

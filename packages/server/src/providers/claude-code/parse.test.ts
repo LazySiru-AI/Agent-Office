@@ -430,6 +430,59 @@ describe('normaliseFrame: result frames', () => {
     const result = normaliseFrame(frame, 'a1');
     expect(result).toEqual({ events: [], recognised: true });
   });
+
+  it('reports a denied tool as a non-fatal error, on an otherwise successful run', () => {
+    // These used to be parsed and dropped, which made a denial invisible: an
+    // agent refused `Bash` and one that never wanted `Bash` produced
+    // indistinguishable output. A denial is the most likely explanation for a
+    // thin report, and it comes from the operator's own `permissionMode`, so
+    // it is fixable once seen.
+    const frame = JSON.parse(
+      '{"type":"result","is_error":false,"subtype":"success","permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_09"}]}',
+    );
+    const result = normaliseFrame(frame, 'a1');
+
+    expect(result.events).toEqual([
+      {
+        t: 'error',
+        assignmentId: 'a1',
+        message: 'tool "Bash" was denied by the permission mode; the agent continued without it',
+        fatal: false,
+      },
+    ]);
+  });
+
+  it('still reports a denial whose entry shape it does not recognise', () => {
+    // `protocol.ts` types these as `z.array(z.unknown())` because both captured
+    // fixtures carry an empty array — no real denial has ever been observed on
+    // this wire format, so the field names above are inference, not knowledge.
+    // If they are wrong, the right failure is a denial reported without a name,
+    // never a denial silently dropped or a confidently wrong tool name.
+    const frame = JSON.parse('{"type":"result","is_error":false,"permission_denials":[{"unexpected":"shape"}]}');
+    const result = normaliseFrame(frame, 'a1');
+
+    expect(result.events).toHaveLength(1);
+    expect(result.events[0]).toMatchObject({ t: 'error', fatal: false });
+    expect((result.events[0] as { message: string }).message).toMatch(/denied.*did not name the tool/);
+  });
+
+  it('reports denials alongside the fatal error when the run also failed', () => {
+    const frame = JSON.parse(
+      '{"type":"result","is_error":true,"result":"ran out of turns","permission_denials":[{"tool_name":"WebFetch"},{"name":"Bash"}]}',
+    );
+    const result = normaliseFrame(frame, 'a1');
+
+    expect(result.events).toHaveLength(3);
+    expect(result.events.filter((e) => e.t === 'error' && !e.fatal)).toHaveLength(2);
+    // The fatal one comes last, so a consumer reading in order learns why the
+    // agent was hampered before it learns that the run ended.
+    expect(result.events[2]).toEqual({
+      t: 'error',
+      assignmentId: 'a1',
+      message: 'ran out of turns',
+      fatal: true,
+    });
+  });
 });
 
 describe('fixture: auth-failure.jsonl (real capture)', () => {

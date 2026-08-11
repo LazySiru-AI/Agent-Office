@@ -91,20 +91,63 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
 
   /**
    * The Manager's turns are not assignments, so nothing in the dispatcher
-   * records their token usage. Intercept it here — this is the only layer that
-   * sees both manager calls — so the run's true cost is persisted (NFR-5).
+   * records their token usage — or, until this fix, their event log. Intercept
+   * both here: this is the only layer that sees both manager calls *and* holds
+   * the store, so it is the natural place for either concern, and keeping them
+   * together means one gate (`isManagerAssignmentId`) decides both.
+   *
+   * DEFECT FIXED: planning and synthesis stream `usage`/`text` events live
+   * through `onEvent`, exactly like a real assignment's — but unlike a real
+   * assignment, `dispatcher.ts` never persists them (it only calls
+   * `store.appendEvent` for the assignments it dispatches). The aggregate
+   * survived on `run.managerUsage`; the event-by-event record NFR-7 promises
+   * ("replay a finished run from its saved event log") did not — replay read
+   * `logs/*.jsonl` and got silence for the two turns that, on a small run,
+   * outspend the entire team.
+   *
+   * `manager.ts` stays free of store knowledge on purpose: it only awaits
+   * whatever `onEvent` hook it is given (see `runManagerTurn`'s comment), and
+   * this closure is that hook. That keeps the store dependency in the one
+   * layer that already has it, rather than teaching `manager.ts` — which is
+   * about prompts and plan validation — what a `RunStore` is.
+   *
+   * `appendEvent` is awaited *before* usage accumulation and before forwarding
+   * to `deps.onEvent`, matching `dispatcher.ts`'s own write-before-notify
+   * ordering for real assignments (`setStatus`/the provider loop in
+   * dispatcher.ts): a client can never observe a manager event over the
+   * WebSocket before it is durable on disk.
+   *
+   * Logged under the event's own `assignmentId` — always one of the two
+   * `MANAGER_*_ASSIGNMENT_ID` constants here, since that is what
+   * `runManagerTurn` stamps on every event a manager turn emits. Two things
+   * make that a safe log key rather than a landmine:
+   *   - It lands in its own `logs/manager-plan.jsonl` / `logs/manager-
+   *     synthesis.jsonl` file, never a real assignment's, because
+   *     `materialiseAssignments` builds `run.assignments` entirely from the
+   *     Manager's own plan and the plan is produced *after* planning's events
+   *     already exist — so at the moment these ids are chosen, no assignment
+   *     id exists to collide with them yet, and by convention (documented on
+   *     the constants in manager.ts) real plans do not choose them either.
+   *   - Even in the paranoid case where a plan *did* name an assignment
+   *     `manager-plan`, the web client's replay fold (`useReplay.ts`'s
+   *     `foldEvents`) explicitly skips any event whose `assignmentId` is not
+   *     found in `base.assignments` rather than throwing — so the worst case
+   *     is one assignment's replay under-rendering, never a crash.
    */
-  const onEvent = (event: AgentEvent): void => {
-    if (
-      event.t === 'usage' &&
-      (event.assignmentId === MANAGER_PLAN_ASSIGNMENT_ID ||
-        event.assignmentId === MANAGER_SYNTHESIS_ASSIGNMENT_ID)
-    ) {
-      const current = run.managerUsage ?? EMPTY_USAGE;
-      run.managerUsage = {
-        inputTokens: current.inputTokens + event.inputTokens,
-        outputTokens: current.outputTokens + event.outputTokens,
-      };
+  const isManagerAssignmentId = (assignmentId: string): boolean =>
+    assignmentId === MANAGER_PLAN_ASSIGNMENT_ID || assignmentId === MANAGER_SYNTHESIS_ASSIGNMENT_ID;
+
+  const onEvent = async (event: AgentEvent): Promise<void> => {
+    if (isManagerAssignmentId(event.assignmentId)) {
+      await deps.store.appendEvent(run.id, event.assignmentId, event);
+
+      if (event.t === 'usage') {
+        const current = run.managerUsage ?? EMPTY_USAGE;
+        run.managerUsage = {
+          inputTokens: current.inputTokens + event.inputTokens,
+          outputTokens: current.outputTokens + event.outputTokens,
+        };
+      }
     }
     deps.onEvent?.(event);
   };
@@ -152,6 +195,12 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
       run,
       registry: deps.registry,
       provider: deps.provider,
+      // Forwarded, not merely accepted. This was declared and documented one
+      // layer up and then dropped here, which made per-agent provider selection
+      // inert for every real run: both the CLI and the HTTP supervisor reach the
+      // dispatcher only through this function, and the tests that covered the
+      // feature called `dispatchRun` directly, so nothing noticed.
+      ...(deps.providerFor === undefined ? {} : { providerFor: deps.providerFor }),
       store: deps.store,
       signal,
       ...(deps.dispatch === undefined ? {} : { options: deps.dispatch }),

@@ -1,6 +1,7 @@
 import type { AgentEvent } from '@agent-office/shared';
 import {
   apiKeyVariable,
+  resolveAgentModel,
   resolveApiConfig,
   type ApiProviderConfig,
   type ApiProviderId,
@@ -95,9 +96,13 @@ export interface OpenAiProviderOptions {
   /**
    * Passed to `resolveApiConfig` as `overrides.model`. Unset falls through to
    * the `<PROVIDER>_MODEL` environment variable, then the guessed default in
-   * `apiConfig.ts`. Provider-wide rather than per-assignment for the same
-   * reason noted in `claude-code/provider.ts`: `AgentRunRequest` carries no
-   * model.
+   * `apiConfig.ts`.
+   *
+   * Run-wide, and stronger than the per-agent `model:` on `AgentRunRequest`:
+   * setting this states what the whole run should use. In practice it is the
+   * only one that decides anything for this provider — the catalog's tiers are
+   * Anthropic's vocabulary, so `resolveAgentModel` cannot translate them here
+   * and says so instead of guessing.
    */
   model?: string;
 
@@ -210,6 +215,19 @@ export class OpenAiCompatibleProvider implements AgentProvider {
       { role: 'user', content: request.task },
     ];
 
+    // Resolved once per assignment, not per round: swapping models midway
+    // through a tool-use conversation would have one model answering for
+    // another's calls.
+    const modelChoice = resolveAgentModel(this.id, config, request.model);
+    if (modelChoice.unhonoured !== undefined) {
+      // Expected rather than exceptional for this provider: a catalog agent
+      // saying `sonnet` is asking for something no OpenAI-compatible endpoint
+      // has. Reported as a non-fatal event anyway, because "ran on a different
+      // model than its definition asked for" changes both the bill and the
+      // output, and silence there is how a surprise becomes a mystery.
+      yield { assignmentId, t: 'error', fatal: false, message: modelChoice.unhonoured };
+    }
+
     let sawText = false;
     let completedWithTextOnlyTurn = false;
 
@@ -217,7 +235,7 @@ export class OpenAiCompatibleProvider implements AgentProvider {
       if (request.signal.aborted) return;
 
       const body: ChatCompletionRequestBody = {
-        model: config.model,
+        model: modelChoice.model,
         messages,
         stream: true,
         // Chat Completions only reports token usage when asked. Without this,
@@ -397,6 +415,20 @@ export class OpenAiCompatibleProvider implements AgentProvider {
     const textByChoice = new Map<number, string>();
     const toolCallsByChoice = new Map<number, Map<number, ToolCallAccumulator>>();
 
+    // Chat Completions sends `usage` as a running total, not a per-chunk
+    // delta — and some deployments attach that same cumulative figure to more
+    // than one chunk in the same stream (the trailing content chunk and the
+    // empty-choices chunk that follows it, in practice). Yielding a `usage`
+    // event per chunk therefore handed the same 100/50 totals downstream
+    // twice, and both the dispatcher and the web replay fold usage events
+    // with `+=`, so the run's cost was reported as double what it actually
+    // spent — exactly the kind of quiet inflation NFR-5 exists to prevent,
+    // and one that trips FR-M8's budget on phantom spend. `latestUsage` is
+    // overwritten, never accumulated, and yielded at most once per round —
+    // last-one-wins, the same rule `message_delta`'s output-token count
+    // follows in the Anthropic adapter.
+    let latestUsage: { inputTokens: number; outputTokens: number } | undefined;
+
     try {
       for await (const sseEvent of readSse(response.body, signal)) {
         // The literal terminal payload, not an SSE `event:` name — see the
@@ -425,9 +457,7 @@ export class OpenAiCompatibleProvider implements AgentProvider {
         const chunk = parsed.data;
 
         if (chunk.usage != null) {
-          yield {
-            assignmentId,
-            t: 'usage',
+          latestUsage = {
             inputTokens: chunk.usage.prompt_tokens,
             outputTokens: chunk.usage.completion_tokens,
           };
@@ -481,6 +511,13 @@ export class OpenAiCompatibleProvider implements AgentProvider {
       // here ("a thrown error is still handled, but loses the partial event
       // stream").
       if (!signal.aborted) throw error;
+    }
+
+    // Same FR-M9 rule as the Anthropic adapter's `consumeTurn`: an abort that
+    // resolved this loop cleanly (rather than throwing, above) must not
+    // produce a trailing usage event for a round that did not finish.
+    if (!signal.aborted && latestUsage !== undefined) {
+      yield { assignmentId, t: 'usage', inputTokens: latestUsage.inputTokens, outputTokens: latestUsage.outputTokens };
     }
 
     const toolAccumulators = toolCallsByChoice.get(0);

@@ -18,7 +18,14 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2, 3, 4, 5, 6, 7 and 8 are done.** 1,006 tests pass, typecheck is
+**Phases 0, 2, 3, 4, 5, 6, 7 and 8 are done, and a five-reviewer QA pass has
+been through all of them.** That pass found 29 defects, 21 of them reproduced
+rather than reasoned — including a review loop that could crash a whole run, a
+`Grep` pattern that froze the server, a report path that could overwrite the
+run's own state file, and a cost display that had never worked for a real
+provider. All are fixed; `PROGRESS.md` has the full account.
+
+1,178 tests pass, typecheck is
 clean, the registry indexes 156 agents, and you can drive a run
 from the browser — watch the team work in a pixel office, click a character to inspect
 it, refresh mid-run without losing it, cancel it, read the reports in-app,
@@ -40,6 +47,7 @@ installed on the machine, fully offline.
 | 6 | Domain breadth + review loop | done (routing untested — no model) |
 | 7 | Anthropic / OpenAI / DeepSeek adapters | built (unverified — no key) |
 | 8 | Dark neon terminal interface | done |
+| — | QA pass: five reviewers, 29 defects, all fixed | done |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
 has been driven against the real CLI — real spawn, real argv, real stream-json —

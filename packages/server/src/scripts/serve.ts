@@ -147,6 +147,23 @@ async function main(): Promise<void> {
     },
   });
 
+  // NFR-2 (server-restart half): close out any run a previous process left
+  // non-terminal — e.g. `status: 'running'` from a crash mid-dispatch — before
+  // this one accepts a single request. Must happen before `listen()`: once the
+  // server is accepting connections, a client's own `POST /api/runs` could
+  // create a genuinely-live run that `store.listRuns()` would then observe and
+  // misfile as crashed, because nothing yet in `supervisor.entries` marks it as
+  // this process's own. See `RunSupervisor.reconcileCrashedRuns` for what this
+  // does and, just as importantly, what it deliberately does not do (resuming
+  // dispatch, which the doc comment there explains is a materially larger
+  // feature than "the server did not lose the run").
+  const reconciled = await supervisor.reconcileCrashedRuns();
+  if (reconciled.length > 0) {
+    process.stdout.write(
+      `Marked ${reconciled.length} run(s) failed: left non-terminal by a previous process (${reconciled.join(', ')}).\n`,
+    );
+  }
+
   const app = await buildServer({ registry, store, supervisor });
 
   await app.listen({ host: HOST, port: options.port });

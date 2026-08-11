@@ -131,7 +131,7 @@ export const MAX_REVIEW_REVISIONS = 1;
 export interface RevisionDecision {
   redispatch: boolean;
   /** Present when `redispatch` is false and a revision was requested but refused. */
-  refusedBecause?: 'attempt-budget' | 'target-not-revisable' | 'not-a-review';
+  refusedBecause?: 'attempt-budget' | 'target-not-revisable' | 'not-a-review' | 'concurrent-revision';
 }
 
 /**
@@ -157,14 +157,37 @@ export function decideRevision(params: {
   reviewer: AssignmentState;
   outcome: ReviewOutcome;
   target: AssignmentState | undefined;
+  /**
+   * True when another reviewer's decide-and-redispatch for this same target is
+   * already claimed elsewhere (set by `dispatcher.ts`'s single-flight guard
+   * around `applyReviewVerdict`).
+   *
+   * Why this exists as an explicit input rather than being inferred from
+   * `target.status`: two reviewers of *one* target, sitting in the same
+   * parallel phase, can both call this function while `target.status` still
+   * reads `'done'` — neither has redispatched yet, so from either reviewer's
+   * point of view the target looks perfectly revisable. That is a genuine race
+   * confirmed against the real `FileRunStore` on disk, not a hypothetical one:
+   * both would decide `redispatch: true`, and the second one to actually
+   * transition the target's status would find it already moved off `done` and
+   * throw. Checking the claim here, ahead of the target-status check below,
+   * means the loser is refused for the real reason — another revision already
+   * claimed this target — rather than a `target-not-revisable` that would
+   * misreport timing as if the target itself were unfit for revision.
+   */
+  concurrentRevisionInFlight?: boolean;
 }): RevisionDecision {
-  const { reviewer, outcome, target } = params;
+  const { reviewer, outcome, target, concurrentRevisionInFlight = false } = params;
 
   if (outcome.verdict === 'approved') return { redispatch: false };
 
   // A revision was requested. From here on, any `false` result must say why.
   if (reviewTargetOf(reviewer) === undefined) {
     return { redispatch: false, refusedBecause: 'not-a-review' };
+  }
+
+  if (concurrentRevisionInFlight) {
+    return { redispatch: false, refusedBecause: 'concurrent-revision' };
   }
 
   // `target` is the plan's resolution of `reviewTargetOf(reviewer)` against the

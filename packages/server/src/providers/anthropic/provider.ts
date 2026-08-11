@@ -2,6 +2,7 @@ import type { AgentEvent } from '@agent-office/shared';
 import { createSandboxedTools, type SandboxedTools } from '../apiTools.js';
 import {
   apiKeyVariable,
+  resolveAgentModel,
   resolveApiConfig,
   type ApiProviderConfig,
   type ResolveConfigOptions,
@@ -77,10 +78,12 @@ export interface AnthropicProviderOptions {
   /**
    * Passed to `resolveApiConfig` as `overrides.model`. Unset falls through to
    * the `ANTHROPIC_MODEL` environment variable, then the default in
-   * `apiConfig.ts`. Provider-wide rather than per-assignment, matching
-   * `claude-code/provider.ts` and `openai/provider.ts`'s own `model` option:
-   * `AgentRunRequest` carries no model, so a catalog agent's per-agent
-   * `model:` frontmatter cannot reach any Phase 7 adapter yet.
+   * `apiConfig.ts`.
+   *
+   * Run-wide, and stronger than the per-agent `model:` that now arrives on
+   * `AgentRunRequest`: setting this states what the whole run should use, so it
+   * outranks the catalog's standing default for any one agent. See
+   * `resolveAgentModel`.
    */
   model?: string;
   /** Sent as the `anthropic-version` header. Defaults to `protocol.ts`'s `ASSUMED_ANTHROPIC_VERSION`. */
@@ -122,6 +125,14 @@ interface TurnOutcome {
   pendingToolUses: PendingToolUse[];
   /** False if the stream ended without a `message_stop` — a truncated/dropped connection. */
   sawMessageStop: boolean;
+  /**
+   * Whether this turn yielded at least one `text` event (i.e. saw a
+   * `text_delta`, even one carrying an empty string). Tracked per turn, not
+   * inferred from `assistantContent`, because `run`'s text-only-turn branch
+   * needs to know across the *whole* tool-use loop whether any turn ever
+   * produced text — see the guard where it is used.
+   */
+  sawText: boolean;
 }
 
 /** Accumulates one content block across `content_block_delta` events keyed by `index`. */
@@ -187,14 +198,39 @@ export class AnthropicProvider implements AgentProvider {
     const toolSchemas = tools.schemas(request.allowedTools);
     const toolDefinitions = toolSchemas.map(toAnthropicToolDef);
 
+    // The agent's catalog `model:` — `sonnet`, `haiku` or nothing — resolved to
+    // something this API will accept. Done once per assignment rather than per
+    // turn: the model must not change underneath a tool-use loop, or the second
+    // half of a conversation would be answered by a different model than the
+    // half it is replying to.
+    const modelChoice = resolveAgentModel('anthropic', config, request.model);
+    if (modelChoice.unhonoured !== undefined) {
+      // Non-fatal, and deliberately an event rather than a diagnostic: which
+      // model an agent ran on decides what it cost and how good it was, so a
+      // substitution belongs in front of whoever is paying.
+      yield {
+        assignmentId: request.assignmentId,
+        t: 'error',
+        fatal: false,
+        message: modelChoice.unhonoured,
+      };
+    }
+
     const messages: AnthropicMessageParam[] = [{ role: 'user', content: request.task }];
     const maxIterations = this.options.maxToolIterations ?? MAX_TOOL_ITERATIONS;
+
+    // The interface contract (`types.ts`) is "must emit at least one `text`
+    // event carrying the agent's final answer". Tracked across the whole
+    // tool-use loop, not just the last turn: a turn that only calls tools
+    // produces no text, and the turn that finally stops calling tools is the
+    // one this guard cares about.
+    let sawText = false;
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       if (request.signal.aborted) return;
 
       const body: AnthropicMessagesRequestBody = {
-        model: config.model,
+        model: modelChoice.model,
         max_tokens: config.maxOutputTokens,
         system: request.systemPrompt,
         messages,
@@ -246,6 +282,8 @@ export class AnthropicProvider implements AgentProvider {
 
       if (outcome.fatal) return; // consumeTurn already emitted the error event.
 
+      if (outcome.sawText) sawText = true;
+
       if (!outcome.sawMessageStop) {
         yield {
           assignmentId: request.assignmentId,
@@ -257,9 +295,21 @@ export class AnthropicProvider implements AgentProvider {
       }
 
       if (outcome.pendingToolUses.length === 0) {
-        // A text-only turn: the model is done. Contract satisfied — at least
-        // one `text` event has been yielded from inside `consumeTurn` for any
-        // turn that produced text.
+        // A text-only turn: the model is done. But "done" is not the same as
+        // "produced text" — `message_start` → `message_delta` →
+        // `message_stop` with no content blocks at all is a degenerate but
+        // real reply, and nothing above guarantees it cannot happen. Left
+        // unguarded, this turns into a confusing downstream failure rather
+        // than the real one: for an ordinary assignment the dispatcher's own
+        // empty-report check (FR-M6) would eventually catch it, but the
+        // Manager's own planning and synthesis turns call this adapter
+        // directly with no such check, so a silently empty run here would
+        // surface there as a bare JSON-parse failure with no clue that the
+        // model simply said nothing. Same guard as `openai/provider.ts`'s
+        // `run`, for the same reason.
+        if (!sawText) {
+          yield { assignmentId: request.assignmentId, t: 'text', chunk: '' };
+        }
         return;
       }
 
@@ -316,6 +366,7 @@ export class AnthropicProvider implements AgentProvider {
     let outputTokens = 0;
     let sawUsage = false;
     let sawMessageStop = false;
+    let sawText = false;
 
     for await (const raw of readSse(response.body, request.signal)) {
       const event = this.parseStreamEvent(raw.data);
@@ -367,6 +418,7 @@ export class AnthropicProvider implements AgentProvider {
           const textDelta = TextDeltaSchema.safeParse(delta);
           if (textDelta.success) {
             acc.text += textDelta.data.text;
+            sawText = true;
             yield { assignmentId: request.assignmentId, t: 'text', chunk: textDelta.data.text };
           }
         } else if (delta.type === 'input_json_delta' && acc.type === 'tool_use') {
@@ -424,7 +476,7 @@ export class AnthropicProvider implements AgentProvider {
           fatal: true,
           message: `the Anthropic API reported an error mid-stream: ${detail}`,
         };
-        return { fatal: true, assistantContent: [], pendingToolUses: [], sawMessageStop: false };
+        return { fatal: true, assistantContent: [], pendingToolUses: [], sawMessageStop: false, sawText };
       }
 
       // Reachable only for a future SSE event type this file has never heard
@@ -440,7 +492,7 @@ export class AnthropicProvider implements AgentProvider {
     // did not finish, and it is not this method's place to report a partial
     // one as though it completed.
     if (request.signal.aborted) {
-      return { fatal: false, assistantContent: [], pendingToolUses: [], sawMessageStop: false };
+      return { fatal: false, assistantContent: [], pendingToolUses: [], sawMessageStop: false, sawText };
     }
 
     if (sawUsage) {
@@ -460,7 +512,7 @@ export class AnthropicProvider implements AgentProvider {
       // 'other' (thinking, unknown): dropped from the echo — see protocol.ts.
     }
 
-    return { fatal: false, assistantContent, pendingToolUses, sawMessageStop };
+    return { fatal: false, assistantContent, pendingToolUses, sawMessageStop, sawText };
   }
 
   /** Parse and validate one SSE frame's `data:` payload. `undefined` means "skip it", with a diagnostic already filed. */

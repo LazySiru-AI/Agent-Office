@@ -1,4 +1,4 @@
-﻿import { describe, expect, it } from 'vitest';
+﻿import { describe, expect, it, vi } from 'vitest';
 import {
   EVENT_BUFFER_LIMIT,
   type RunState,
@@ -8,6 +8,7 @@ import { MemoryRunStore } from '../store/memoryStore.js';
 import type { RunStore } from '../store/types.js';
 import { RingBuffer, RunSupervisor } from './supervisor.js';
 import {
+  SLOW_RUN_TIMEOUT_MS,
   stubDeliverable,
   testProviderFactory,
   testRegistry,
@@ -38,16 +39,26 @@ function makeSupervisor(
 }
 
 /**
- * Timeout for the handful of tests that drive a whole run end to end.
+ * Applied to this whole file rather than to hand-picked tests.
  *
- * Not a blanket raise. These each load a registry, start a supervisor and walk
- * a full plan through the store — genuinely 3-5 seconds of real work, so
- * vitest's 5s default was always within noise of failing. It began failing
- * reliably once Phase 7 added ~190 tests: the work did not get slower, it just
- * stopped being alone on the disk. Raising the default for every test would
- * hide a real hang somewhere else, so only the honestly-slow tests get room.
+ * The previous approach was to mark "the handful of tests that drive a whole
+ * run end to end" individually, on the reasoning that a blanket raise would
+ * hide a real hang. The reasoning was sound; the execution was not, twice over.
+ * Tests were missed — "returns the run id before the run has finished" awaits
+ * `waitForTerminal` exactly like its neighbours and never got the marker, and
+ * it failed in all five runs of a measurement pass. And the marker did not
+ * work anyway, because `waitForTerminal` gave up at its own tighter deadline
+ * first (see `fixtures.ts`).
+ *
+ * Nearly every test in this file starts a supervisor and drives a real run, so
+ * choosing which ones are "the slow ones" was always a per-test judgement that
+ * had to be made correctly fifteen times and repeated on every new test. A
+ * file-level budget makes it once. The hang-detection this gives up is
+ * recovered elsewhere and better: `RUN_POLL_TIMEOUT_MS` fires first and names
+ * the status the run was stuck in, which is a far more useful failure than a
+ * bare vitest timeout ever was.
  */
-const SLOW_RUN_TIMEOUT_MS = 20_000;
+vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS });
 describe('RingBuffer', () => {
   it('keeps the newest entries and reports that it dropped the rest', () => {
     // The dropped flag is what `snapshot.truncated` is built from. Without it a
@@ -308,6 +319,72 @@ describe('RunSupervisor cancellation (FR-M9)', () => {
     expect(supervisor.liveRunIds()).toEqual([]);
     expect((await supervisor.getRunState(first)).status).toBe('cancelled');
     expect((await supervisor.getRunState(second)).status).toBe('cancelled');
+  });
+});
+
+describe('RunSupervisor.reconcileCrashedRuns (NFR-2, server restart)', () => {
+  it('marks a run left non-terminal by a crash as failed, instead of leaving it running forever', async () => {
+    const store = new MemoryRunStore();
+    // The exact on-disk shape a crash leaves: `run.json` still says `running`,
+    // with an assignment stuck at `working`, because the process died
+    // mid-dispatch rather than failing cleanly through `setStatus`.
+    const crashed = await store.createRun('a task interrupted by a crash');
+    await store.saveRun({
+      ...crashed,
+      status: 'running',
+      assignments: [
+        {
+          id: 'lead',
+          phaseId: 'analysis',
+          agentName: 'alpha',
+          objective: 'do the work',
+          deliverable: 'reports/01-alpha.md',
+          dependsOn: [],
+          status: 'working',
+          attempts: 1,
+          usage: { inputTokens: 0, outputTokens: 0 },
+          startedAt: Date.now(),
+        },
+      ],
+    });
+
+    // A fresh supervisor, exactly as a restarted process constructs one: no
+    // memory of the run above (its `entries` map starts empty), only the store
+    // it shares with the process that crashed.
+    const { supervisor } = makeSupervisor({}, store);
+
+    // Before this fix, nothing ever called `store.listRuns()` here or in
+    // `serve.ts`'s `main()`, so this run stayed `running` — on disk
+    // indistinguishable from a run this process is genuinely executing.
+    const reconciled = await supervisor.reconcileCrashedRuns();
+
+    expect(reconciled).toEqual([crashed.id]);
+    const after = await supervisor.getRunState(crashed.id);
+    expect(after.status).toBe('failed');
+    expect(after.error).toMatch(/restart/i);
+    // Reconciling never adopts the run as this process's own: it was never
+    // started here, so cancelling it must still read as "not executing in
+    // this server process" rather than pretending a cancel actually happened.
+    expect(supervisor.cancelRun(crashed.id)).toBe(false);
+    expect(supervisor.liveRunIds()).not.toContain(crashed.id);
+  });
+
+  it('leaves finished runs alone', async () => {
+    const store = new MemoryRunStore();
+    const { supervisor } = makeSupervisor({}, store);
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.' });
+    const finished = await waitForTerminal(supervisor, runId);
+
+    const restarted = new RunSupervisor({ registry: testRegistry(), store });
+    const reconciled = await restarted.reconcileCrashedRuns();
+
+    expect(reconciled).toEqual([]);
+    expect((await store.loadRun(runId)).status).toBe(finished.status);
+  });
+
+  it('reports no runs to reconcile against an empty store', async () => {
+    const { supervisor } = makeSupervisor();
+    await expect(supervisor.reconcileCrashedRuns()).resolves.toEqual([]);
   });
 });
 

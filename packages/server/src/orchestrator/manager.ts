@@ -50,6 +50,17 @@ const SYNTHESIS_TOKEN_WARNING = 120_000;
 
 export type ManagerMode = 'planning' | 'synthesis';
 
+/**
+ * A manager-turn event listener may itself need to await something (in
+ * practice: `runner.ts` persisting the event to the store before forwarding
+ * it — see the defect note on {@link runManagerTurn}). `void | Promise<void>`
+ * rather than a bare `Promise<void>` return keeps every existing synchronous
+ * listener (tests, `console.warn`-style loggers) assignable without change;
+ * callers that care about ordering `await` the call, callers that do not can
+ * ignore the return value exactly as before.
+ */
+export type ManagerEventListener = (event: AgentEvent) => void | Promise<void>;
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -621,7 +632,7 @@ export interface PlanRunDeps {
   /** FR-M2. Total provider calls is `maxRepairAttempts + 1`. Default 2. */
   maxRepairAttempts?: number;
   /** Every provider event is forwarded here, plus one non-fatal error per rejection. */
-  onEvent?: (event: AgentEvent) => void;
+  onEvent?: ManagerEventListener;
   /** FR-R4 groundwork: show the Manager a pre-filtered candidate list. */
   candidateAgents?: readonly string[];
   /** NFR-1. Planning writes nothing, but the provider seam requires a directory. */
@@ -687,7 +698,7 @@ export async function planRun(deps: PlanRunDeps): Promise<RunPlan> {
     if (!('rejected' in rejection)) return rejection.plan;
 
     rejections.push(rejection.rejected);
-    recordRejection(rejection.rejected, log, deps.onEvent);
+    await recordRejection(rejection.rejected, log, deps.onEvent);
 
     const attemptsRemaining = totalAttempts - attempt;
     if (attemptsRemaining > 0) {
@@ -746,11 +757,11 @@ function evaluatePlanResponse(
   return { plan: parsed.data };
 }
 
-function recordRejection(
+async function recordRejection(
   rejection: RejectedPlanAttempt,
   log: (message: string) => void,
-  onEvent?: (event: AgentEvent) => void,
-): void {
+  onEvent?: ManagerEventListener,
+): Promise<void> {
   log(
     [
       `[manager] plan attempt ${rejection.attempt} rejected (${rejection.reason}):`,
@@ -760,7 +771,9 @@ function recordRejection(
     ].join('\n'),
   );
 
-  onEvent?.({
+  // Awaited so a persisting listener (see `runManagerTurn`) writes this event
+  // before the next repair attempt's own events can interleave with it.
+  await onEvent?.({
     t: 'error',
     assignmentId: MANAGER_PLAN_ASSIGNMENT_ID,
     message: `plan attempt ${rejection.attempt} rejected (${rejection.reason}): ${rejection.issues.join('; ')}`,
@@ -899,7 +912,7 @@ export interface SynthesiseReportDeps {
   task?: string;
   /** Per-report truncation cap. Default {@link DEFAULT_MAX_REPORT_CHARS}. */
   maxReportChars?: number;
-  onEvent?: (event: AgentEvent) => void;
+  onEvent?: ManagerEventListener;
   workspaceDir?: string;
   allowedTools?: string[];
   logger?: (message: string) => void;
@@ -955,13 +968,69 @@ export async function synthesiseReport(deps: SynthesiseReportDeps): Promise<stri
   return trimmed;
 }
 
-/** Truncate with a marker the Manager is instructed to notice. Never silent. */
-function truncateReport(markdown: string, maxChars: number): string {
+/**
+ * A UTF-16 code unit in the range 0xD800–0xDBFF is a high surrogate: the first
+ * half of a surrogate pair encoding a character outside the Basic Multilingual
+ * Plane (emoji, several CJK extensions, ...). It is never a valid character on
+ * its own.
+ */
+const HIGH_SURROGATE_MIN = 0xd800;
+const HIGH_SURROGATE_MAX = 0xdbff;
+
+/**
+ * `String#slice` counts UTF-16 code units, not characters, so a cut at
+ * `maxChars` can land between a surrogate pair's two halves. The result then
+ * contains an unpaired high surrogate, which has no valid UTF-8 encoding and
+ * becomes U+FFFD the next time this text is encoded — for a process's stdin or
+ * a network body, which is exactly what happens to every prompt built here.
+ * Backing the cut up by one code unit keeps the pair whole (and drops the
+ * dangling low surrogate that would otherwise be left at the new boundary,
+ * which is `slice`'s job on the next call, not this function's).
+ */
+function safeSliceLength(text: string, maxChars: number): number {
+  if (maxChars <= 0) return 0;
+  if (maxChars >= text.length) return text.length;
+  const code = text.charCodeAt(maxChars - 1);
+  if (code >= HIGH_SURROGATE_MIN && code <= HIGH_SURROGATE_MAX) return maxChars - 1;
+  return maxChars;
+}
+
+/**
+ * Truncate `markdown` to (approximately) `maxChars`, with a marker the Manager
+ * is instructed to notice. Never silent. Exported so `brief.ts` can apply the
+ * same cap to upstream reports inlined into a brief (FR-M5) — see its own
+ * comment for why briefing needs a cap at all.
+ *
+ * Two failure modes fixed here, both found by feeding it a surrogate pair and
+ * an open fence straddling the cut:
+ *
+ *   1. A raw `slice(0, maxChars)` can stop mid surrogate-pair, corrupting one
+ *      character at the boundary of a report the Manager is told to trust
+ *      (see {@link safeSliceLength}).
+ *   2. The same slice can land inside a ``` fence and leave it open. That is
+ *      worse than losing a character: everything after the cut — including
+ *      our own `[TRUNCATED ...]` marker — is then parsed as code by whatever
+ *      reads this prompt next, silently changing how the *rest* of the prompt
+ *      is interpreted rather than just losing content. An odd number of ```
+ *      markers in the slice means exactly this happened, and closing the
+ *      fence (at most 4 extra characters) restores well-formed markdown.
+ */
+export function truncateReport(markdown: string, maxChars: number): string {
   if (maxChars <= 0 || markdown.length <= maxChars) return markdown;
 
-  const omitted = markdown.length - maxChars;
+  const cutLength = safeSliceLength(markdown, maxChars);
+  let sliced = markdown.slice(0, cutLength);
+  // Measured against `cutLength`, not the requested `maxChars`: when the safe
+  // cut backs up one code unit to avoid splitting a surrogate pair, the marker
+  // below must still report exactly how much of the *original* content this
+  // slice is missing.
+  const omitted = markdown.length - cutLength;
+
+  const fenceCount = (sliced.match(/```/g) ?? []).length;
+  if (fenceCount % 2 === 1) sliced += '\n```';
+
   return [
-    markdown.slice(0, maxChars),
+    sliced,
     '',
     `[TRUNCATED BY AGENT OFFICE: ${omitted} of ${markdown.length} characters omitted to fit the synthesis budget. Treat the omitted portion as unknown.]`,
   ].join('\n');
@@ -979,10 +1048,24 @@ interface ManagerTurnParams {
   allowedTools: string[];
   workspaceDir: string;
   signal: AbortSignal;
-  onEvent?: (event: AgentEvent) => void;
+  onEvent?: ManagerEventListener;
 }
 
-/** Drive one provider turn, forwarding every event and returning the joined text. */
+/**
+ * Drive one provider turn, forwarding every event and returning the joined text.
+ *
+ * `onEvent` is awaited (defect fix): a synchronous `onEvent?.(event)` cannot be
+ * relied on to have finished anything by the time this loop moves to the next
+ * event, which is fine for a listener that only forwards to a UI but wrong for
+ * one that persists — `runner.ts` wraps `onEvent` to write manager `usage`/
+ * `text` events to the store (the Manager's own turns are not assignments, so
+ * `dispatcher.ts`'s per-assignment persistence never sees them; before this
+ * fix nothing did, and replay showed silence for planning and synthesis even
+ * though they can outspend the whole team on a small run). Awaiting here gives
+ * that listener the same write-before-continue ordering `dispatcher.ts`
+ * already has for real assignments, without `manager.ts` importing a store
+ * type or knowing persistence happens at all — it only awaits a hook.
+ */
 async function runManagerTurn(params: ManagerTurnParams): Promise<string> {
   const chunks: string[] = [];
   const fatal: string[] = [];
@@ -995,7 +1078,7 @@ async function runManagerTurn(params: ManagerTurnParams): Promise<string> {
     workspaceDir: params.workspaceDir,
     signal: params.signal,
   })) {
-    params.onEvent?.(event);
+    await params.onEvent?.(event);
 
     if (event.t === 'text') chunks.push(event.chunk);
     else if (event.t === 'error' && event.fatal) fatal.push(event.message);

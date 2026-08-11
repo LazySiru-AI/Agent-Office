@@ -1,11 +1,16 @@
-﻿import { afterEach, describe, expect, it } from 'vitest';
+﻿import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { API, ServerMessageSchema, type ServerMessage } from '@agent-office/shared';
+import { FileRunStore } from '../store/fileStore.js';
 import { MemoryRunStore } from '../store/memoryStore.js';
 import type { RunStore } from '../store/types.js';
 import { buildServer } from './server.js';
 import { RunSupervisor } from './supervisor.js';
 import {
+  SLOW_RUN_TIMEOUT_MS,
   TEST_SYNTHESIS,
   stubDeliverable,
   testProviderFactory,
@@ -63,16 +68,16 @@ function expectApiError(body: string): string {
 }
 
 /**
- * Timeout for the handful of tests that drive a whole run end to end.
- *
- * Not a blanket raise. These each load a registry, start a supervisor and walk
- * a full plan through the store — genuinely 3-5 seconds of real work, so
- * vitest's 5s default was always within noise of failing. It began failing
- * reliably once Phase 7 added ~190 tests: the work did not get slower, it just
- * stopped being alone on the disk. Raising the default for every test would
- * hide a real hang somewhere else, so only the honestly-slow tests get room.
+ * File-level, for the reasons written out in `supervisor.test.ts`: picking
+ * "the slow ones" by hand was a judgement that had to be made correctly on
+ * every test and every new test, and the tighter deadline inside
+ * `waitForTerminal` made the marker ineffective even where it was applied.
+ * Half the tests here drive a real run through the store; the ones that do not
+ * cannot hang, and `RUN_POLL_TIMEOUT_MS` still fires first with a message
+ * naming the status a stuck run was in.
  */
-const SLOW_RUN_TIMEOUT_MS = 20_000;
+vi.setConfig({ testTimeout: SLOW_RUN_TIMEOUT_MS });
+
 describe('GET /api/health', () => {
   it('answers without touching the store, so it works as a readiness probe', async () => {
     const { app } = await setup();
@@ -223,6 +228,40 @@ describe('GET /api/runs and /api/runs/:runId', () => {
     expect(response.statusCode).toBe(400);
     expectApiError(response.body);
   });
+
+  it('does not leak the runs root or a filesystem username into a 404 body', async () => {
+    // `MemoryRunStore`'s "not found" error is already just a run id (see the
+    // test above) — it cannot exercise this defect. `FileRunStore` is the
+    // store that actually failed: its error names the absolute path it tried
+    // (`cannot read run state at C:\Users\<name>\...\run.json: ENOENT ...`),
+    // and `loadRun` used to forward that string verbatim into the response
+    // body, handing any loopback caller the server's own filesystem layout.
+    const tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'agent-office-server-'));
+    const runsRoot = path.join(tmpRoot, 'runs');
+    try {
+      const registry = testRegistry();
+      const store = new FileRunStore(runsRoot);
+      const supervisor = new RunSupervisor({
+        registry,
+        store,
+        makeProvider: testProviderFactory(),
+        onWarning: () => undefined,
+        produceDeliverable: stubDeliverable(),
+      });
+      const app = await buildServer({ registry, store, supervisor });
+      await app.ready();
+      started.push({ app, supervisor });
+
+      const response = await app.inject({ method: 'GET', url: API.run('20260101-000000-zzzz') });
+
+      expect(response.statusCode).toBe(404);
+      const message = expectApiError(response.body);
+      expect(message).not.toContain(runsRoot);
+      expect(message).not.toContain(os.userInfo().username);
+    } finally {
+      await rm(tmpRoot, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('POST /api/runs/:runId/cancel (FR-M9)', () => {
@@ -355,10 +394,18 @@ describe('report routes (NFR-1)', () => {
     expect(body.markdown).toContain('Findings');
   });
 
-  it('refuses a report path that climbs out of the run directory', async () => {
-    // The path in a real request comes from the Manager's LLM-generated
-    // `deliverable` field, so it is treated as hostile. The store performs the
-    // containment check; this proves the route actually routes through it.
+  it('serves only the reports the run declares, not everything in its directory', async () => {
+    // Containment was never enough on its own, and this is the test that used
+    // to say it was. It asked only whether a `../../../../etc/passwd` climb was
+    // refused — it was, and still is — and concluded the route was safe. But
+    // the boundary containment establishes is the RUN DIRECTORY, and that
+    // directory holds `run.json`, the `logs/*.jsonl` replay records, and
+    // `workspace/`, which is where NFR-1 deliberately puts the output of an
+    // agent nobody trusts. Every one of those was served in full, over an
+    // unauthenticated loopback route (NFR-6), to anything on this machine that
+    // could make an HTTP request.
+    //
+    // So the traversal case below is now the least interesting of the four.
     const { app, supervisor } = await setup();
 
     const created = await app.inject({
@@ -367,15 +414,32 @@ describe('report routes (NFR-1)', () => {
       payload: { task: 'Analyse the thing.' },
     });
     const { runId } = JSON.parse(created.body) as { runId: string };
-    await waitForTerminal(supervisor, runId);
+    const run = await waitForTerminal(supervisor, runId);
 
-    const response = await app.inject({
+    // A real report is still served — the route must not have become useless.
+    const declared = run.assignments.find((assignment) => assignment.reportPath !== undefined);
+    expect(declared?.reportPath).toBeDefined();
+    const allowed = await app.inject({
+      method: 'GET',
+      url: API.assignmentReport(runId, declared?.reportPath ?? ''),
+    });
+    expect(allowed.statusCode).toBe(200);
+
+    for (const path of ['run.json', 'logs/lead-analysis.jsonl', 'workspace/anything.txt']) {
+      const response = await app.inject({ method: 'GET', url: API.assignmentReport(runId, path) });
+      expect(response.statusCode).toBe(404);
+      // The refusal names no path and no reason beyond "not a report here":
+      // whether some other file exists in this run directory is not something
+      // an unauthenticated caller should be able to probe for.
+      expect(expectApiError(response.body)).toMatch(/has no report at that path/);
+      expect(response.body).not.toContain('run.json');
+    }
+
+    const climb = await app.inject({
       method: 'GET',
       url: API.assignmentReport(runId, '../../../../etc/passwd'),
     });
-
-    expect(response.statusCode).toBe(400);
-    expect(expectApiError(response.body)).toMatch(/escapes the run directory/);
+    expect(climb.statusCode).toBe(404);
   });
 
   it('returns 404 for a report path that is safe but absent', async () => {

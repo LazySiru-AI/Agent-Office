@@ -43,7 +43,20 @@ export async function* readSse(
 
   const reader = body.getReader();
   const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
   let buffer = '';
+  // Real bytes currently sitting in `buffer`, unresolved into an event.
+  //
+  // This must be a byte count, not `buffer.length`: `.length` on a decoded
+  // JS string counts UTF-16 code units, and a stream of multi-byte
+  // characters (CJK text is 3 bytes/char in UTF-8 but 1 code unit each;
+  // most emoji are 4 bytes but 2 code units, a surrogate pair) makes
+  // `.length` undercount the true byte size by up to 3x. A 32MB *byte* cap
+  // measured that way let an unterminated CJK stream buffer roughly 100MB
+  // before tripping — three times the advertised limit. Tracking the actual
+  // `byteLength` of what has been read in, minus what has been consumed out,
+  // keeps the cap honest in the unit it is documented in.
+  let bufferedBytes = 0;
 
   const onAbort = (): void => {
     // Cancelling the reader is what actually closes the socket. Without it an
@@ -57,8 +70,9 @@ export async function* readSse(
       const { done, value } = await reader.read();
       if (done) break;
 
+      bufferedBytes += value.byteLength;
       buffer += decoder.decode(value, { stream: true });
-      if (buffer.length > MAX_EVENT_BYTES) {
+      if (bufferedBytes > MAX_EVENT_BYTES) {
         throw new Error(
           `SSE stream exceeded ${MAX_EVENT_BYTES} bytes without an event boundary; refusing to buffer further`,
         );
@@ -67,8 +81,14 @@ export async function* readSse(
       for (;;) {
         const boundary = findBoundary(buffer);
         if (boundary === undefined) break;
+        const consumedLength = boundary.index + boundary.length;
         const raw = buffer.slice(0, boundary.index);
-        buffer = buffer.slice(boundary.index + boundary.length);
+        const consumed = buffer.slice(0, consumedLength);
+        buffer = buffer.slice(consumedLength);
+        // Re-encoding only the piece just consumed (bounded by one event's
+        // size, not the whole stream) to keep `bufferedBytes` an accurate
+        // count of what remains unresolved.
+        bufferedBytes -= encoder.encode(consumed).length;
 
         const parsed = parseEvent(raw);
         if (parsed !== undefined) yield parsed;

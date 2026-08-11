@@ -240,9 +240,40 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       throw new HttpError(400, `invalid query: ${formatIssues(query.error)}`);
     }
 
-    // Deliberately no existence check on the run first: `readReport` resolves
-    // the path against the run directory and rejects anything that escapes it,
-    // which is the check that actually matters here (NFR-1).
+    // The run IS loaded first, and that reverses an earlier decision worth
+    // recording. The old comment here said an existence check was unnecessary
+    // because `readReport` rejects any path escaping the run directory, "which
+    // is the check that actually matters". Containment was never the only thing
+    // that mattered: it makes the run directory the boundary, and the run
+    // directory holds `run.json`, the `logs/*.jsonl` replay records, and
+    // `workspace/` — which is where NFR-1 deliberately puts the output of an
+    // agent nobody trusts. All three were served in full through this route on
+    // request. On a loopback server with no authentication (NFR-6) that is a
+    // read-any-file-in-any-run primitive, reachable by anything that can make
+    // an HTTP request from this machine.
+    //
+    // So the rule is now "a file this run declares as a report", not "a file
+    // inside this run's directory". Matching against `reportPath` rather than
+    // against the plan's `deliverable` is the stricter of the two readings and
+    // the right one: `reportPath` is set only once an assignment has actually
+    // succeeded and written its file, so a path that was merely *planned* is
+    // not servable either.
+    const run = await loadRun(deps, runId);
+    const declared = new Set<string>(
+      run.assignments
+        .map((assignment) => assignment.reportPath)
+        .filter((reportPath): reportPath is string => reportPath !== undefined),
+    );
+    if (run.reportPath !== undefined) declared.add(run.reportPath);
+
+    if (!declared.has(query.data.path)) {
+      // 404, not 403: whether some other file exists inside this run directory
+      // is not something an unauthenticated caller should be able to probe, and
+      // a distinguishable "forbidden" would answer exactly that question. The
+      // message names no path for the same reason.
+      throw new HttpError(404, `run "${runId}" has no report at that path`);
+    }
+
     return readReport(deps, runId, query.data.path);
   });
 
@@ -503,17 +534,20 @@ function parseRunId(params: unknown): string {
 /**
  * Load a run, answering 404 when it cannot be read.
  *
- * Any load failure becomes a 404 carrying the store's own message. That message
- * distinguishes "no such directory" from "run.json does not match the schema",
- * so collapsing both into one status costs nothing diagnostically — and the
- * alternative, sniffing errno out of a wrapped error, is the kind of guess that
- * breaks the first time a store implementation changes.
+ * Any load failure becomes a 404. It used to carry the store's own message —
+ * useful, because that message distinguishes "no such directory" from
+ * "run.json does not match the schema" — but `fileStore.ts`'s message is
+ * `cannot read run state at ${absolute path}: ...`, and `describe(error)` was
+ * forwarding that verbatim into the HTTP body. `GET /api/runs/<unknown-id>`
+ * was handing back the runs root's full filesystem path, Windows username
+ * included, to whoever asked. Same discipline as {@link readReport} below:
+ * report that the run was not found, never the path the store tried.
  */
 async function loadRun(deps: ServerDeps, runId: string): Promise<RunState> {
   try {
     return await deps.supervisor.getRunState(runId);
-  } catch (error) {
-    throw new HttpError(404, `run "${runId}" not found: ${describe(error)}`);
+  } catch {
+    throw new HttpError(404, `run "${runId}" not found`);
   }
 }
 

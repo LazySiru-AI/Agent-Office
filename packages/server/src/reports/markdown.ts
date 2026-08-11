@@ -111,6 +111,31 @@ import { Marked, type Token, type Tokens } from 'marked';
  * shown as preformatted text (still safe, per the HTML-escaping rule above)
  * and `extractHeadingOutline` falls back to an empty outline — a report
  * without a table of contents is a minor loss; a run without a PDF is not.
+ *
+ * ## Pathological emphasis runs are bounded before lexing, not caught after
+ *
+ * `marked`'s emphasis tokenizer recurses over a run of consecutive `*`/`_`
+ * markers trying every split point, and a long enough run (`n` asterisks,
+ * one letter, `n` more asterisks) makes that recursion throw `RangeError:
+ * Maximum call stack size exceeded`. The try/catch above already stops that
+ * from crashing anything, but the time spent *reaching* the throw is not
+ * bounded by the catch: measured at 0.5s for 5,000 markers and 12s for
+ * 80,000. That is squarely in the range of real LLM output (a model
+ * emitting bullet markers with no spacing between them gets there), and
+ * every appendix is rendered separately, so a handful of agents each doing
+ * this compound directly into a stalled `designing` step. "Never throws"
+ * was never the actual requirement; "never blocks the run for seconds" is,
+ * and a catch block cannot deliver that no matter how fast it fires.
+ *
+ * So the shape is made impossible before either lexer ever sees it:
+ * {@link boundEmphasisRuns} backslash-escapes any run of
+ * {@link PATHOLOGICAL_RUN_THRESHOLD} or more consecutive identical emphasis
+ * markers, which `marked` then reads as that many literal characters (same
+ * as any other escaped punctuation) instead of a chain of markers to
+ * recurse over. No legitimate report needs anywhere near that many
+ * consecutive markers (`***bold italic***` needs three), so nothing but the
+ * pathological shape is affected, and the underlying regex (a bounded
+ * backreference repetition, no nested quantifiers) is itself linear-time.
  */
 
 /** See "Heading levels are shifted, capped at h6" above. */
@@ -118,6 +143,28 @@ const HEADING_SHIFT = 2;
 
 /** HTML defines no level past this. */
 const MAX_HEADING_LEVEL = 6;
+
+/**
+ * More consecutive identical emphasis markers than any legitimate markdown
+ * ever nests (`***bold italic***` needs three). See "Pathological emphasis
+ * runs are bounded before lexing" above.
+ */
+const PATHOLOGICAL_RUN_THRESHOLD = 32;
+
+/** Matches a run of `PATHOLOGICAL_RUN_THRESHOLD` or more identical `*`/`_` characters. */
+const EMPHASIS_RUN_PATTERN = new RegExp(`([*_])\\1{${PATHOLOGICAL_RUN_THRESHOLD - 1},}`, 'g');
+
+/**
+ * Neutralise a pathologically long run of emphasis markers before either
+ * lexer sees it, by escaping each marker in the run. See "Pathological
+ * emphasis runs are bounded before lexing" above for why this exists and why
+ * escaping (rather than truncating or dropping) is the right degradation:
+ * the reader still sees every character the report contained, just as
+ * literal punctuation instead of triggering emphasis parsing.
+ */
+function boundEmphasisRuns(md: string): string {
+  return md.replace(EMPHASIS_RUN_PATTERN, (run) => run.replace(/[*_]/g, '\\$&'));
+}
 
 /** One entry in a report's heading structure, for an optional table of contents. */
 export interface HeadingOutlineEntry {
@@ -158,7 +205,8 @@ export function renderMarkdown(md: string): string {
 export function extractHeadingOutline(md: string): HeadingOutlineEntry[] {
   try {
     if (md.trim() === '') return [];
-    const tokens = new Marked({ gfm: true, breaks: false, pedantic: false }).lexer(md);
+    const bounded = boundEmphasisRuns(md);
+    const tokens = new Marked({ gfm: true, breaks: false, pedantic: false }).lexer(bounded);
     return computeHeadingOutline(tokens);
   } catch (error) {
     console.warn(
@@ -171,6 +219,11 @@ export function extractHeadingOutline(md: string): HeadingOutlineEntry[] {
 
 function renderMarkdownOrThrow(md: string): string {
   if (md.trim() === '') return '';
+
+  // See "Pathological emphasis runs are bounded before lexing" above: this
+  // must happen before `marked.lexer` runs, not in the catch below — the
+  // whole point is to avoid the slow path, not shorten how it fails.
+  const bounded = boundEmphasisRuns(md);
 
   // Populated once tokens exist, read by the `heading` renderer below. A
   // fresh instance and fresh closure state per call is what keeps this
@@ -245,7 +298,7 @@ function renderMarkdownOrThrow(md: string): string {
     },
   });
 
-  const tokens = marked.lexer(md);
+  const tokens = marked.lexer(bounded);
   outline = computeHeadingOutline(tokens);
   return marked.parser(tokens);
 }

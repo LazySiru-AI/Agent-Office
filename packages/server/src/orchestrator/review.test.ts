@@ -236,6 +236,34 @@ describe('decideRevision', () => {
       expect(decision).toEqual({ redispatch: false, refusedBecause: 'target-not-revisable' });
     },
   );
+
+  it('refuses with concurrent-revision when another redispatch for the same target is already claimed, even though the target itself still looks perfectly revisable', () => {
+    // This is the single-flight guard's decision surface (dispatcher.ts's
+    // `applyReviewVerdict`): two reviewers of one target can both call this
+    // function while `target.status` still reads `done` and `attempts` is
+    // still within budget — from the target's own state alone, both look like
+    // a legitimate first revision. `concurrentRevisionInFlight` is what tells
+    // the loser the truth: someone else already claimed this target.
+    const target = makeAssignment({ id: 'target', status: 'done', attempts: 1 });
+    const decision = decideRevision({
+      reviewer: reviewerOf('target'),
+      outcome: { verdict: 'revisions_requested', critique: 'Also wrong.' },
+      target,
+      concurrentRevisionInFlight: true,
+    });
+    expect(decision).toEqual({ redispatch: false, refusedBecause: 'concurrent-revision' });
+  });
+
+  it('ignores the concurrency claim when it is false, behaving exactly as before (backward compatibility)', () => {
+    const target = makeAssignment({ id: 'target', status: 'done', attempts: 1 });
+    const decision = decideRevision({
+      reviewer: reviewerOf('target'),
+      outcome: { verdict: 'revisions_requested', critique: 'Fix the thing.' },
+      target,
+      concurrentRevisionInFlight: false,
+    });
+    expect(decision).toEqual({ redispatch: true });
+  });
 });
 
 describe('buildRevisionNote', () => {

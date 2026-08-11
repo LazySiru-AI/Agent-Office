@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { AGENT_CATEGORIES } from '@agent-office/shared';
 import {
   RegistryLoadError,
@@ -40,6 +40,22 @@ const EXPECTED_CATEGORIES: string[] = [...AGENT_CATEGORIES];
  * commit as the files themselves.
  */
 const EXPECTED_AGENT_COUNT = 156;
+
+/**
+ * These tests read the real catalog — 156 markdown files parsed with a real
+ * YAML parser, off a real disk that a virus scanner is also interested in.
+ * A measurement pass over five full-suite runs showed one of them at 5,021ms
+ * against vitest's 5,000ms default: not slow work, but work whose duration is
+ * dominated by contention with the ~1,000 other tests running around it, and
+ * therefore not something a fixed default sized for pure-computation tests can
+ * accommodate.
+ *
+ * A different reason and so a different number from `http/fixtures.ts`'s
+ * `SLOW_RUN_TIMEOUT_MS`: nothing here waits on a run, so there is no poller to
+ * fire first with a better message, and a hang would mean a stuck filesystem
+ * call. 20s is roughly 4x the worst observation.
+ */
+vi.setConfig({ testTimeout: 20_000 });
 
 function agentFile(name: string, description: string, extra: string[] = []): string {
   return [

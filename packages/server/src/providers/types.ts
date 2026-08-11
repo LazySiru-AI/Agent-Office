@@ -32,6 +32,28 @@ export interface AgentRunRequest {
   workspaceDir: string;
   /** Aborted on cancel or timeout (FR-M8, FR-M9). Providers must honour it. */
   signal: AbortSignal;
+
+  /**
+   * The agent's catalog `model:` frontmatter, verbatim — `sonnet`, `haiku` or
+   * `inherit` are the only values the vendored catalog uses, and 8 of the 156
+   * agents omit it entirely.
+   *
+   * Deliberately the catalog's own vocabulary rather than a resolved API model
+   * id, because there is no single id these words map to: `sonnet` names a
+   * concrete model to the Anthropic API, is a first-class alias to the Claude
+   * Code CLI, and means nothing at all to OpenAI or DeepSeek. Resolving it here
+   * would force this seam to pick one provider's naming, which is the exact
+   * coupling the seam exists to prevent. Each adapter resolves it in the way its
+   * own engine can, and says so when it cannot.
+   *
+   * `inherit` is a catalog convention meaning "whatever the run is using", not a
+   * model name — never send it to an engine.
+   *
+   * An explicit provider-level model (the `--model` flag, or the settings panel)
+   * outranks this: it is a direct instruction about this run, whereas the
+   * frontmatter is the catalog's standing default for the agent.
+   */
+  model?: string;
 }
 
 export interface ProviderAvailability {

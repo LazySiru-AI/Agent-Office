@@ -239,6 +239,79 @@ describe('AnthropicProvider — a plain text turn', () => {
 });
 
 // ---------------------------------------------------------------------------
+// The "at least one text event" contract (types.ts)
+// ---------------------------------------------------------------------------
+
+describe('AnthropicProvider — the empty-turn contract guard', () => {
+  it('still emits a text event carrying an empty chunk when a turn ends with no content blocks at all', async () => {
+    // The exact shape the reviewer fed in: message_start -> message_delta ->
+    // message_stop, no content_block_* events whatsoever. Nothing upstream
+    // of `run` guarantees a turn produces text, so without this guard the
+    // run completes having yielded only a usage event, breaking the
+    // documented contract ("must emit at least one text event carrying the
+    // agent's final answer").
+    const body =
+      sseFrame('message_start', {
+        type: 'message_start',
+        message: { id: 'msg_1', role: 'assistant', content: [], usage: { input_tokens: 10, output_tokens: 0 } },
+      }) +
+      sseFrame('message_delta', {
+        type: 'message_delta',
+        delta: { stop_reason: 'end_turn', stop_sequence: null },
+        usage: { output_tokens: 0 },
+      }) +
+      sseFrame('message_stop', { type: 'message_stop' });
+
+    const fake = await startFakeAnthropic([sseResponse(body)]);
+    try {
+      const events = await collect(providerAgainst(fake.url, NO_TOOLS), makeRequest());
+
+      const text = events.filter((e): e is Extract<AgentEvent, { t: 'text' }> => e.t === 'text');
+      expect(text).toEqual([{ t: 'text', assignmentId: 'a1', chunk: '' }]);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reporting a run-wide model override (defect 6 coverage — resolveAgentModel
+// itself is covered exhaustively in apiConfig.test.ts; this proves the
+// adapter actually surfaces what that function returns).
+// ---------------------------------------------------------------------------
+
+describe('AnthropicProvider — reporting a run-wide model override', () => {
+  it('yields exactly one non-fatal error event when a run-wide model overrides the agent catalog model, and still completes the run normally', async () => {
+    const fake = await startFakeAnthropic([sseResponse(plainTurnSse(['ok'], { input: 5, output: 1 }))]);
+    try {
+      const provider = new AnthropicProvider({
+        model: 'claude-opus-5',
+        deps: {
+          createTools: NO_TOOLS,
+          env: { ANTHROPIC_API_KEY: 'sk-ant-test-key-not-a-real-secret', ANTHROPIC_BASE_URL: fake.url },
+        },
+      });
+      const events = await collect(provider, makeRequest({ model: 'sonnet' }));
+
+      const warnings = events.filter((e) => e.t === 'error' && !e.fatal);
+      expect(warnings).toHaveLength(1);
+      const message = warnings[0]?.t === 'error' ? warnings[0].message : '';
+      expect(message).toContain('sonnet');
+      expect(message).toContain('claude-opus-5');
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'ok')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+
+      const sent = SentBodySchema.parse(fake.requests[0]?.body);
+      expect(sent.model).toBe('claude-opus-5');
+    } finally {
+      await fake.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Chunk boundaries
 // ---------------------------------------------------------------------------
 

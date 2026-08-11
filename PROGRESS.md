@@ -13,9 +13,16 @@ written, not executed) · **blocked** · **not started**.
 | 3 — Web shell + live wiring | **done** | yes |
 | 4 — Pixel office sim | **done** | yes |
 | 5 — Designer step + PDF export | **done** | yes |
-| 6 — Domain breadth | not started | — |
-| 7 — Provider expansion + polish | not started | — |
-| 8 — Dark neon terminal interface | not started | — |
+| 6 — Domain breadth | **done** — routing untested, no model has planned anything | yes |
+| 7 — Provider expansion + polish | **built, unverified** — no key, no sign-in | yes |
+| 8 — Dark neon terminal interface | **done** | yes |
+| QA pass — five-reviewer audit | in progress | — |
+
+This table went stale for three phases while the per-phase entries below it were
+kept current — 6, 7 and 8 were all committed while it still read "not started".
+Worth a moment's thought, because it is the same failure the QA pass below found
+everywhere else in the project: a summary that nobody re-derives drifts from the
+detail it summarises, and the summary is what people read.
 
 Each phase commit's subject starts with `Phase N:`, so to find one:
 
@@ -1122,3 +1129,114 @@ anything more puts a credential one screenshot from being shared.
 - No cost ceiling for the HTTP providers.
 - SQLite not adopted: the plan made it conditional on JSON-on-disk hurting, and
   at thirty runs it does not.
+
+---
+
+## QA pass — five reviewers against the whole codebase
+
+Not a phase. Every phase had been declared done by the same person who built
+it, which is the arrangement most likely to miss things, so five reviewers were
+turned loose on a frozen tree with one instruction: find defects, fix nothing,
+and mark every finding CONFIRMED (executed and observed) or PLAUSIBLE (reasoned
+from reading). That distinction is the reason this entry can be specific.
+
+They found **29 defects, 21 of them executed**. The eight worst had all shipped
+in phases marked done.
+
+### What the split found that the builder had not
+
+The five areas were providers, orchestrator, security, web/contracts, and the
+test suite itself. The last of those was the most uncomfortable and the most
+valuable: a reviewer whose only job is to distrust the tests found that the
+green suite had been green for the wrong reasons in several places.
+
+The pattern across all five is worth naming, because it is not "these are hard
+problems". Nearly every defect was a **boundary that was checked in one place
+and assumed in another**:
+
+- The tool allowlist was enforced when the menu was printed and again — after
+  Phase 7's fix — when food was served, but `schemas()` still trusted its own
+  argument rather than the constructor's.
+- Path containment made the RUN DIRECTORY the boundary, and then `run.json`,
+  the replay logs and the untrusted-agent `workspace/` all sat inside it.
+- A 404 helper was carefully written not to leak a filesystem path, and its
+  sibling twenty lines away leaked one.
+- The token budget was called a per-run budget and scoped to dispatch.
+- `providerFor` was documented as forwarded and was not forwarded.
+
+### The eight that mattered most
+
+1. **Two reviewers of one target crashed the whole run.** `decideRevision`
+   checked `target.status !== 'done'` with nothing serialising the check against
+   the mutation, so two reviewers over one lead — the shape of `manager.ts`'s
+   own worked example — could both decide to redispatch. The second's
+   `briefing -> briefing` is illegal, `setStatus` threw, and the throw escaped
+   `runPool`'s `Promise.all` into `executeRun`'s catch, failing the run and
+   discarding every completed report. Reproduced 4 times in 8 against the real
+   `FileRunStore`; ordinary Windows filesystem latency is enough. Fixed with a
+   single-flight claim taken across a synchronous stretch, and the losing
+   reviewer refused through the existing non-fatal event path.
+2. **One `Grep` call froze the server.** `MAX_GREP_MS` was checked between files
+   and lines; a synchronous `regex.test()` cannot be interrupted by anything
+   checked around it. `^(a+)+$` against 41 characters ran past 120 seconds. Now
+   refused before compilation. The first fix covered only the nested-quantifier
+   spelling — `(a|a)*` still hung past 25 seconds and `(a|aa)+` took 6.2 — so
+   the gate also compares the first token of each alternative. Its remaining
+   holes are enumerated on the function rather than left to be discovered.
+3. **A report path could overwrite the run's own state, and be read back over
+   HTTP.** `deliverable` was `z.string().min(1)`; the `reports/…` shape lived
+   only in the prompt. A plan naming `run.json` overwrote it. The read side
+   served `run.json`, `workspace/` and the logs verbatim over an unauthenticated
+   loopback route. The schema now constrains the write; the route now serves only
+   what the run declares as a report.
+4. **The cost display had never worked for a real provider.** `effectiveModelFor`
+   substituted the provider id where the pricing table is keyed by catalog
+   model, so every real provider failed the lookup and the header said "partial
+   — some agents have no priced model" when every model was priced. Invisible
+   until now only because no run has ever used a real provider.
+5. **`maxCostUsd` was unreachable from any real run.** Both the supervisor and
+   the run CLI call `makeProvider` with no options; the wire schema has no cost
+   field. FR-M8's spend cap existed, was tested, and could not be switched on.
+6. **Manager spend escaped the run token budget** — measured at 645 tokens
+   against a 400 budget — and the doc comment defending the split was the root
+   cause rather than an aside.
+7. **Replay had no record of the Manager at all.** Four events streamed live,
+   zero persisted, for the two turns that on a small run outspend the team.
+8. **A restart stranded every live run**, which is half of what NFR-2 promises.
+
+### The test suite was measured, not trusted
+
+Phase 7 gave three slow tests an explicit 20s timeout. They kept failing, and
+the reason is the sort of thing only a dedicated pass finds: `waitForTerminal`
+carried its own hardcoded 10s ceiling and **no call site overrode it**, so the
+raised budget changed the error message and nothing else. A fourth test with
+identical work never got the marker at all and failed in 5 runs out of 5.
+
+Both are now one exported constant beside the helper it bounds, with the poller
+deliberately below the vitest budget so the informative failure wins the race.
+Budgets came from five measured full-suite runs rather than from taste.
+
+One test was found that could not fail: the sim's status-coverage check built
+its list of statuses from the very map it was checking for completeness.
+
+### Verified
+
+- **1,178 tests pass, 4 skipped, across three consecutive full runs**; typecheck
+  clean in all three workspaces. Up from 1,006.
+- The 4 skips are unchanged: Windows symlink-escape tests that skip loudly.
+- Six new test files for modules that had none, including `costModel.ts` and
+  `deliverable.ts` — which is how defect 4 survived this long.
+
+### Known gaps carried forward
+
+- **The ReDoS gate is a static check and cannot be complete.** Alternatives that
+  overlap without sharing a first character still get through. The only total
+  fix is matching inside something killable.
+- **`maxCostUsd` is reachable only from the single-agent script.** The plumbing
+  through the wire contract and the supervisor is not done.
+- Two reviewers were cut short by a session limit and resumed; the test-suite
+  reviewer did not reach requirement-to-test mapping or a shuffled-order run.
+- `socket.ts`, `useRun.ts` and `api.ts` still have no tests.
+- A cancelled assignment is recorded as `failed`, because `status.ts` offers no
+  terminal state that means "stopped". An imperfect fit, documented where it is
+  made.

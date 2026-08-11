@@ -111,8 +111,27 @@ export type RunState = z.infer<typeof RunStateSchema>;
 /**
  * Everything the run actually spent: assignments plus the Manager's own turns.
  *
- * This is the number to show a user (NFR-5). {@link totalUsage} deliberately
- * excludes the Manager because the dispatcher's budget is about dispatch.
+ * This is the number to show a user (NFR-5), and it is also what
+ * `dispatcher.ts`'s `enforceTokenBudget` checks FR-M8's per-run token budget
+ * against. It was not always the latter: the budget used to be checked with
+ * {@link totalUsage} alone, on the reasoning that "the dispatcher's budget is
+ * about dispatch". That reasoning was itself the bug, not a justification for
+ * one — FR-M8 says "per-run token budget", and a user who sets a limit means
+ * the whole run, not the slice of it the dispatcher happens to own. Measured
+ * before the fix: `runTokenBudget: 400`, 225 tokens of assignment spend, 420
+ * tokens of Manager spend — 645 true total, 61% over — and the run never
+ * halted, because 225 alone never crossed 400.
+ *
+ * The two components are not equally reachable by a dispatch-time check,
+ * which matters for what this guarantees. Manager *planning* spend is banked
+ * into `run.managerUsage` before dispatch begins, so it counts from the very
+ * first budget check `enforceTokenBudget` makes — an oversized planning turn
+ * alone can now halt a run before a single assignment is dispatched. Manager
+ * *synthesis* spend, by contrast, happens after dispatch has already finished
+ * and returned, so no check made during dispatch — this one included — can
+ * ever pre-empt it. A run can therefore still finish having spent more than
+ * its budget once synthesis is counted; that is an inherent limit of checking
+ * the budget during dispatch, not a gap this function could close.
  */
 export function runTotalUsage(run: RunState): Usage {
   const assignments = totalUsage(run);
@@ -123,7 +142,16 @@ export function runTotalUsage(run: RunState): Usage {
   };
 }
 
-/** Sum of every assignment's usage. Scopes the dispatch token budget (FR-M8). */
+/**
+ * Sum of every assignment's usage, excluding the Manager's own planning and
+ * synthesis turns.
+ *
+ * No longer what FR-M8's dispatch budget is checked against — see
+ * {@link runTotalUsage}'s doc comment for why that changed. Kept as its own
+ * function because some callers legitimately want the assignments-only
+ * figure (e.g. a per-assignment cost breakdown, or a test asserting the two
+ * totals actually differ), not because dispatch still scopes to it.
+ */
 export function totalUsage(run: RunState): Usage {
   return run.assignments.reduce<Usage>(
     (acc, assignment) => ({

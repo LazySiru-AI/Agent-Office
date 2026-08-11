@@ -75,7 +75,16 @@ describe('foldEvents (NFR-7 replay, NFR-5 cost mid-replay)', () => {
 
   it('sets startedAt/endedAt from the first non-pending and first terminal status event', () => {
     const run = baseRun([assignment('a1')]);
-    const events = [statusEvent(100, 'a1', 'briefing'), statusEvent(400, 'a1', 'done')];
+    // A legal full path (pending -> briefing -> working -> reporting -> done)
+    // — see the "impossible transition" tests below for why a shortcut like
+    // `briefing -> done` no longer stands in for one, now that the fold
+    // checks `canTransitionAssignment`.
+    const events = [
+      statusEvent(100, 'a1', 'briefing'),
+      statusEvent(150, 'a1', 'working'),
+      statusEvent(180, 'a1', 'reporting'),
+      statusEvent(400, 'a1', 'done'),
+    ];
 
     const result = foldEvents(run, events, 1000);
     const a1 = result.assignments[0];
@@ -85,7 +94,13 @@ describe('foldEvents (NFR-7 replay, NFR-5 cost mid-replay)', () => {
 
   it('approximates reportPath from `deliverable` when status becomes done, per dispatcher.ts (documented approximation)', () => {
     const run = baseRun([assignment('a1')]);
-    const events = [statusEvent(100, 'a1', 'done')];
+    // Legal path to `done` — see the note on the previous test.
+    const events = [
+      statusEvent(50, 'a1', 'briefing'),
+      statusEvent(70, 'a1', 'working'),
+      statusEvent(90, 'a1', 'reporting'),
+      statusEvent(100, 'a1', 'done'),
+    ];
     const result = foldEvents(run, events, 100);
     expect(result.assignments[0]?.reportPath).toBe('reports/a1.md');
   });
@@ -146,14 +161,17 @@ describe('foldEvents (NFR-7 replay, NFR-5 cost mid-replay)', () => {
 
   it('is not corrupted by out-of-order or duplicate-timestamp events', () => {
     const run = baseRun([assignment('a1')]);
+    // A legal path to `done` (see the "impossible transition" tests below) —
+    // the duplicate-ts pairs are what this test is actually about.
     const sorted: LoggedAgentEvent[] = [
       statusEvent(100, 'a1', 'briefing'),
       usageEvent(100, 'a1', 5, 1), // duplicate ts with the event above
       statusEvent(200, 'a1', 'working'),
       usageEvent(200, 'a1', 5, 1), // duplicate ts again
+      statusEvent(250, 'a1', 'reporting'),
       statusEvent(300, 'a1', 'done'),
     ];
-    const shuffled = [sorted[4], sorted[1], sorted[3], sorted[0], sorted[2]].filter(
+    const shuffled = [sorted[5], sorted[1], sorted[3], sorted[0], sorted[4], sorted[2]].filter(
       (e): e is LoggedAgentEvent => e !== undefined,
     );
 
@@ -164,18 +182,88 @@ describe('foldEvents (NFR-7 replay, NFR-5 cost mid-replay)', () => {
     expect(fromSorted.assignments[0]?.usage).toEqual({ inputTokens: 10, outputTokens: 2 });
   });
 
+  it('does not double-count usage when the exact same logged entry appears twice (duplicate log line)', () => {
+    // A crash mid-append (or a retry) can leave the same `{ts, event}` JSON
+    // written twice into the `.jsonl` log. Feeding foldEvents that literal
+    // duplicate must not double the token count it folds into NFR-5's cost
+    // figure — see the file header's "Duplicate log lines" note.
+    const run = baseRun([assignment('a1')]);
+    const line = usageEvent(100, 'a1', 100, 50);
+    const events: LoggedAgentEvent[] = [line, { ...line, event: { ...line.event } }];
+
+    const result = foldEvents(run, events, 999);
+    expect(result.assignments[0]?.usage).toEqual({ inputTokens: 100, outputTokens: 50 });
+  });
+
+  it('also collapses two separately-emitted usage events that happen to be byte-identical (the accepted trade-off of exact-entry dedupe)', () => {
+    // This pins the known limitation documented in the file header: because
+    // there is no idempotency key to tell "the same line, twice" apart from
+    // "two different emissions that happen to match", a genuinely legitimate
+    // repeat (same assignment, same millisecond, same token counts) is
+    // indistinguishable from a duplicated log line and gets collapsed too.
+    // A value-based fold would total 20/10 here; exact-entry dedupe totals
+    // 10/5. If this assertion ever needs to change, the trade-off note in
+    // useReplay.ts needs to change with it, not just this test.
+    const run = baseRun([assignment('a1')]);
+    const events: LoggedAgentEvent[] = [usageEvent(100, 'a1', 10, 5), usageEvent(100, 'a1', 10, 5)];
+
+    const result = foldEvents(run, events, 999);
+    expect(result.assignments[0]?.usage).toEqual({ inputTokens: 10, outputTokens: 5 });
+  });
+
+  it('ignores a status transition impossible per canTransitionAssignment, rather than applying it blindly', () => {
+    // `done -> working` is not in shared/src/status.ts's transition table
+    // (only `done -> briefing`, the FR-M10 revision edge, is). Before this
+    // guard, the fold applied it anyway: status flipped to 'working' while
+    // `endedAt` — set once, by design, on the first terminal status — was
+    // never cleared, producing a `{status: 'working', endedAt: <set>}`
+    // combination the live orchestrator can never emit.
+    const run = baseRun([assignment('a1')]);
+    const events: LoggedAgentEvent[] = [
+      statusEvent(50, 'a1', 'briefing'),
+      statusEvent(70, 'a1', 'working'),
+      statusEvent(90, 'a1', 'reporting'),
+      statusEvent(100, 'a1', 'done'),
+      statusEvent(200, 'a1', 'working'), // impossible: canTransitionAssignment('done', 'working') is false
+    ];
+
+    const result = foldEvents(run, events, 999);
+    const a1 = result.assignments[0];
+    expect(a1?.status).toBe('done'); // the illegal entry is dropped; last known-good status holds
+    expect(a1?.endedAt).toBe(100); // stays coherent with a terminal status, not left dangling
+  });
+
+  it('still applies the FR-M10 revision edge (done -> briefing), the one legal escape from a terminal status', () => {
+    // Guards against the transition check above becoming too strict and
+    // rejecting the one edge shared/src/status.ts explicitly permits.
+    const run = baseRun([assignment('a1')]);
+    const events: LoggedAgentEvent[] = [
+      statusEvent(50, 'a1', 'briefing'),
+      statusEvent(70, 'a1', 'working'),
+      statusEvent(90, 'a1', 'reporting'),
+      statusEvent(100, 'a1', 'done'),
+      statusEvent(200, 'a1', 'briefing'), // legal: canTransitionAssignment('done', 'briefing') is true
+    ];
+
+    const result = foldEvents(run, events, 999);
+    expect(result.assignments[0]?.status).toBe('briefing');
+  });
+
   it('ignores events referencing an unknown assignment id rather than throwing', () => {
     const run = baseRun([assignment('a1')]);
     const events: LoggedAgentEvent[] = [
       statusEvent(100, 'ghost-assignment', 'working'),
       usageEvent(100, 'ghost-assignment', 999, 999),
-      statusEvent(200, 'a1', 'working'),
+      // pending -> briefing: a legal transition, so this test exercises only
+      // the unknown-id branch, not the transition-legality guard tested
+      // separately below.
+      statusEvent(200, 'a1', 'briefing'),
     ];
 
     expect(() => foldEvents(run, events, 999)).not.toThrow();
     const result = foldEvents(run, events, 999);
     expect(result.assignments).toHaveLength(1);
-    expect(result.assignments[0]?.status).toBe('working');
+    expect(result.assignments[0]?.status).toBe('briefing');
     expect(result.assignments[0]?.usage).toEqual({ inputTokens: 0, outputTokens: 0 });
   });
 
