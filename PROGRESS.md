@@ -1608,3 +1608,195 @@ instead of quietly certifying a limitation that no longer exists.
   in place rather than deleted — it is another session's output, and `runs/`
   is gitignored while a repo-root `reports/` is not, which is its own small
   hazard: one `git add -A` from being committed.
+
+---
+
+## Cache-aware pricing
+
+Phase 9 put spend on every desk, which made an existing accuracy problem
+prominent enough to matter: a five-agent run displayed **$23.11**, and the
+figure was roughly an order of magnitude too high.
+
+`Usage` carried a single `inputTokens` total and every price was computed at
+the fresh-input rate. But `totalInputTokens` folds three counters into that
+total — fresh input, cache reads and cache writes — and those are not priced
+alike. Against this repo's own captured run, **44,878 of 67,635 input tokens
+were cache reads**: Anthropic prices a cache read at roughly **0.1x** fresh
+input and a cache write at **1.25x** (the 5-minute TTL; a 1-hour TTL is 2x and
+nothing here requests one). Charging all of it at 1.0x is not a stale-price
+problem, which is what the pricing tables already warn about — it is the wrong
+arithmetic.
+
+### The total stays a total
+
+`inputTokens` still means every input token processed, and the two new
+counters are a **decomposition** of it rather than additions to it:
+
+```
+fresh = inputTokens - cacheReadTokens - cacheWriteTokens
+```
+
+That choice is what makes the change back-compatible in one step. Both
+counters are optional, so a `run.json` or a `.jsonl` line written before they
+existed parses unchanged, reports the same token figure it always did, and —
+with both absent — takes a code path that reduces exactly to the flat
+arithmetic it replaces. A test asserts that equation directly rather than
+trusting it.
+
+The fresh remainder clamps at zero. Counters exceeding the total mean corrupt
+or hand-edited state, and the honest response is not to emit a negative charge
+that quietly offsets the cache buckets.
+
+### One arithmetic, not two
+
+`wire.ts` and `providers/pricing.ts` each carried their own copy of the
+cost calculation. They were identical while both were three lines of
+multiplication, and they were exactly the pair that would diverge the moment
+one learned about cache rates and the other did not. Both now call a single
+`costForUsage`; they differ only in how a model resolves to a price, which is
+the one thing they genuinely disagree about.
+
+The same collapse happened on the accumulation side, and for a sharper reason.
+**Five** places were summing usage by hand — the dispatcher's per-assignment
+accumulator, the runner's Manager accumulator, `totalUsage`, `runTotalUsage`,
+and replay's fold — each spelling out two field additions. Adding the counters
+to four of the five and missing the sixth would have zeroed them on one path,
+and the resulting cost error would have read as a pricing bug rather than a
+dropped field. `addUsage` is now the only way usage is combined.
+
+`addUsage` preserves ABSENCE, which is the subtle part: when neither operand
+reports a split the result carries neither key, so folding an old log yields a
+`Usage` shaped exactly as it was then and therefore priced exactly as it was
+then (NFR-7). One reported counter is enough to keep one, because discarding a
+number an adapter actually measured is worse than carrying a partial one.
+
+### What this does not do
+
+**It does not re-price existing runs, and cannot.** Verified in the browser
+after the change: the same five-agent run still reads $23.11, because its
+`.jsonl` never recorded a split and no amount of arithmetic recovers a number
+that was never written down. The fix is forward-looking — new runs price
+correctly, old ones keep the figure they were given. Re-pricing history would
+require re-reading each run's raw provider logs, which are not retained.
+
+### Verified
+
+- **1,388 tests pass, 4 skipped**; typecheck clean across all three
+  workspaces. Thirteen new tests, including the real capture's own numbers
+  (in=26, cache_read=44,878, cache_write=22,731) asserted end to end.
+- The back-compatibility equation is a test, not a claim: a `Usage` with
+  neither counter costs exactly what the pre-cache implementation charged.
+- Five existing tests asserted the usage event's exact shape and were updated
+  rather than loosened — a reported zero and an absent counter are different
+  claims, and the tests now say which one each frame makes.
+
+---
+
+## Third QA pass — two reviewers in parallel, and a hole in the loopback model
+
+Two reviewers were run concurrently against a tree that had two authors in it:
+one on the web client's Phase 9 work, one on a parallel session's uncommitted
+server changes. Both found things, and the server one found the worst defect
+this project has had.
+
+### The loopback model was open to any web page
+
+`server.ts` had grown a `Host` header allowlist, with a doc comment stating it
+"closes the CSRF hole on `POST /api/runs/:id/cancel`". It does not, and the
+reason is the natural mistake to make about these two headers.
+
+**`Host` is the URL a request was sent TO; `Origin` is the page it came FROM.**
+A page on `evil.example` fetching `http://127.0.0.1:5179/api/runs` sends
+`Host: 127.0.0.1:5179` — a genuinely loopback host, which passes — and names
+itself only in `Origin`, which was computed and then used *solely* to decide
+whether to echo `access-control-allow-origin`. So the allowlist stopped the DNS
+rebinding shape (attacker's name in `Host`) and nothing else.
+
+Reproduced against a running server, twice:
+
+- `GET /api/runs` with `Origin: http://evil.example` returned **200 and the
+  full run list**.
+- `POST /api/runs/:id/cancel` from the same foreign origin returned **200 and
+  actually cancelled a live run**.
+
+A withheld CORS header does not help with either. It is a rule the *browser*
+enforces about what script may READ, and both of the things that matter here
+sit outside it: a bodyless POST is a CORS "simple request", so the side effect
+has already happened by the time any response header is inspected; and `/ws`
+is not subject to the same-origin policy at all, so any open tab could connect
+and receive the whole event stream — run state, log lines, deliverable content.
+
+Under NFR-6 ("no auth, loopback only") `Host` and `Origin` are the *entire*
+defence. A present-but-foreign `Origin` is now refused outright, in the same
+`onRequest` hook, ahead of content-type parsing and every route. An **absent**
+`Origin` still passes, deliberately: curl, the run CLI and the test harness
+send none, and the one browser case that also omits it is DNS rebinding —
+which is what the `Host` check is for. Neither half is redundant.
+
+The tests are the more interesting part of the failure. There was a
+`describe('Host header allowlist (DNS rebinding)')` block with five cases, and
+every one of them varied `Host` while leaving `Origin` alone — so the suite was
+green, thoroughly, against the one axis that was already covered. Five new
+cases pin the other axis, including the forged cancel asserting on the *side
+effect* rather than the status code, and the WebSocket upgrade.
+
+### The design reviewer found geometry nothing was measuring
+
+Phase 9's own `officeText.test.ts` grades what a plate says and whether its
+colours are legible. Nothing graded whether a plate **fits**, and it did not:
+
+- At **1x**, `architect-reviewer` renders **99px wide into a 64px column gap**,
+  and a four-line verbose plate is **78px tall into a 64px row gap**. Both run
+  across a neighbouring desk.
+- At **2x** both fit comfortably — which is why every manual look at the office
+  missed it. A one- or two-row team gets 2x; three rows falls back to 1x. The
+  overlap appears on precisely the runs with the most plates to draw.
+
+The root cause is a deliberate design decision meeting its consequence: plates
+render in an **unscaled** overlay so text stays crisp at any zoom, while the
+gaps they must fit into are **scaled**. `fitPlateLines` now trims a plate to
+the box the current viewport actually gives it — truncating each line to the
+available width with an ellipsis, and dropping detail lines that would reach
+the next row. Showing fewer facts is the honest response to having no room for
+them. The name line is never dropped and never degrades to a bare ellipsis.
+
+`scene.ts` mirrors the two desk-spacing constants to size that box, and a test
+measures the real spacing out of `layoutOffice` rather than trusting the copy.
+
+### The focus-reveal was clipped by its own frame
+
+The `visually-hidden-focusable` pattern from the second QA pass revealed the
+office's text alternative by switching it to `position: static`, rejoining the
+flex flow of `.office-canvas` — a 520px box with `overflow: hidden` and
+`align-items: center`. Measured at 12 agents: a **1,206px list inside a 520px
+frame**, centred, so roughly 340px of it was clipped off each end. A keyboard
+user tabbing to the first agent focused a control scrolled out of sight, which
+is the exact failure (WCAG 2.4.7) that class exists to prevent — and Phase 9
+made it worse by lengthening every button's label.
+
+It now fills the host and scrolls internally, so the list can never exceed its
+own scroll box and the browser scrolls a focused child into view for free.
+Verified after the change: 12 agents, 518px, first button fully visible.
+
+A skip link was added ahead of the list for the same reason it was missing —
+one focus stop per agent with no cap meant a keyboard user heading for the
+activity log tabbed through the entire office first (WCAG 2.4.1).
+
+### Verified
+
+- **1,403 tests pass, 4 skipped**; typecheck clean across all three
+  workspaces. Up from 1,388.
+- The security fix is confirmed end to end against a running server: a foreign
+  origin now gets 403, the dev server's own loopback origin still gets 200, and
+  a request with no Origin at all still gets 200.
+- Ten new geometry tests, five new same-origin tests.
+
+### Reviewed and found clean
+
+The parallel session's `windowsSpawn.ts` was independently verified rather than
+taken on trust, including a real `.cmd` spawn on this machine: it works around
+Node ≥20.12.2 throwing on `spawn('claude.cmd')` by routing through `cmd.exe`
+with per-token quoting, and **refuses** rather than escapes the characters a
+batch shim would re-parse (`" % ! ^ & | < >`). That is the right call —
+escaping is unsound in the general case (BatBadBut/CVE-2024-24576) — and the
+injection attempt is refused before any process starts.

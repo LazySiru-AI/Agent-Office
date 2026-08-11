@@ -76,6 +76,16 @@ function OfficeTextAlternative({
   return (
     <div className="visually-hidden visually-hidden-focusable office-alt">
       <h3 id="office-alt-heading">Office floor</h3>
+      {/* WCAG 2.4.1 (Bypass Blocks). This list is one focus stop per agent and
+          nothing caps it — `layoutOffice` lays out beyond 12 quite happily — so
+          a keyboard user heading for the activity log below had to tab through
+          every desk first. The skip link is the first thing in the group, so
+          the cost of stepping over the whole office is one keypress. */}
+      {characters.length > 1 && (
+        <a className="office-alt-skip" href="#office-alt-end">
+          Skip the {characters.length} agents on the floor
+        </a>
+      )}
       {characters.length === 0 ? (
         // `.office-empty` has existed in the stylesheet since Phase 4 and was
         // referenced by nothing: the host div was rendered unconditionally, so
@@ -107,6 +117,9 @@ function OfficeTextAlternative({
           ))}
         </ul>
       )}
+      {/* The skip link's destination. `tabIndex={-1}` so it can receive
+          programmatic focus from the jump without becoming its own tab stop. */}
+      <span id="office-alt-end" tabIndex={-1} />
     </div>
   );
 }

@@ -461,3 +461,75 @@ export function plateLines(view: CharacterView, density: PlateDensity): string[]
 
   return lines;
 }
+
+/**
+ * Monospace advance width as a fraction of font size.
+ *
+ * Measured against the stack the plate actually renders in rather than taken
+ * from a table: `architect-reviewer` is 99px at 10px (5.5px/char) and
+ * `run default` is 48px at 8px (4.36px/char), so real advances sit around
+ * 0.44–0.55. Rounding UP to 0.6 makes every estimate here slightly wide,
+ * which truncates a shade early — the safe direction, because the failure
+ * being prevented is text from one desk running across its neighbour.
+ */
+const MONO_ADVANCE_RATIO = 0.6;
+
+/** The box one desk plate has to live in, in *screen* pixels. */
+export interface PlateBox {
+  widthPx: number;
+  heightPx: number;
+  /** Font size of the name line; detail lines below it are smaller. */
+  nameSizePx: number;
+  detailSizePx: number;
+  lineHeightPx: number;
+}
+
+/**
+ * Trim a plate to the space it actually has (FR-S10's clutter risk, made
+ * geometric).
+ *
+ * The office draws plates in an UNSCALED overlay so text stays crisp at any
+ * zoom, while the desks they label live in the scaled world. That is the right
+ * call for legibility and it means the room available to a plate halves when
+ * the renderer drops from 2x to 1x — which it does for a three-row team, i.e.
+ * exactly the runs with the most plates to draw. Measured at 1x: an
+ * 18-character agent name is 99px against a 64px column gap, and a four-line
+ * verbose plate is 78px tall against a 64px row gap. Both overlap a neighbour.
+ *
+ * So the plate is fitted rather than assumed to fit:
+ *
+ * - Every line is truncated to the available width, with an ellipsis so the
+ *   reader can see that something was cut rather than misread a shortened
+ *   name as the whole name.
+ * - Detail lines that would not fit vertically are dropped, nearest-the-name
+ *   first. Showing fewer facts is the honest response to having no room for
+ *   them; drawing them over the next row is not.
+ *
+ * The name line is never dropped — a desk with no label is worse than a
+ * truncated one — and it keeps at least one character plus the ellipsis even
+ * in an absurdly narrow box.
+ */
+export function fitPlateLines(lines: readonly string[], box: PlateBox): string[] {
+  const [name = '', ...details] = lines;
+
+  const fitWidth = (text: string, sizePx: number): string => {
+    const advance = sizePx * MONO_ADVANCE_RATIO;
+    if (advance <= 0) return text;
+    const maxChars = Math.floor(box.widthPx / advance);
+    if (text.length <= maxChars) return text;
+    // `maxChars - 1` to leave room for the ellipsis itself; never below one
+    // visible character, or the plate degrades to a bare "…".
+    return `${text.slice(0, Math.max(1, maxChars - 1))}…`;
+  };
+
+  const fitted = [fitWidth(name, box.nameSizePx)];
+
+  // How many detail rows clear the vertical budget. The name occupies the
+  // first row; each detail line costs one `lineHeightPx` below it.
+  const roomForDetails = Math.max(0, Math.floor((box.heightPx - box.nameSizePx) / box.lineHeightPx));
+  for (const line of details.slice(0, roomForDetails)) {
+    fitted.push(fitWidth(line, box.detailSizePx));
+  }
+
+  return fitted;
+}

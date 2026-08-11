@@ -82,16 +82,36 @@ textarea:focus-visible,
 }
 
 /* A visually-hidden control must become visible when focused, or a keyboard
-   user tabs into something they cannot see. */
+   user tabs into something they cannot see.
+ *
+ * `position: absolute; inset: 0` with its own scroll container, rather than
+ * `position: static` rejoining the parent's flow. The static form looked
+ * right and failed on exactly the runs that matter: `.office-canvas` is a
+ * 520px box with `overflow: hidden` and `align-items: center`, so a revealed
+ * list taller than that was clipped symmetrically — measured at 12 agents,
+ * a 1,206px list inside a 520px frame, with the first and last ~340px of it
+ * outside the visible area entirely. A keyboard user tabbing to the first
+ * agent would have focused a control scrolled out of sight, which is the
+ * precise failure (WCAG 2.4.7) the `-focusable` half of this class exists to
+ * prevent.
+ *
+ * Filling the host and scrolling internally fixes it at the root: the list can
+ * never be taller than its own scroll box, and the browser scrolls a focused
+ * child into view for free. The opaque background is not decoration — the
+ * canvas is still painted underneath. */
 .visually-hidden-focusable:focus-within {
-  position: static;
+  position: absolute;
+  inset: 0;
   width: auto;
   height: auto;
   margin: 0;
-  overflow: visible;
+  padding: 0.75rem;
+  overflow-y: auto;
   clip: auto;
   clip-path: none;
   white-space: normal;
+  background: var(--ao-surface);
+  z-index: 1;
 }
 
 /* --- Layout shell --- */

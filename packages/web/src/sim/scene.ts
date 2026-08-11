@@ -1,8 +1,10 @@
 import { Application, Container, Graphics, Sprite, Text, Texture, type Ticker } from 'pixi.js';
 import {
+  fitPlateLines,
   layoutOffice,
   plateLines,
   TILE,
+  type PlateBox,
   type AgentAppearance,
   type CharacterView,
   type DeskSlot,
@@ -388,6 +390,21 @@ const PLATE_LINE_HEIGHT = 9;
  * tell them apart at a glance without learning a second visual vocabulary.
  */
 const HOVER_RING_ALPHA = 0.45;
+/**
+ * Desk spacing, in tiles, mirrored from `layoutOffice`'s own constants.
+ *
+ * Duplicated deliberately and narrowly: `model.ts` keeps these private because
+ * they describe how the grid is BUILT, and this is the one consumer that needs
+ * to know how much room the grid leaves — the gap a plate must fit inside.
+ * `plateGeometry.test.ts` asserts the two stay equal, so the copy cannot drift
+ * silently the way an unwatched duplicate would.
+ */
+const DESK_SPACING_TILES_X = 4;
+const DESK_SPACING_TILES_Y = 4;
+/** Kept clear between two adjacent plates so they never appear to touch. */
+const PLATE_GUTTER_PX = 6;
+/** Kept clear below a plate so it never reaches the next row's desk. */
+const PLATE_VERTICAL_MARGIN_PX = 20;
 /** Cast under a desk whose agent is currently `working` — see `isWorkGlowing`. */
 const WORK_GLOW_COLOUR = toPixiColour(OFFICE.workGlow);
 /** Soft, not solid — a glow that competed with the selection ring or a status
@@ -620,6 +637,14 @@ export class OfficeSceneRenderer {
     }
     if (this.uiLayer !== undefined) {
       this.uiLayer.position.set(this.viewport.offsetX, this.viewport.offsetY);
+    }
+    // Re-fit before repositioning: how much a plate may say depends on
+    // `viewport.scale`, which this method just recomputed. A window resize
+    // that drops the office from 2x to 1x halves the room each plate has, and
+    // without this the previous 2x text would stay on screen and overlap.
+    for (const view of this.latestCharacters) {
+      const state = this.characters.get(view.assignmentId);
+      if (state !== undefined) this.syncPlate(state, view);
     }
     this.repositionNameplates();
   }
@@ -950,8 +975,35 @@ export class OfficeSceneRenderer {
    * usually has not changed. Surplus lines are hidden rather than destroyed
    * for the same reason — a density toggle should not cost a reallocation.
    */
+  /**
+   * The screen-pixel box one plate may occupy, derived from the live viewport.
+   *
+   * Plates render in the UNSCALED `uiLayer`, so their font size is fixed while
+   * the gaps between desks are not: a column gap is `DESK_SPACING_X` tiles of
+   * *world* space, which is `× viewport.scale` on screen. At 2x there is room
+   * for a full plate; at 1x — the fallback for a three-row team — there is
+   * half as much, and an untrimmed plate runs across its neighbours. This is
+   * what `fitPlateLines` is given.
+   *
+   * A margin is held back on each axis so two adjacent plates that both fill
+   * their box still have a visible gutter between them rather than meeting.
+   */
+  private plateBox(): PlateBox {
+    const scale = this.viewport.scale;
+    return {
+      widthPx: Math.max(1, DESK_SPACING_TILES_X * TILE * scale - PLATE_GUTTER_PX),
+      heightPx: Math.max(1, DESK_SPACING_TILES_Y * TILE * scale - PLATE_VERTICAL_MARGIN_PX),
+      nameSizePx: PLATE_NAME_SIZE,
+      detailSizePx: PLATE_DETAIL_SIZE,
+      lineHeightPx: PLATE_LINE_HEIGHT,
+    };
+  }
+
   private syncPlate(state: CharacterRenderState, view: CharacterView): void {
-    const [name = view.agentName, ...details] = plateLines(view, this.plateDensity);
+    const [name = view.agentName, ...details] = fitPlateLines(
+      plateLines(view, this.plateDensity),
+      this.plateBox(),
+    );
 
     if (state.nameplate.text !== name) state.nameplate.text = name;
 
