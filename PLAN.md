@@ -284,6 +284,7 @@ the style.
 | FR-S11 | S | The `working` animation is refined by the current tool — reading tools read, writing tools type — sourced from the `tool` events the adapter already emits. Refines FR-S3; status remains the source of truth for *behaviour*, tool only for which working loop plays. |
 | FR-S12 | S | Hover and **keyboard focus** produce the same character highlight as clicking. The office's text alternative is a real focusable control per agent, so a mouse-only highlight would regress the keyboard access it provides. |
 | FR-S13 | C | User-controlled zoom, at integer steps only — fractional scaling blurs pixel art, which is why the renderer picks whole numbers today. |
+| FR-S14 | M | The office reads as a **room**: a wall it is set against, a floor with a material, and furniture. And the desk at the head of that room is occupied — the **Manager** is a character, drawn at the top-centre desk, animating from the run's own status. The office has drawn that desk empty since Phase 4, which left its central interaction (agents walking up to be briefed, walking back to report) with only one party in it. *(Narrows FR-U3 for the canvas only: the office no longer takes the chrome's near-black palette. See Phase 10.)* |
 
 **Art sourcing.** v1 uses a CC0/permissive pack (Kenney-style) behind the FR-S9
 manifest abstraction. Licence terms must be checked and recorded in a
@@ -683,6 +684,158 @@ table already renders, so both must read from one source — `costModel.ts` — 
 the office and the table will eventually disagree about what a run cost, which
 is precisely the class of defect the last two QA passes kept finding.
 
+
+### Phase 10 — The office looks like a place
+
+Phase 9 gave the office *information*; this one gives it a *room*. The prompt was
+the same [pixel-agents](https://github.com/pixel-agents-hq/pixel-agents)
+screenshot that motivated Phase 9, read a second time for its art direction
+rather than its features — and the honest reading is that our office is not
+losing on pixel-art style, it is losing on being a depicted space at all.
+
+**The two findings that motivate the phase.**
+
+*The room is not a room.* `rebuildFloorAndDesks` painted a two-tone checkerboard
+across the whole layout and put desks on it. There was no wall, no floor
+material, no chair, no screen, no plant — nothing that says "workplace" rather
+than "grid". Both floor tones were near-blacks a shade apart, so the one visual
+distinction available to the whole scene was spent on a checker pattern nobody
+reads as flooring. Phase 8's argument for that palette was "a CRT is a screen,
+and a screen is dark whatever the room is", which is sound and produced the wrong
+result: the office is not a readout of a machine, it is a depiction of a place,
+and a place rendered in four shades of one near-black reads as a wireframe of an
+office rather than an office.
+
+*The head desk is empty.* `layoutOffice` has produced a `managerDesk` since Phase
+4, `ASSIGNMENT_BEHAVIOUR` sends `briefing` and `reporting` agents to walk to it,
+and the renderer has drawn the desk — with nobody behind it. So the sim's central
+interaction, the thing that makes it an *office* rather than a row of independent
+workstations, has been a character walking up to a piece of furniture and
+addressing it. The orchestrator that briefs and receives from every agent is the
+one participant in the run that the office never drew.
+
+#### 10.1 Repaint the office as a room (FR-S14, narrowing FR-U3)
+
+- **Measured, not invented.** The floor, wall, wood and carpet values in `OFFICE`
+  are literal samples taken off the reference screenshot rather than picked by
+  eye, for the same reason the plate geometry was measured rather than eyeballed
+  in Phase 9: "warm brown" is a description, `#734728` is a decision.
+- Wall band across the top of the layout (`OfficeLayout.wallRows`), floorboards
+  in a brick bond below it, and a skirting line where they meet.
+- Furniture: a monitor on every desk, a chair behind every seat, and the things
+  that make a space identifiable at a glance — plants, a bookshelf, a clock,
+  framed art, a couch, a rug under the Manager.
+- **The chrome does not follow.** `THEMES` stays the dark neon terminal of FR-U1.
+  Only the canvas is repainted, and only because it depicts something. The screens
+  on the desks keep the phosphor green — that is the one place the terminal
+  identity is literally true.
+
+#### 10.2 Characters that can be told apart (FR-S2, at a size that allows it)
+
+The sprite box grows 12×16 → 16×24. At 12×16 a head is a 4×4 block: no row for a
+hairline, no column for a shoulder, one pixel per eye. Every character therefore
+came out as the same silhouette in different colours — the art was not crude by
+intention, it was crude because the box could not hold anything else. 16×24 is
+the smallest box that holds a recognisable hair *shape*, two-tone shading on
+every mass, and a seated pose distinguishable from a standing one.
+
+`SPRITE_RAMP` also stops being phosphor hues and becomes people. Cyan hair on a
+mint face is *distinguishable*, which is all FR-S2 literally asks, but it is not
+*recognisable* — and recognisability is the entire point of deriving appearance
+from the agent's name. A reader is meant to learn "the one with the ginger hair
+is the reviewer", and that only works if the ramps describe something a person
+already has a word for.
+
+#### 10.3 Seat the office
+
+`SpriteKey` gains `seated`, as an axis rather than three more animations — it is
+orthogonal to what a character is *doing*, exactly as `facing` is, and folding it
+into the animation union would double every future animation and let the halves
+drift. The renderer decides it from **geometry, not status**: a character is
+seated when it has arrived at its own desk. That keeps `shared/src/status.ts` the
+sole owner of behaviour (FR-S3) — sitting down is not a new state, it is what
+being at your desk looks like.
+
+#### 10.4 Put the Manager at the head desk (FR-S14)
+
+`OfficeScene.manager`, always present, animating from the run's status
+(`planning`/`synthesizing`/`designing` read; `dispatching`/`running` type; `done`
+relaxed; `failed` slumped; `cancelled` idle, for the same reason a cancelled
+assignment is not drawn as a failed one).
+
+Deliberately **not** a `CharacterView` in `scene.characters`: it has no
+`assignmentId`, and every map, hit test and selection path in the renderer is
+keyed by one, so a fabricated id would make clicking the Manager open an inspect
+panel for an assignment that does not exist. It also never walks, so the walk
+interpolation, target resolution and carried-report prop are all inapplicable. A
+separate field states both of those in the type rather than leaving them as rules
+a future caller has to remember.
+
+Agents already walk to `managerDesk.approach` to be briefed and to report; what
+was missing was somebody to arrive at, and a facing on arrival — `resolveFacing`
+returns the *previous* heading once movement stops, so an agent that had walked
+up to report ended up facing whichever way it happened to come from.
+
+#### 10.5 The walk to the Manager had never actually been visible
+
+Found by reading `dispatcher.ts` while checking what "approach the Manager"
+would need to mean, and it is the most surprising thing in the phase.
+
+`briefing` is set at `dispatcher.ts:287` and `working` at `:321`; between them
+sit `loadUpstreamReports` and `buildAssignmentBrief` — a few file reads and some
+string assembly, single-digit milliseconds. `reporting` is set at `:463` and
+`done` at `:474`, with one `writeReport` in between. Both statuses are
+transient.
+
+`WALK_SPEED_TILES_PER_SECOND` is 4 and the trip from a desk to the approach tile
+is several tiles. So a character gets on the order of **0.08 tiles — about one
+pixel** — towards the Manager before the status flips and `stepTowards`,
+correctly and by design, re-routes it back to its desk. The office's central
+interaction has been running for six phases and rendering as a twitch.
+
+Nothing caught it because every test asserts on target *values* —
+`expect(character.target).toEqual(manager.approach)` is true, and stays true,
+for the millisecond the status exists. No test asked whether the journey was
+ever *observable*, which is a different claim and the one that mattered.
+
+The fix is an **errand**: renderer-owned travel state that survives a target
+change. Once a character is sent to the Manager it completes the trip, dwells
+facing him, and only then resumes following its current target — which by that
+point is its desk, so the walk home needs no special handling.
+
+This is the one place in the phase that comes close to FR-S3, so the argument is
+worth stating: FR-S3 says the renderer owns no *status*. An errand is not
+status, it is travel state — the same category as `currentPos`, which the
+renderer has always owned. The renderer is not deciding that an agent is
+briefing; it is finishing the journey the orchestrator's status already sent it
+on. It is also skipped entirely under `prefers-reduced-motion` (FR-U5), where
+characters snap to their targets and a forced dwell would be reintroducing
+exactly the motion the setting asks us not to draw.
+
+#### 10.6 The consequence nobody would have predicted
+
+Plate text used to sit directly on the floor, which was legible only because the
+floor was near-black. On wood, `OFFICE.plateDetail` measures **2.18:1** — a real
+WCAG AA failure introduced by a palette change, exactly the kind of coupling
+`officeText.test.ts` exists to catch. The fixes available without a backing panel
+were both bad: lighten the detail lines until they matched the name, destroying
+the hierarchy that makes a floor of desks scannable, or abandon the repaint. So
+plates now print on an opaque `plateBg` card, and the contrast grid grades
+against that instead. The panel's alpha is pinned at exactly 1 by a test, because
+a translucent one would make the true ground a blend of the card and whatever
+board sat under it — and the contrast test would then be measuring a colour that
+never appears on screen.
+
+**Exit criteria.** The office renders a wall, a floor material and furniture;
+every desk has a chair and a screen; the Manager is drawn at the head desk and
+animates from run status; characters sit down when they arrive, complete the
+walk to the Manager even though the status that sent them lasts milliseconds,
+and face him while they report; the Manager is not hit-testable and is announced in the
+office's text alternative as a non-interactive entry; plate text clears WCAG AA
+against the opaque panel it now prints on; and no colour in `sim/` is a hex
+literal (FR-U2 still holds — the repaint moved values, it did not scatter them).
+
+---
 ---
 
 ## 4. Risks

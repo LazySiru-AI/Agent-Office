@@ -316,10 +316,24 @@ describe('office plate text meets WCAG AA on every ground it lands on', () => {
   // real words, so it is held to the same 4.5:1 as everything else rather than
   // being exempt for living on a canvas.
   //
-  // The grounds are the office's own, not the page's: `OFFICE` deliberately
-  // does not follow the light theme (a CRT is dark whatever the room is), so
-  // these three are the only backdrops plate text ever sits on.
-  const GROUNDS = ['background', 'floorLight', 'floorDark'] as const;
+  // The ground moved in Phase 10, and the reason is worth keeping.
+  //
+  // Plate text used to be graded against `background` and both floor tones,
+  // because it sat directly on them. That was survivable only while the floor
+  // was near-black. Repainting it as wood put `plateDetail` at **2.18:1** on
+  // `floorLight` — a real, measured AA failure — and the only fixes without a
+  // backing panel were to lighten the detail lines until they matched the name
+  // (destroying the hierarchy the last test in this block protects) or to
+  // abandon the repaint.
+  //
+  // So plates now print on an opaque `plateBg` panel and are graded against it.
+  // That substitution is only honest while the panel is genuinely opaque: at
+  // any alpha below 1 the true ground would be a blend of the panel and
+  // whatever board sat under it, and this test would be measuring a colour that
+  // never appears on screen. `scene.test.ts` pins the panel's alpha at exactly
+  // 1 for that reason, and the two tests are a pair — neither is sufficient
+  // alone.
+  const GROUNDS = ['plateBg'] as const;
   const TEXT = ['nameplate', 'plateDetail'] as const;
 
   for (const text of TEXT) {
@@ -340,8 +354,8 @@ describe('office plate text meets WCAG AA on every ground it lands on', () => {
     // right desk is found. If a retune ever brought them level, the office
     // would still pass the bar above and would have lost the thing that makes
     // it scannable.
-    const name = contrastRatio(OFFICE.nameplate, OFFICE.background);
-    const detail = contrastRatio(OFFICE.plateDetail, OFFICE.background);
+    const name = contrastRatio(OFFICE.nameplate, OFFICE.plateBg);
+    const detail = contrastRatio(OFFICE.plateDetail, OFFICE.plateBg);
     expect(detail).toBeLessThan(name);
   });
 });

@@ -1,8 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import type { RunState } from '@agent-office/shared';
-import type { PlateDensity } from '../theme/useTheme.js';
-import { buildScene, plateLines, type CharacterView, type SceneContext } from './model.js';
-import { createOfficeScene, type OfficeSceneRenderer } from './scene.js';
+import { readStorage, writeStorage, type PlateDensity } from '../theme/useTheme.js';
+import { buildScene, plateLines, type CharacterView, type ManagerView, type SceneContext } from './model.js';
+import {
+  createOfficeScene,
+  MAX_ZOOM,
+  MIN_ZOOM,
+  parseZoomPreference,
+  type OfficeSceneRenderer,
+  type ZoomLevel,
+  type ZoomPreference,
+} from './scene.js';
 import { SPRITE_MANIFEST } from './sprites.js';
 
 /**
@@ -60,13 +68,46 @@ export interface OfficeCanvasProps {
  * back on screen the moment a keyboard lands in it, so a keyboard user is
  * never operating a control they cannot see.
  */
+/**
+ * A prose gloss for the Manager's animation, for the screen-reader
+ * alternative only (FR-S12, FR-S14).
+ *
+ * `managerAnimationFor` in `model.ts` turns the run's status into one of the
+ * five loops the sprite vocabulary already has, deliberately reusing a
+ * character's animations rather than inventing Manager-only ones — a reader
+ * who has learned that `idle_slumped` means something failed should not have
+ * to learn a second dialect for the desk at the front. That reuse is exactly
+ * right for the canvas, where the loop is drawn, and exactly wrong to read out
+ * verbatim: "type" and "read" describe what the sprite's hands are doing, not
+ * a sentence a screen-reader user should have to decode into "dispatching
+ * work". This is the one place that translates the loop name back into prose,
+ * and it exists only for that — the canvas never calls it.
+ */
+function managerActivityLabel(animation: ManagerView['animation']): string {
+  switch (animation) {
+    case 'read':
+      return 'reviewing the plan';
+    case 'type':
+      return 'dispatching work to the floor';
+    case 'idle_relaxed':
+      return 'done for this run';
+    case 'idle_slumped':
+      return 'dealing with a failed run';
+    case 'idle':
+    case 'walk':
+      return 'idle';
+  }
+}
+
 function OfficeTextAlternative({
+  manager,
   characters,
   density,
   selectedAssignmentId,
   onSelectAssignment,
   onFocusAssignment,
 }: {
+  manager: ManagerView;
   characters: readonly CharacterView[];
   density: PlateDensity;
   selectedAssignmentId: string | undefined;
@@ -76,6 +117,16 @@ function OfficeTextAlternative({
   return (
     <div className="visually-hidden visually-hidden-focusable office-alt">
       <h3 id="office-alt-heading">Office floor</h3>
+      {/* The Manager is always on screen (FR-S14 — the head desk is never
+          unoccupied) but is deliberately not one of `characters`: it has no
+          `assignmentId`, so there is nothing for a click or an inspect panel
+          to act on. A static line rather than a button is what keeps that
+          honest for a keyboard/screen-reader user the way the canvas keeps it
+          honest for a pointer user — clicking the Manager's desk does
+          nothing there either (`hitTestAt` never builds an entity for it). */}
+      <p className="office-alt-manager">
+        {manager.name} (Manager): {managerActivityLabel(manager.animation)}.
+      </p>
       {/* WCAG 2.4.1 (Bypass Blocks). This list is one focus stop per agent and
           nothing caps it — `layoutOffice` lays out beyond 12 quite happily — so
           a keyboard user heading for the activity log below had to tab through
@@ -124,6 +175,129 @@ function OfficeTextAlternative({
   );
 }
 
+/**
+ * FR-S13 — user-controlled zoom, added after the automatic best fit turned
+ * out not to be enough on its own.
+ *
+ * `computeViewport`'s largest-integer-that-fits already does the right thing
+ * whenever the host has room, and Phase 10's own wall (`layoutOffice`'s
+ * `MANAGER_BAND` growing from 5 tiles to 8) made every layout taller, which
+ * pushed several real hosts down an integer step even after `styles.css`
+ * widened the host box. There is no host size that wins for every window,
+ * though: a real measured host at 341x418px fits a four-column office's
+ * 320px width at exactly 1x regardless of how tall the box is, because WIDTH
+ * is what binds there, not height. So the office also needs a control the
+ * user can reach for when automatic isn't enough — not a replacement for it.
+ */
+const ZOOM_STORAGE_KEY = 'agent-office.zoom';
+
+/** localStorage's string form of a `ZoomPreference`. `'auto'` unchanged; a
+ *  level is written as its digit, matching the shape `parseZoomPreference`
+ *  in `scene.ts` reads back. */
+function zoomPreferenceToStorage(preference: ZoomPreference): string {
+  return preference === 'auto' ? 'auto' : String(preference);
+}
+
+/**
+ * The zoom overlay, rendered on top of the office (unlike `OfficeTextAlternative`,
+ * which is visually hidden — this is a real, visible, sighted-and-keyboard
+ * control, not an accessible alternative to something else).
+ *
+ * `+`/`-` glyphs are drawn for a sighted user who already has the visible
+ * "1x"/"2x"/… label for context, but neither button's ACCESSIBLE name is the
+ * glyph alone (WCAG 2.1.1, 4.1.2 — a bare "+" is not a name a screen reader
+ * can announce usefully): each carries its own `aria-label` stating what it
+ * does in words.
+ */
+function ZoomControls({
+  preference,
+  resolvedZoom,
+  onChange,
+}: {
+  preference: ZoomPreference;
+  resolvedZoom: ZoomLevel;
+  onChange: (preference: ZoomPreference) => void;
+}): JSX.Element {
+  const zoomOut = useCallback(() => {
+    onChange(Math.max(MIN_ZOOM, resolvedZoom - 1) as ZoomLevel);
+  }, [onChange, resolvedZoom]);
+  const zoomIn = useCallback(() => {
+    onChange(Math.min(MAX_ZOOM, resolvedZoom + 1) as ZoomLevel);
+  }, [onChange, resolvedZoom]);
+  const resetToFit = useCallback(() => onChange('auto'), [onChange]);
+
+  return (
+    <div
+      className="office-zoom-controls"
+      role="group"
+      aria-label="Office zoom"
+      style={{
+        position: 'absolute',
+        right: 8,
+        bottom: 8,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '4px 6px',
+        borderRadius: 6,
+        background: 'var(--ao-surface-raised)',
+        border: '1px solid var(--ao-line-firm)',
+        color: 'var(--ao-ink)',
+        fontFamily: 'monospace',
+        fontSize: 12,
+        lineHeight: 1,
+        zIndex: 1,
+      }}
+    >
+      <button
+        type="button"
+        aria-label="Zoom out"
+        onClick={zoomOut}
+        disabled={resolvedZoom <= MIN_ZOOM}
+        style={zoomButtonStyle}
+      >
+        <span aria-hidden="true">−</span>
+      </button>
+      {/* `aria-live="polite"` so a screen-reader user who reaches for this
+          control hears the level change without it interrupting anything —
+          this is feedback for an action just taken, not an alert. */}
+      <span aria-live="polite" style={{ minWidth: '4.5em', textAlign: 'center' }}>
+        {resolvedZoom}x{preference === 'auto' ? ' (auto)' : ''}
+      </span>
+      <button
+        type="button"
+        aria-label="Zoom in"
+        onClick={zoomIn}
+        disabled={resolvedZoom >= MAX_ZOOM}
+        style={zoomButtonStyle}
+      >
+        <span aria-hidden="true">+</span>
+      </button>
+      <button
+        type="button"
+        aria-label="Reset zoom to automatically fit the window"
+        onClick={resetToFit}
+        disabled={preference === 'auto'}
+        style={zoomButtonStyle}
+      >
+        Fit
+      </button>
+    </div>
+  );
+}
+
+const zoomButtonStyle: CSSProperties = {
+  minWidth: '1.6em',
+  padding: '2px 6px',
+  borderRadius: 4,
+  border: '1px solid var(--ao-line-firm)',
+  background: 'var(--ao-surface)',
+  color: 'var(--ao-ink)',
+  fontFamily: 'inherit',
+  fontSize: 'inherit',
+  cursor: 'pointer',
+};
+
 export function OfficeCanvas({
   run,
   onSelectAssignment,
@@ -145,6 +319,24 @@ export function OfficeCanvas({
   // renderer's highlight independently.
   const [indicatedId, setIndicatedId] = useState<string | undefined>(undefined);
 
+  // FR-S13. `zoomPreference` is what the user picked (or 'auto', the
+  // default); `resolvedZoom` is what the renderer actually resolved that to
+  // just now, reported back through `onZoomChange` because the resolution
+  // against the live container size happens entirely inside the renderer —
+  // this component has no other way to know it, and needs it to render the
+  // "Nx" label and to step +/- from the CURRENT level rather than from
+  // whatever `zoomPreference` alone would suggest (which is meaningless while
+  // it is `'auto'`).
+  const [zoomPreference, setZoomPreferenceState] = useState<ZoomPreference>(() =>
+    parseZoomPreference(readStorage(ZOOM_STORAGE_KEY)),
+  );
+  const [resolvedZoom, setResolvedZoom] = useState<ZoomLevel>(MIN_ZOOM);
+
+  const setZoomPreference = useCallback((preference: ZoomPreference) => {
+    setZoomPreferenceState(preference);
+    writeStorage(ZOOM_STORAGE_KEY, zoomPreferenceToStorage(preference));
+  }, []);
+
   // Built once per render and shared: the canvas draws these and the text
   // alternative reads them. Two `buildScene` calls would be two chances to
   // disagree, which is the whole reason the alternative sits in this file.
@@ -157,6 +349,7 @@ export function OfficeCanvas({
     const renderer = createOfficeScene(SPRITE_MANIFEST, {
       onSelectAssignment: (assignmentId) => onSelectRef.current?.(assignmentId),
       onHoverAssignment: (assignmentId) => setIndicatedId(assignmentId),
+      onZoomChange: (zoom) => setResolvedZoom(zoom),
     });
     rendererRef.current = renderer;
     renderer.mount(host);
@@ -187,13 +380,25 @@ export function OfficeCanvas({
     rendererRef.current?.setPlateDensity(density);
   }, [density]);
 
+  useEffect(() => {
+    rendererRef.current?.setZoom(zoomPreference);
+  }, [zoomPreference]);
+
   // The canvas is `aria-hidden`: it carries no information the list beside it
   // does not, and leaving it exposed would announce an unlabelled graphic
   // immediately before the same content in readable form.
+  //
+  // `position: relative` is set inline rather than added to `.office-canvas`
+  // in `styles.css` — that file belongs to the coordinator, who already
+  // fixed the host's own sizing there for this same requirement, and the
+  // zoom overlay below is positioned entirely by this component so it has no
+  // reason to reach into a stylesheet it does not own for it.
   return (
-    <div className="office-canvas">
+    <div className="office-canvas" style={{ position: 'relative' }}>
       <div ref={hostRef} className="office-stage" aria-hidden="true" />
+      <ZoomControls preference={zoomPreference} resolvedZoom={resolvedZoom} onChange={setZoomPreference} />
       <OfficeTextAlternative
+        manager={scene.manager}
         characters={scene.characters}
         density={density}
         selectedAssignmentId={selectedAssignmentId}

@@ -14,14 +14,23 @@ import { fitPlateLines, layoutOffice, TILE, type PlateBox } from './model.js';
  * so the overlap appears on exactly the runs with the most plates.
  */
 
-/** The box a plate gets at a given integer render scale, matching `scene.ts`. */
+/**
+ * The box a plate gets at a given integer render scale, matching `scene.ts`.
+ *
+ * The three font sizes mirror `PLATE_NAME_SIZE`, `PLATE_DETAIL_SIZE` and
+ * `PLATE_LINE_HEIGHT`, which grew from 10/8/9 to 13/11/12 in Phase 10 — the
+ * office's text lives in an UNSCALED overlay, so an 8px detail line was 8px
+ * whether the office rendered at 1x or 4x, and 8px is simply too small to read.
+ * The margins either side (6 and 20) are unchanged: they reserve room for the
+ * *neighbouring* plate and desk, so they are about spacing, not glyphs.
+ */
 function boxAtScale(scale: number): PlateBox {
   return {
     widthPx: 4 * TILE * scale - 6,
     heightPx: 4 * TILE * scale - 20,
-    nameSizePx: 10,
-    detailSizePx: 8,
-    lineHeightPx: 9,
+    nameSizePx: 13,
+    detailSizePx: 11,
+    lineHeightPx: 12,
   };
 }
 
@@ -41,11 +50,31 @@ describe('fitPlateLines keeps a plate inside its desk (FR-S10)', () => {
     expect(widthOf(name ?? '', box.nameSizePx)).toBeLessThanOrEqual(box.widthPx);
   });
 
-  it('leaves that same name alone at 2x, where it fits', () => {
+  it('leaves a typical agent name alone at 2x, where it fits', () => {
     // The fit is a response to real geometry, not a blanket shortening — a
-    // two-row team should still read full agent names.
+    // two-row team should still read whole agent names.
+    const [name] = fitPlateLines(['code-reviewer'], boxAtScale(2));
+    expect(name).toBe('code-reviewer');
+  });
+
+  it('still truncates the longest names at 2x, and that is the honest outcome', () => {
+    // This one CHANGED in Phase 10, and the change is worth recording rather
+    // than quietly re-pinning. `architect-reviewer` used to survive at 2x; at
+    // the larger, actually-readable 13px name size it no longer does — 18
+    // characters is roughly 140px against the 122px a plate gets at 2x.
+    //
+    // The plate's width is one desk spacing, and it cannot grow: the box exists
+    // precisely so a plate never runs across the neighbouring desk. So the
+    // choice was a name a reader can make out with the tail elided, or a name
+    // small enough to print whole and too small to read. Truncation with a
+    // visible ellipsis wins, because the alternative fails at the plate's only
+    // job. The full name is one hover or click away, and the office's text
+    // alternative always reads it in full.
     const [name] = fitPlateLines(['architect-reviewer'], boxAtScale(2));
-    expect(name).toBe('architect-reviewer');
+    expect(name).not.toBe('architect-reviewer');
+    expect(name?.endsWith('…')).toBe(true);
+    // Still enough of the name to tell agents apart, not a stub.
+    expect(name?.length).toBeGreaterThan(8);
   });
 
   it('keeps every line within the box at both scales, for a full verbose plate', () => {

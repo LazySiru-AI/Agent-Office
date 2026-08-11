@@ -5,6 +5,7 @@ import {
   type CharacterBehaviour,
   type LoggedAgentEvent,
   type RunState,
+  type RunStatus,
   type Usage,
 } from '@agent-office/shared';
 import { assignmentCostUsd, effectiveModelFor, formatCostUsd } from '../costModel.js';
@@ -49,6 +50,16 @@ export interface OfficeLayout {
   heightTiles: number;
   columns: number;
   rows: number;
+  /**
+   * Rows at the top of the office that are wall rather than floor.
+   *
+   * The office had no wall until Phase 10, and the absence is most of why it
+   * read as a grid of desks floating on a void: a room is legible because it
+   * has a back to it. The renderer needs the count as data rather than as its
+   * own constant, because the Manager's desk is positioned against the wall and
+   * the two must agree about where the wall stops.
+   */
+  wallRows: number;
   managerDesk: DeskSlot;
   /** One slot per assignment, index-aligned with the run's assignment order. */
   desks: DeskSlot[];
@@ -59,8 +70,49 @@ const MARGIN = 2;
 /** Desks are spaced two tiles apart so characters never overlap while walking. */
 const DESK_SPACING_X = 4;
 const DESK_SPACING_Y = 4;
-/** Rows the Manager's desk and its walking lane consume at the top. */
-const MANAGER_BAND = 5;
+/** Rows of wall across the top of the office, where the decor hangs. */
+const WALL_ROWS = 3;
+/**
+ * Rows the wall, the Manager's desk and its walking lane consume at the top.
+ *
+ * Grew from 5 to 8 with the wall. The Manager sits directly against it — which
+ * is what makes the desk read as the head of the room rather than as one more
+ * desk that happens to be at the front.
+ */
+const MANAGER_BAND = 8;
+/**
+ * How much wider than tall the room is drawn, regardless of how many desks it
+ * actually has to hold.
+ *
+ * This is a *rendering* fix expressed in the layout, and the arithmetic behind
+ * it is worth keeping because "the office looks too small" turned out not to be
+ * about size at all.
+ *
+ * `scene.ts` scales the world by the largest WHOLE number that fits — fractional
+ * scaling is what turns crisp pixel art to mush under nearest-neighbour
+ * sampling, so that floor is not negotiable. It therefore takes
+ * `min(hostWidth / worldWidth, hostHeight / worldHeight)` and throws away the
+ * remainder. Measured on a real 1440×960 window with five agents: the host is
+ * 1055×718 and the world was 256×288 — a *portrait* room in a *landscape*
+ * frame. The height ratio came out at 2.49 and the width at 4.12, so the office
+ * rendered at 2x, filling 512 of 1055 available pixels. Under half the frame
+ * was office, and half of a scale step was discarded, purely because the two
+ * aspect ratios disagreed.
+ *
+ * Widening the room to roughly the shape of the pane it lives in makes both
+ * axes bind at once, so almost nothing is wasted. At the same five agents the
+ * world becomes 432×288 and renders at 864×576 — the same 2x, but filling ~82%
+ * of the frame instead of ~48%. A twelve-agent office reaches ~97%.
+ *
+ * The extra floor is not padding: the desk grid stays centred on `centreX`, so
+ * the width appears as open floor down both sides — which is exactly where the
+ * lounge furniture goes, and exactly how the reference office is composed. A
+ * room whose walls hug its desks reads as a corridor.
+ *
+ * 1.45 rather than a display's 16:9, because the office shares its pane with
+ * the app's chrome and never gets the full window height.
+ */
+const ROOM_ASPECT = 1.45;
 
 /**
  * Desk grid that reflows for 1–12 agents (FR-S1).
@@ -79,15 +131,20 @@ export function layoutOffice(agentCount: number): OfficeLayout {
   const rows = count === 0 ? 0 : Math.ceil(count / columns);
 
   const gridWidth = Math.max(columns, 1) * DESK_SPACING_X;
-  const widthTiles = Math.max(gridWidth + MARGIN * 2, 14);
   const heightTiles = MANAGER_BAND + rows * DESK_SPACING_Y + MARGIN;
+  // The room is widened to a landscape aspect rather than being exactly as wide
+  // as its desks need. See `ROOM_ASPECT`.
+  const widthTiles = Math.max(gridWidth + MARGIN * 2, 14, Math.ceil(heightTiles * ROOM_ASPECT));
 
   const centreX = Math.floor(widthTiles / 2);
   const managerDesk: DeskSlot = {
-    desk: { x: centreX, y: 1 },
-    seat: { x: centreX, y: 2 },
+    // Against the wall, top-centre. Both halves of that matter: centred is what
+    // makes every agent's walk to it symmetrical, and against the wall is what
+    // makes it the head of the room.
+    desk: { x: centreX, y: WALL_ROWS },
+    seat: { x: centreX, y: WALL_ROWS + 1 },
     // Directly below the Manager's seat: where an agent stands to report.
-    approach: { x: centreX, y: 3 },
+    approach: { x: centreX, y: WALL_ROWS + 2 },
   };
 
   const desks: DeskSlot[] = [];
@@ -111,7 +168,7 @@ export function layoutOffice(agentCount: number): OfficeLayout {
     });
   }
 
-  return { widthTiles, heightTiles, columns, rows, managerDesk, desks };
+  return { widthTiles, heightTiles, columns, rows, wallRows: WALL_ROWS, managerDesk, desks };
 }
 
 /**
@@ -151,7 +208,20 @@ export const SHIRT_COLOURS = SPRITE_RAMP.shirt;
 export const TROUSER_COLOURS = SPRITE_RAMP.trousers;
 
 export const BODY_VARIANTS = 3;
-export const HAIR_STYLES = 4;
+/**
+ * Hair *silhouettes*, which is a different axis from hair colour — the ramp
+ * above supplies the colour, this supplies the shape, and `appearanceFor`
+ * slices the hash independently for each so two agents sharing a shape are not
+ * thereby pushed towards sharing a colour.
+ *
+ * Four through Phase 9, and four was a consequence of the 12×16 sprite box
+ * rather than a design decision: at that size a head is 4×4 and there is simply
+ * no room for a fifth shape anyone could tell from the other four. At 16×24
+ * there is, and shape carries far more recognisability than colour does at a
+ * glance across a floor of desks — so this is where the extra variety is worth
+ * spending.
+ */
+export const HAIR_STYLES = 6;
 
 /**
  * FNV-1a, chosen because it is short, stable and has no dependencies. The hash
@@ -260,6 +330,16 @@ export interface SceneContext {
   runProvider: string | undefined;
   /** From {@link latestToolByAssignment}. */
   toolByAssignment: Map<string, string>;
+  /**
+   * The run's own status, which only the Manager needs.
+   *
+   * Every other character in the office derives from an `AssignmentState`; the
+   * Manager has none, because it is not an assignment — it is the orchestrator
+   * that hands them out. Its behaviour therefore has to come from the one piece
+   * of state that describes the run as a whole. Optional so an office can still
+   * be built from assignments alone, which is what replay and most tests do.
+   */
+  runStatus?: RunStatus;
 }
 
 const EMPTY_CONTEXT: SceneContext = {
@@ -302,9 +382,104 @@ export interface CharacterView {
   currentTool: string | undefined;
 }
 
+/**
+ * The Manager — the run's point of contact, at the desk at the head of the room
+ * (FR-S14).
+ *
+ * The office has drawn a Manager's desk since Phase 4 and never put anyone
+ * behind it. Agents walked to it to be briefed and walked back to report, and
+ * the thing they were walking to was an empty piece of furniture — so the
+ * office's central interaction, the one that makes it a *workplace* rather than
+ * a row of independent desks, had no other party in it.
+ *
+ * It is deliberately **not** a `CharacterView` in `scene.characters`:
+ *
+ * - It has no `assignmentId`, and every map, hit test and selection path in the
+ *   renderer is keyed by one. Handing them a character with a fabricated id
+ *   would make clicking the Manager open an inspect panel for an assignment
+ *   that does not exist.
+ * - It never walks. Its whole behaviour is "sit at the head desk and look like
+ *   the run is going the way it is going", so the walk interpolation, the
+ *   target resolution and the carried-report prop are all inapplicable.
+ *
+ * A separate field states both of those in the type rather than leaving them as
+ * rules a future caller has to remember.
+ */
+export interface ManagerView {
+  /**
+   * A reserved id, never an assignment's.
+   *
+   * The `@` prefix cannot collide: assignment ids are generated identifiers and
+   * the orchestrator has no path that produces one starting with `@`.
+   */
+  id: string;
+  /** What the plate calls it. */
+  name: string;
+  appearance: AgentAppearance;
+  animation: SpriteAnimation;
+  /** Tile the Manager is drawn on, and the desk it sits behind. */
+  seat: Point;
+  desk: Point;
+}
+
 export interface OfficeScene {
   layout: OfficeLayout;
   characters: CharacterView[];
+  /** Always present — the head desk is never unoccupied. */
+  manager: ManagerView;
+}
+
+/** The Manager's reserved identity. Exported so the renderer can exclude it from hit testing. */
+export const MANAGER_ID = '@manager';
+const MANAGER_NAME = 'orchestrator';
+
+/**
+ * What the Manager is doing, from the run's status.
+ *
+ * The mapping is the same *kind* of thing `ASSIGNMENT_BEHAVIOUR` is for
+ * assignments — state in, animation out, no memory — and it deliberately reuses
+ * the animation vocabulary rather than inventing Manager-only loops. A reader
+ * who has learned that a slumped character means something failed should not
+ * have to learn a second dialect for the desk at the front.
+ *
+ * `read` for the thinking phases and `type` for the dispatching ones is the one
+ * judgement call here: planning, synthesis and design are the run's reading
+ * work, and it is more informative than having the Manager type throughout.
+ */
+export function managerAnimationFor(status: RunStatus | undefined): SpriteAnimation {
+  switch (status) {
+    case 'planning':
+    case 'synthesizing':
+    case 'designing':
+      return 'read';
+    case 'dispatching':
+    case 'running':
+    case 'report_ready':
+      return 'type';
+    case 'done':
+      return 'idle_relaxed';
+    case 'failed':
+      return 'idle_slumped';
+    // `queued`, `cancelled`, and no run at all. A cancelled run gets `idle`
+    // rather than `idle_slumped` for the same reason a cancelled assignment
+    // does: nothing went wrong, the work simply stopped being wanted.
+    default:
+      return 'idle';
+  }
+}
+
+export function managerViewFor(layout: OfficeLayout, status: RunStatus | undefined): ManagerView {
+  return {
+    id: MANAGER_ID,
+    name: MANAGER_NAME,
+    // Derived from the name exactly as every agent's is, so the Manager is
+    // recognisably the same person across runs and restarts (FR-S2). It is a
+    // character in the office, not a piece of set dressing with a fixed palette.
+    appearance: appearanceFor(MANAGER_NAME),
+    animation: managerAnimationFor(status),
+    seat: { ...layout.managerDesk.seat },
+    desk: { ...layout.managerDesk.desk },
+  };
 }
 
 /** Resolve `behaviour.location` into an actual tile. */
@@ -370,11 +545,20 @@ export function buildSceneFromAssignments(
     };
   });
 
-  return { layout, characters };
+  return { layout, characters, manager: managerViewFor(layout, context.runStatus) };
 }
 
 export function buildScene(run: RunState | undefined, context?: SceneContext): OfficeScene {
-  return buildSceneFromAssignments(run?.assignments ?? [], context);
+  // The run's status is injected here rather than asked of the caller: every
+  // caller already passes the run, and requiring them to copy one field out of
+  // it onto the context would be one more thing to forget — with the failure
+  // being a Manager permanently idle through a live run, which looks like a
+  // rendering bug rather than a missing argument.
+  const merged: SceneContext = {
+    ...(context ?? EMPTY_CONTEXT),
+    ...(run === undefined ? {} : { runStatus: run.status }),
+  };
+  return buildSceneFromAssignments(run?.assignments ?? [], merged);
 }
 
 // ---------------------------------------------------------------------------

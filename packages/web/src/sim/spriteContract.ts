@@ -17,9 +17,30 @@ import type { AgentAppearance } from './model.js';
  * thing needing a GPU is the part that uploads it.
  */
 
-/** Sprite cell size in pixels. Characters are drawn within this box. */
-export const SPRITE_WIDTH = 12;
-export const SPRITE_HEIGHT = 16;
+/**
+ * Sprite cell size in pixels. Characters are drawn within this box.
+ *
+ * 12×16 through Phase 9, and the reason it grew is worth recording: at 12×16 a
+ * head is a 4×4 block, which leaves no row for a hairline, no column for a
+ * shoulder, and exactly one pixel per eye. Every character therefore came out
+ * as the same silhouette in different colours — the art was not crude by
+ * intention, it was crude because the box could not hold anything else, and no
+ * amount of palette work was going to fix that.
+ *
+ * 16×24 is the smallest box that holds the three things the direction actually
+ * asks for: a hair *shape* distinct enough to recognise an agent by, a two-tone
+ * shade on every body part so figures read as rounded rather than as flat
+ * rectangles, and a seated pose that is legibly different from a standing one.
+ * It is one tile wide and one and a half tall, which is also the proportion the
+ * reference draws its characters at.
+ *
+ * Nothing derives layout from these arithmetically — a 12×16 character does not
+ * scale to 16×24 by ratio, and `sprites.ts` re-tunes its constants by hand —
+ * but every draw call there is bounds-checked, so a future change clips rather
+ * than crashes while it is being re-tuned.
+ */
+export const SPRITE_WIDTH = 16;
+export const SPRITE_HEIGHT = 24;
 
 /** Frames in every animation loop. Uniform so the renderer needs no table. */
 export const FRAMES_PER_ANIMATION = 4;
@@ -68,6 +89,25 @@ export interface SpriteKey {
   /** 0-based, always less than {@link FRAMES_PER_ANIMATION}. */
   frame: number;
   facing: Facing;
+  /**
+   * Drawn sitting rather than standing.
+   *
+   * An axis of its own rather than three more animations (`sit_idle`,
+   * `sit_type`, `sit_read`, …), for the same reason `facing` is: sitting is
+   * orthogonal to what the character is *doing*, so folding it into the
+   * animation union would multiply every future animation by two and let the
+   * two halves drift — a `read` that had a seated variant and a `walk` that
+   * nonsensically did.
+   *
+   * The renderer sets it from geometry, not from status: a character is seated
+   * when it has arrived at its own desk. That keeps `shared/src/status.ts` the
+   * sole owner of behaviour (FR-S3) — sitting down is not a new state, it is
+   * what being at your desk looks like.
+   *
+   * Optional, defaulting to standing, so every existing caller and fixture
+   * still typechecks and still describes exactly what it did before.
+   */
+  seated?: boolean;
 }
 
 /**
@@ -84,11 +124,47 @@ export type FrameGenerator = (key: SpriteKey) => PixelGrid;
  * Props drawn beside characters, keyed by name so the renderer needs no
  * knowledge of what they look like.
  *
- * `desk`, `paper` (the report a character carries while `reporting`), and the
- * overhead bubbles the behaviour table can ask for.
+ * Six of these through Phase 9 — a desk, the Manager's desk, the report page a
+ * character carries while `reporting`, and three bubbles — which is why the
+ * office read as a grid of desks on a void rather than as a room. The rest
+ * furnish it: a chair to sit on, and the things that make a space identifiable
+ * as a workplace at a glance (screens, plants, shelves, a clock, art, a couch,
+ * a rug under the Manager).
+ *
+ * They carry no {@link AgentAppearance} and no frame index — a prop is static
+ * and identical everywhere it appears, which is what lets the implementation
+ * build all of them once at module load instead of caching per call.
  */
-export type PropName = 'desk' | 'manager_desk' | 'paper' | 'bubble_speech' | 'bubble_alert' | 'bubble_error';
+export type PropName =
+  // furniture a character interacts with
+  | 'desk'
+  | 'manager_desk'
+  | 'chair'
+  // the room
+  | 'plant'
+  | 'bookshelf'
+  | 'wall_clock'
+  | 'wall_art'
+  | 'couch'
+  | 'rug'
+  // carried and overhead
+  | 'paper'
+  | 'bubble_speech'
+  | 'bubble_alert'
+  | 'bubble_error';
 
+/**
+ * Unlike {@link FrameGenerator}, a prop is **not** confined to the
+ * `SPRITE_WIDTH × SPRITE_HEIGHT` character box: a bookshelf is wider than it is
+ * tall and a rug is wider still, and forcing both into a 16×24 cell would mean
+ * drawing them at a size the room does not want. The renderer reads each grid's
+ * own dimensions when it uploads the texture and anchors it bottom-centre on
+ * its tile, so an oversized prop simply overhangs symmetrically.
+ *
+ * The obligations that remain are that every grid is rectangular (all rows the
+ * same length), non-empty, and — as with frames — that generation is total: a
+ * name in the union always yields a grid.
+ */
 export type PropGenerator = (name: PropName) => PixelGrid;
 
 /**

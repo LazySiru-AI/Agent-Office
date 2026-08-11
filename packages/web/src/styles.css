@@ -35,6 +35,27 @@
 
 html {
   color-scheme: dark;
+  /* The type scale's base, raised from the browser default in Phase 10.
+   *
+   * Every `font-size` in this file is expressed in `rem`, and the great
+   * majority of them sit between 0.7 and 0.9 — which against a 16px default
+   * meant real text rendering at **11.2px to 14.4px**. That is small enough
+   * that the interface was reported as hard to read, and it was not the result
+   * of a decision: the values were chosen individually, against each other,
+   * and nothing ever measured the smallest of them in absolute terms.
+   *
+   * A percentage, not a pixel value, and this is the whole reason it can be
+   * done here in one line. `112.5%` scales the entire interface relative to
+   * whatever base size the *user* has configured in their browser, so someone
+   * who has already raised their default keeps the benefit and gets this on top
+   * — where `font-size: 18px` would have overridden their preference and
+   * quietly broken WCAG 1.4.4. Everything sized in `rem` (padding, gaps, widths)
+   * scales with it, so proportions are preserved rather than re-tuned.
+   *
+   * The office canvas is deliberately unaffected: it is a fixed-aspect pixel
+   * scene sized in whole tiles, and its own text lives in `sim/scene.ts`'s
+   * unscaled overlay. That is bumped separately, in its own units. */
+  font-size: 112.5%;
 }
 
 body {
@@ -359,7 +380,7 @@ button[aria-pressed='true'] {
 .run-list-age {
   margin-left: auto;
   font-family: var(--ao-font-mono);
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   color: var(--ao-ink-mute);
 }
 
@@ -374,7 +395,7 @@ button[aria-pressed='true'] {
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
 }
 
 .run-list-search input {
@@ -394,7 +415,7 @@ button[aria-pressed='true'] {
 .run-list-filters button {
   padding: 0.15rem 0.45rem;
   min-height: 24px;
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   font-family: var(--ao-font-mono);
 }
 
@@ -539,7 +560,7 @@ button[aria-pressed='true'] {
   padding: 0.1rem 0.5rem;
   border-radius: 999px;
   font-family: var(--ao-font-mono);
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.03em;
@@ -623,7 +644,7 @@ button[aria-pressed='true'] {
   color: var(--ao-ink-soft);
   font-weight: 600;
   text-transform: uppercase;
-  font-size: 0.7rem;
+  font-size: 0.78rem;
   letter-spacing: 0.04em;
 }
 
@@ -710,16 +731,40 @@ button[aria-pressed='true'] {
   background: var(--ao-sunken);
   border: 1px solid var(--ao-line-firm);
   box-shadow: inset 0 0 24px 0 color-mix(in srgb, var(--ao-bg) 60%, transparent);
-  overflow: hidden;
+  /* `auto`, not `hidden`. It was `hidden` because the office always fitted —
+     `computeViewport` picked the largest scale that did. FR-S13's zoom broke
+     that assumption on purpose: a user who zooms past the fit is asking to see
+     the office bigger than the frame, and under `hidden` the excess was simply
+     cropped away with no way to reach it. Scrollbars still never appear while
+     the office fits, so the bezel is unchanged in the common case. */
+  overflow: auto;
   width: 100%;
-  /* Sized against the integer-scale rule, not picked by eye. The renderer uses
-     the largest whole-number scale that fits, so the host height decides how
-     big the pixel art is allowed to be: a three-agent office is 15 tiles
-     (240px) tall, and at 420px only 1x fits — visibly tiny in a wide pane.
-     520px clears 2x for the common one- and two-row layouts. A three-row team
-     (19 tiles, 608px at 2x) falls back to 1x rather than being cropped, which
-     is the right way round. */
-  height: 520px;
+  /* Sized against the integer-scale rule, not picked by eye — and re-derived in
+     Phase 10, because the office got taller and a fixed height silently made
+     everything smaller.
+
+     The renderer uses the largest WHOLE-NUMBER scale that fits, so this height
+     alone decides how big the pixel art is allowed to be, and the steps are
+     brutal: a host 1px short of the next integer multiple wastes the entire
+     difference as letterbox. Phase 10 added a wall band, which took the office
+     from `MANAGER_BAND` 5 tiles to 8, so every layout grew by 3 tiles (48px):
+
+       1 row  (1-2 agents)   14 tiles   224px at 1x
+       2 rows (3-6 agents)   18 tiles   288px
+       3 rows (7-12 agents)  22 tiles   352px
+       4 rows (13-16)        26 tiles   416px
+
+     At the old fixed 520px that made 2x reachable for a ONE-row office only,
+     and everything else fell back to 1x — i.e. adding the wall made the office
+     visibly smaller, which is the opposite of what the repaint was for.
+
+     So the host now takes the height it can actually get. On a 1080p screen
+     `100vh - 240px` lands near 720px, which clears 3x for one row and 2x for
+     two and three — roughly double the on-screen size of the old fixed box. The
+     lower clamp keeps a short window from collapsing the office to a sliver;
+     the upper one stops a very tall display from scaling the art past the point
+     where a pixel is a visible square. */
+  height: clamp(420px, calc(100vh - 240px), 880px);
 }
 
 /* The office is the one thing on the page that cannot reflow: it is a
@@ -748,13 +793,28 @@ button[aria-pressed='true'] {
 /* The element the renderer actually measures and mounts into. It exists so the
    host can also hold the canvas's keyboard/screen-reader alternative without
    that markup landing inside the box Pixi sizes itself against. It fills the
-   host exactly, so `scene.ts`'s integer-scale calculation is unchanged. */
+   host exactly, so `scene.ts`'s integer-scale calculation is unchanged — and it
+   must keep filling it exactly, never sizing to its own content, or the
+   ResizeObserver in `scene.ts` would feed the canvas's size back in as the
+   container's size and the auto-fit scale would chase itself.
+
+   `grid` with an `auto`-margined canvas, rather than flex centring, and the
+   difference only shows once the canvas is BIGGER than this box — which FR-S13's
+   zoom made reachable. Under `justify-content: center` an oversized child
+   overflows equally in both directions, and overflow to the left of the scroll
+   origin is not scrollable: measured at 3x, a 1296px canvas in a 1049px host
+   gave a scrollWidth of 1173, so ~124px of office sat permanently off the left
+   edge with no way to reach it. Auto margins in grid resolve to zero when free
+   space is negative, so the canvas centres while it fits and pins to the start
+   the moment it does not — every pixel of it reachable by scrolling. */
 .office-stage {
   width: 100%;
   height: 100%;
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  display: grid;
+}
+
+.office-stage > canvas {
+  margin: auto;
 }
 
 .office-canvas canvas {
@@ -799,7 +859,7 @@ button[aria-pressed='true'] {
 
 .settings-label {
   flex-basis: 100%;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--ao-ink-mute);
@@ -827,7 +887,7 @@ button[aria-pressed='true'] {
    useful than an option that silently isn't there. */
 .settings-provider-reason {
   flex-basis: 100%;
-  font-size: 0.72rem;
+  font-size: 0.78rem;
   color: var(--ao-ink-mute);
   font-family: var(--ao-font-mono);
 }
@@ -836,7 +896,7 @@ button[aria-pressed='true'] {
   flex-basis: 100%;
   grid-column: 1 / -1;
   margin: 0;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   color: var(--ao-status-bad);
 }
 
@@ -879,7 +939,7 @@ button[aria-pressed='true'] {
 
 .display-controls-label {
   flex-basis: 100%;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--ao-ink-mute);
@@ -911,7 +971,7 @@ button[aria-pressed='true'] {
 
 .inspect-category {
   margin: 0;
-  font-size: 0.75rem;
+  font-size: 0.8rem;
   color: var(--ao-ink-mute);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -931,7 +991,7 @@ button[aria-pressed='true'] {
 }
 
 .inspect-stats dt {
-  font-size: 0.7rem;
+  font-size: 0.78rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--ao-ink-mute);
@@ -1014,7 +1074,7 @@ button[aria-pressed='true'] {
 
 .replay-partial {
   color: var(--ao-status-waiting);
-  font-size: 0.75rem;
+  font-size: 0.8rem;
 }
 
 /* --- Phase 5: PDF deliverable (FR-P5) --- */

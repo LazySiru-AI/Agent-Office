@@ -7,10 +7,14 @@ import {
 } from '@agent-office/shared';
 import {
   appearanceFor,
+  buildScene,
   buildSceneFromAssignments,
   hashName,
   layoutOffice,
+  managerAnimationFor,
+  managerViewFor,
   targetFor,
+  MANAGER_ID,
   type OfficeLayout,
 } from './model.js';
 
@@ -206,6 +210,137 @@ describe('targetFor', () => {
       const point = targetFor({ animation: 'idle', location, bubble: 'none', carrying: false }, home, layout);
       expect(Number.isFinite(point.x)).toBe(true);
       expect(Number.isFinite(point.y)).toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// FR-S14 — the desk at the head of the room finally has someone at it
+// ---------------------------------------------------------------------------
+
+describe('the Manager (FR-S14)', () => {
+  it('is present in every scene, including an empty one', () => {
+    // The office drew a Manager's desk from Phase 4 and never put anyone behind
+    // it, so the interaction the whole sim is built around — agents walking up
+    // to be briefed and back to report — had no other party in it. A run with
+    // no assignments yet is exactly when the Manager is the only thing on
+    // screen, so "empty run" is the case that must not be the exception.
+    expect(buildSceneFromAssignments([]).manager).toBeDefined();
+    expect(buildSceneFromAssignments([assignment('a', 'coder', 'working')]).manager).toBeDefined();
+  });
+
+  it('sits at the head desk, against the wall and centred', () => {
+    // Both halves carry meaning. Centred is what makes every agent's walk to it
+    // symmetrical rather than favouring one side of the floor; against the wall
+    // is what makes it read as the head of the room instead of one more desk
+    // that happens to be at the front.
+    for (const n of [0, 1, 4, 9, 12]) {
+      const layout = layoutOffice(n);
+      const manager = managerViewFor(layout, 'running');
+      expect(manager.desk).toEqual(layout.managerDesk.desk);
+      expect(manager.seat).toEqual(layout.managerDesk.seat);
+      expect(manager.desk.y, `n=${String(n)}: desk should sit on the wall's last row`).toBe(
+        layout.wallRows,
+      );
+      expect(manager.desk.x).toBe(Math.floor(layout.widthTiles / 2));
+    }
+  });
+
+  it('leaves the whole approach lane clear of the first row of desks', () => {
+    // The reporting walk ends on `managerDesk.approach`, and an agent standing
+    // there must not be standing on someone else's desk. Nothing pinned this
+    // before, which is how the top band could be re-sized from 5 tiles to 8
+    // without a single test noticing.
+    for (let n = 1; n <= 12; n += 1) {
+      const layout = layoutOffice(n);
+      const firstDeskRow = Math.min(...layout.desks.map((d) => d.desk.y));
+      expect(
+        layout.managerDesk.approach.y,
+        `n=${String(n)}: the approach tile collides with the first desk row`,
+      ).toBeLessThan(firstDeskRow);
+    }
+  });
+
+  it('takes a reserved id that no assignment can produce', () => {
+    // Every map, hit test and selection path in the renderer is keyed by
+    // assignment id. A Manager sharing that namespace would make clicking it
+    // open an inspect panel for an assignment that does not exist.
+    expect(MANAGER_ID.startsWith('@')).toBe(true);
+    const scene = buildSceneFromAssignments([assignment('a', 'coder', 'working')]);
+    expect(scene.characters.map((c) => c.assignmentId)).not.toContain(scene.manager.id);
+  });
+
+  it('looks the same in every run, like every other character', () => {
+    // FR-S2 applies to the Manager too: its appearance is derived from its name
+    // rather than fixed as set dressing, so it is a person in the office who
+    // stays recognisable across runs and restarts.
+    const a = managerViewFor(layoutOffice(3), 'running');
+    const b = managerViewFor(layoutOffice(7), 'done');
+    expect(a.appearance).toEqual(b.appearance);
+    expect(a.appearance).toEqual(appearanceFor(a.name));
+  });
+
+  it('reflects what the run is doing, and never invents a state', () => {
+    expect(managerAnimationFor('planning')).toBe('read');
+    expect(managerAnimationFor('synthesizing')).toBe('read');
+    expect(managerAnimationFor('running')).toBe('type');
+    expect(managerAnimationFor('done')).toBe('idle_relaxed');
+    expect(managerAnimationFor('failed')).toBe('idle_slumped');
+    // A cancelled run gets `idle`, not `idle_slumped`, for exactly the reason a
+    // cancelled assignment does: nothing went wrong, the work simply stopped
+    // being wanted, and the office must not show a defeated Manager because the
+    // user pressed Cancel.
+    expect(managerAnimationFor('cancelled')).toBe('idle');
+    expect(managerAnimationFor('queued')).toBe('idle');
+    expect(managerAnimationFor(undefined)).toBe('idle');
+  });
+
+  it('picks up the run status without the caller having to pass it', () => {
+    // `buildScene` injects it from the run it was already given. Requiring
+    // every caller to copy one field onto the context would be one more thing
+    // to forget, and the failure — a Manager idle through a live run — reads as
+    // a rendering bug rather than as a missing argument.
+    const run = {
+      id: 'run-1',
+      task: 'do the thing',
+      status: 'running' as const,
+      createdAt: 0,
+      updatedAt: 0,
+      assignments: [assignment('a', 'coder', 'working')],
+    };
+    expect(buildScene(run).manager.animation).toBe('type');
+    expect(buildScene({ ...run, status: 'done' as const }).manager.animation).toBe('idle_relaxed');
+    expect(buildScene(undefined).manager.animation).toBe('idle');
+  });
+});
+
+describe('the room is drawn landscape, not desk-shaped (FR-S13)', () => {
+  it('is always wider than it is tall, at every team size', () => {
+    // Not cosmetic. `scene.ts` scales by the largest WHOLE number that fits and
+    // discards the remainder, so a portrait room in a landscape pane wastes
+    // most of a scale step: measured at five agents in a 1055x718 host, a
+    // 256x288 world rendered at 2x and filled 512 of 1055 pixels. Matching the
+    // room's shape to the pane's makes both axes bind at once.
+    for (let n = 0; n <= 20; n += 1) {
+      const layout = layoutOffice(n);
+      expect(
+        layout.widthTiles,
+        `n=${String(n)}: ${String(layout.widthTiles)}x${String(layout.heightTiles)} is not landscape`,
+      ).toBeGreaterThan(layout.heightTiles);
+    }
+  });
+
+  it('still leaves the desk grid centred, so the extra width is floor on both sides', () => {
+    // The point of the width is open floor for the lounge furniture to stand
+    // on, down both sides of the desks. If widening had pushed the grid to one
+    // edge it would have bought a wider room and lost a symmetrical one.
+    for (const n of [1, 5, 12]) {
+      const layout = layoutOffice(n);
+      const xs = layout.desks.map((d) => d.desk.x);
+      const midpoint = (Math.min(...xs) + Math.max(...xs)) / 2;
+      // Within one desk spacing of the room's centre line, which is as exact as
+      // an integer grid holding an even or odd number of columns can be.
+      expect(Math.abs(midpoint - layout.widthTiles / 2)).toBeLessThanOrEqual(2);
     }
   });
 });
