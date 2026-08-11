@@ -12,7 +12,7 @@ import {
   type ServerMessage,
 } from '@agent-office/shared';
 import type { Registry } from '../registry/index.js';
-import { UnknownProviderError } from '../providers/factory.js';
+import { UnknownProviderError, probeProviders } from '../providers/factory.js';
 import { ProviderUnavailableError } from '../providers/types.js';
 import { UnsafePathError, type RunStore } from '../store/types.js';
 import { assertValidRunId } from '../store/util.js';
@@ -68,6 +68,7 @@ function toPattern(url: string): string {
 const ROUTES = {
   health: API.health(),
   agents: API.agents(),
+  providers: API.providers(),
   runs: API.runs(),
   run: toPattern(API.run(RUN_ID_PLACEHOLDER)),
   cancelRun: toPattern(API.cancelRun(RUN_ID_PLACEHOLDER)),
@@ -163,6 +164,17 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // --- Agent roster (FR-R1) ------------------------------------------------
   app.get(ROUTES.agents, async () => ({
     agents: deps.registry.agents.map(toAgentSummary),
+  }));
+
+  // --- Provider readiness (Phase 7) ----------------------------------------
+  //
+  // Each provider's own `isAvailable()` answers this, rather than the route
+  // re-deriving it from environment variables: the adapter is the thing that
+  // knows what it needs, and a second copy of that rule here would drift the
+  // first time one of them changed. The contract for `isAvailable` is that it
+  // makes no network call, so this route is cheap and cannot hang.
+  app.get(ROUTES.providers, async () => ({
+    providers: await probeProviders(new Set(deps.registry.byName.keys())),
   }));
 
   // --- Runs ----------------------------------------------------------------

@@ -1012,3 +1012,113 @@ deleted — the software one still asserts that a coincidental
   vocabulary) or a floor that always keeps a domain's obvious generalists.
 - The review loop never re-reviews. That is FR-M10 as written ("once"), but it
   means nobody checks whether the revision actually addressed the critique.
+
+---
+
+## Phase 7 — Provider expansion
+
+Exit criterion: the same task runs identically through Claude Code and through a
+raw API provider, with only a dropdown changing.
+
+### What could not be done, first
+
+There is no API key on this machine, and the Claude Code CLI — which *is*
+installed, at `…\Claude\claude-code\2.1.222\claude.exe` — is not signed in. So
+the exit criterion's comparison was never run. Nothing in this phase has spoken
+to a real model.
+
+What that leaves is worth being precise about. The adapters are verified against
+**local fake HTTP servers** that speak the documented wire format: SSE framing,
+tool-use loops, streamed tool-call fragments, auth failures, rate limits,
+stalls, and chunk boundaries falling mid-`data:` line. That proves this code
+behaves correctly *given that format*. It proves nothing about whether the
+format matches the live API. Every file concerned says so in its own words
+rather than leaving the reader to assume.
+
+### Built
+
+- **Anthropic Messages adapter** — SSE, the tool-use loop, cache-counter folding
+  into usage, 30-round bound.
+- **OpenAI Chat Completions adapter, serving DeepSeek too.** One class, not two
+  files: everything that differs between them — key variable, base URL, model —
+  is absorbed by `apiConfig.ts`, and nothing forced a provider-specific branch.
+- **Sandboxed filesystem tools** (`apiTools.ts`) — `Read`, `Write`, `Edit`,
+  `Glob`, `Grep`, `LS`, confined to one run's workspace. A raw API has no
+  filesystem tools of its own, so the adapter supplies them, which means NFR-1
+  is enforced by this code rather than by someone else's sandbox.
+- **`sse.ts`** — one reader for all three adapters.
+- **Settings panel** — provider, concurrency, timeout, budgets, persisted.
+- **`GET /api/providers`** — each adapter answers for itself.
+- **Run history browser** — search, filters, relative ages.
+- **Per-agent provider selection** — `providerFor(agentName)` at the dispatcher.
+- **`.env` loading**, so keys live in a gitignored file rather than a shell.
+
+### Findings
+
+- **The sandbox's allowlist was enforced at advertisement, not at execution.**
+  `schemas(allowedTools)` decided what the model was *told about*; `execute()`
+  ran anything it implemented. A model offered only `Read` could emit a `Write`
+  call — from a stale context or a hallucination — and it would be carried out.
+  An agent's `tools:` frontmatter is a permission boundary (FR-M5 says a
+  provider "must not exceed it"), and one checked only when the menu is printed
+  is not a boundary. `createSandboxedTools` now takes the allowlist and refuses
+  anything outside it, naming the canonical tools the agent does have so the
+  model stops rather than retrying a name that is not a tool.
+- **An abort raced the SSE reader.** Passing one signal to both `fetch` and the
+  stream reader meant `fetch` errored the body reader with `AbortError` before
+  the reader's own cancel ran, and that rejection surfaced as a spurious run
+  failure. Caught and swallowed only while `signal.aborted` is true.
+- **`--max-budget-usd` has no raw-API equivalent.** `makeProvider` accepts
+  `maxCostUsd` for every provider and three of them ignore it. Spend on the HTTP
+  adapters is bounded only by `maxOutputTokens` per call and the tool-round
+  limit. Recorded in `factory.ts` next to the option, because this is exactly
+  the sort of thing that reads as working until the bill arrives.
+- **The suite outgrew a 5-second timeout.** Three end-to-end tests began failing
+  reliably once this phase added ~190 tests. They pass in isolation and each do
+  3–5 seconds of real work; the work did not get slower, it just stopped being
+  alone on the disk. Those three now carry an explicit 20s timeout with the
+  reasoning written down. Raising the default for everything would have hidden
+  a real hang somewhere else.
+- **Two provider pickers had appeared.** `TaskForm` had its own dropdown and the
+  settings panel had another. The form now states what it will do and the
+  settings own the choice.
+
+### Default provider changed to the local CLI
+
+At the user's direction, `claude-code` is now the default for every agent,
+replacing `scripted`. That default spends money, which is the deliberate trade:
+the previous default called no model at all and produced a report of placeholder
+text that reads like a finished run. `scripted` is still there and still free.
+
+Keys come from a gitignored `.env` (see `.env.example`), loaded before any
+adapter resolves its configuration. A real environment variable still wins over
+the file. The settings UI never sees a key — the browser is told only *whether*
+a provider is usable and why not, because availability is all it needs and
+anything more puts a credential one screenshot from being shared.
+
+### Verified
+
+- **1,006 tests pass, 4 skipped**; typecheck clean across all three workspaces.
+- Every escape vector tried against the sandbox was rejected: `../` traversal,
+  absolute and UNC paths, drive-relative paths, NUL truncation, the
+  `abc`/`abc-evil` prefix-sibling bug, and case-differing Windows paths.
+- **Four symlink-escape tests are skipped, not passed.** Windows refused
+  `fs.symlink` without Developer Mode; the defence is implemented and the skip
+  prints why. Do not read the green suite as covering it.
+- The SSE reader survives every chunk split from one byte upward, and a
+  multi-byte character split across two chunks.
+- In the browser: `/api/providers` reports each adapter's own reason, an
+  unavailable provider blocks the Start button and shows that reason, switching
+  to `scripted` clears it, and the history browser's search narrows 30 runs to
+  one on "tax ireland".
+
+### Known gaps carried forward
+
+- **The exit criterion is unmet and cannot be met here** — it needs a signed-in
+  CLI or one API key.
+- Default model names for OpenAI and DeepSeek are guesses that have never been
+  sent to a live endpoint. `apiConfig.ts` says so; expect them to be the first
+  thing to fix when a real call fails.
+- No cost ceiling for the HTTP providers.
+- SQLite not adopted: the plan made it conditional on JSON-on-disk hurting, and
+  at thirty runs it does not.

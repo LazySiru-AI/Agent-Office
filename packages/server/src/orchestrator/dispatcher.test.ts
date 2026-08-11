@@ -577,3 +577,84 @@ describe('dispatchRun — the review loop (FR-M10)', () => {
     expect(briefFor('b')).not.toContain('Verdict marker');
   });
 });
+
+describe('dispatchRun — per-agent provider selection (Phase 7)', () => {
+  it('routes an agent to its own provider and leaves the rest on the run’s', async () => {
+    const { store, provider, run } = await setup({ fallback: { text: 'Default provider.' } });
+    const special = new ScriptedProvider({ fallback: { text: 'Special provider.' } });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      // `alpha` only. `beta` and `gamma` must be untouched by this.
+      providerFor: (agentName) => (agentName === 'alpha' ? special : undefined),
+      store,
+      signal: new AbortController().signal,
+    });
+
+    expect(special.requests.map((r) => r.assignmentId)).toEqual(['a']);
+    expect(provider.requests.map((r) => r.assignmentId).sort()).toEqual(['b', 'c']);
+
+    expect(await store.readReport(run.id, 'reports/01-alpha.md')).toContain('Special provider.');
+    expect(await store.readReport(run.id, 'reports/02-beta.md')).toContain('Default provider.');
+  });
+
+  it('falls back to the run’s provider when the resolver returns undefined', async () => {
+    const { store, provider, run } = await setup({ fallback: { text: 'Findings.' } });
+
+    const result = await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      providerFor: () => undefined,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.completed).toBe(3);
+    expect(provider.requests).toHaveLength(3);
+  });
+
+  it('behaves identically when no resolver is supplied at all', async () => {
+    // The seam is additive: every existing caller passes nothing, and must see
+    // exactly the behaviour it saw before Phase 7.
+    const { store, provider, run } = await setup({ fallback: { text: 'Findings.' } });
+
+    const result = await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    expect(result.completed).toBe(3);
+    expect(provider.requests).toHaveLength(3);
+  });
+
+  it('re-resolves for a revision, so a send-back does not inherit the wrong provider', async () => {
+    // The FR-M10 re-dispatch runs inside the reviewer's execution. If the
+    // provider were resolved once per phase rather than per assignment, the
+    // revision would run on whatever the reviewer used.
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: 'Wrong.\n\n[[REVIEW_VERDICT: REVISIONS_REQUESTED]]' },
+      },
+      fallback: { text: 'Findings.' },
+    });
+    const special = new ScriptedProvider({ fallback: { text: 'Special.' } });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      providerFor: (agentName) => (agentName === 'alpha' ? special : undefined),
+      store,
+      signal: new AbortController().signal,
+    });
+
+    // Both the original dispatch and the revision went to alpha's provider.
+    expect(special.requests.map((r) => r.assignmentId)).toEqual(['a', 'a']);
+  });
+});

@@ -4,27 +4,47 @@ import type { CreateRunRequest } from '@agent-office/shared';
 /**
  * Task input + "Start run" button.
  *
- * `PROVIDER_IDS` is duplicated here rather than imported: `web` may depend
- * only on `shared`, and the canonical list lives in
- * `packages/server/src/providers/types.ts`. Only `scripted` is wired up as
- * of Phase 3 (see PLAN.md Phase 1/7) — the others are listed so the selector
- * doesn't need editing again the moment a real adapter lands, but picking one
- * today will surface as a run failure rather than silently falling back.
+ * Phase 7 took the provider and concurrency controls out of this form. They
+ * used to live here because there was nowhere else to put them; now
+ * `SettingsPanel` owns them, and two places to choose a provider is exactly the
+ * duplication that ends with the form and the settings disagreeing about what
+ * a run will do. What is left is the one thing this form is actually for.
+ *
+ * The settings arrive as props rather than being read from the hook here, so
+ * this component stays renderable without any of that machinery, matching the
+ * convention the rest of the panels follow.
  */
-const KNOWN_PROVIDERS = ['scripted', 'claude-code', 'anthropic', 'openai', 'deepseek'] as const;
-
 export interface TaskFormProps {
   onStart: (req: CreateRunRequest) => Promise<string>;
+  /** From `useSettings` — what the run will be started with. */
+  provider: string;
+  concurrency: number;
+  /** True when the current settings are unusable; blocks the submit. */
+  settingsInvalid: boolean;
+  /**
+   * Why the submit is blocked, when the reason is worth stating here.
+   *
+   * A field-level validation error already shows next to its own field, so the
+   * generic message is enough for those. An unavailable provider has no field
+   * of its own to fail against — the value is valid, the world is not — so it
+   * gets said in full.
+   */
+  blockedReason?: string;
   /** Disable the form while a run is already in flight isn't required by the
    * contract (runs execute independently), but a busy indicator on the
    * button avoids double-submits while the create request is pending. */
   busy: boolean;
 }
 
-export function TaskForm({ onStart, busy }: TaskFormProps): JSX.Element {
+export function TaskForm({
+  onStart,
+  provider,
+  concurrency,
+  settingsInvalid,
+  blockedReason,
+  busy,
+}: TaskFormProps): JSX.Element {
   const [task, setTask] = useState('');
-  const [provider, setProvider] = useState<string>('scripted');
-  const [concurrency, setConcurrency] = useState('');
   const [error, setError] = useState<string | undefined>(undefined);
   const [submitting, setSubmitting] = useState(false);
 
@@ -38,18 +58,8 @@ export function TaskForm({ onStart, busy }: TaskFormProps): JSX.Element {
       return;
     }
 
-    const req: CreateRunRequest = { task: trimmed, provider };
-    const concurrencyNum = concurrency.trim().length > 0 ? Number(concurrency) : undefined;
-    if (concurrencyNum !== undefined) {
-      if (!Number.isInteger(concurrencyNum) || concurrencyNum < 1) {
-        setError('concurrency must be a positive whole number');
-        return;
-      }
-      req.concurrency = concurrencyNum;
-    }
-
     setSubmitting(true);
-    onStart(req)
+    onStart({ task: trimmed, provider, concurrency })
       .then(() => setTask(''))
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setSubmitting(false));
@@ -68,37 +78,23 @@ export function TaskForm({ onStart, busy }: TaskFormProps): JSX.Element {
       />
 
       <div className="task-form-row">
-        <label htmlFor="provider-select">Provider</label>
-        <select
-          id="provider-select"
-          value={provider}
-          onChange={(e) => setProvider(e.target.value)}
-          disabled={submitting}
-        >
-          {KNOWN_PROVIDERS.map((id) => (
-            <option key={id} value={id}>
-              {id}
-            </option>
-          ))}
-        </select>
+        {/* Not a control — a statement of what pressing the button will do.
+            Someone about to spend money should be able to see which provider
+            it goes to without opening the settings below. */}
+        <span className="task-form-summary muted">
+          via <code>{provider}</code>, {concurrency} at a time
+        </span>
 
-        <label htmlFor="concurrency-input">Concurrency</label>
-        <input
-          id="concurrency-input"
-          type="number"
-          min={1}
-          max={12}
-          placeholder="default"
-          value={concurrency}
-          onChange={(e) => setConcurrency(e.target.value)}
-          disabled={submitting}
-        />
-
-        <button type="submit" disabled={submitting || busy}>
+        <button type="submit" disabled={submitting || busy || settingsInvalid}>
           {submitting ? 'Starting…' : 'Start run'}
         </button>
       </div>
 
+      {settingsInvalid && (
+        <p className="form-error">
+          {blockedReason ?? 'Fix the settings below before starting a run.'}
+        </p>
+      )}
       {error !== undefined && <p className="form-error">{error}</p>}
     </form>
   );

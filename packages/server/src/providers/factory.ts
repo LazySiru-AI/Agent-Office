@@ -2,7 +2,9 @@ import {
   MANAGER_PLAN_ASSIGNMENT_ID,
   MANAGER_SYNTHESIS_ASSIGNMENT_ID,
 } from '../orchestrator/manager.js';
+import { AnthropicProvider } from './anthropic/provider.js';
 import { ClaudeCodeProvider } from './claude-code/provider.js';
+import { OpenAiCompatibleProvider } from './openai/provider.js';
 import { ScriptedProvider } from './scripted.js';
 import type { AgentProvider } from './types.js';
 
@@ -191,7 +193,67 @@ export function scriptedPlanJson(task: string, known: ReadonlySet<string>): stri
  * The HTTP layer quotes this list when it rejects a request, so a user who asks
  * for `anthropic` is told what is available instead of what is conceivable.
  */
-export const AVAILABLE_PROVIDER_IDS = ['scripted', 'claude-code'] as const;
+export const AVAILABLE_PROVIDER_IDS = [
+  'scripted',
+  'claude-code',
+  'anthropic',
+  'openai',
+  'deepseek',
+] as const;
+
+/**
+ * What a run uses when nobody says otherwise.
+ *
+ * The local Claude Code CLI, because it is the one engine on this machine that
+ * needs no key in a file — it uses the sign-in the user already has. The HTTP
+ * adapters take over the moment `ANTHROPIC_API_KEY` and friends appear in
+ * `.env`; until then they report themselves unavailable and the settings panel
+ * shows why.
+ *
+ * This used to be `scripted`, which was right while there was nothing else that
+ * worked and is wrong now: a default that quietly calls no model produces a
+ * report full of placeholder text that looks like a finished run. The trade is
+ * deliberate — the default now spends money — so every test that must not
+ * spend passes `scripted` explicitly rather than relying on the default.
+ */
+export const DEFAULT_PROVIDER = 'claude-code';
+
+/**
+ * Ask every provider whether it could run, for `GET /api/providers` (Phase 7).
+ *
+ * Constructing each one is cheap and synchronous by contract, and
+ * `isAvailable()` is documented to make no network call — so this is a fast
+ * route that cannot hang. It asks the adapters rather than re-deriving
+ * readiness from environment variables here, because a second copy of "what
+ * does this provider need" would drift from the first the moment one changed.
+ *
+ * A provider that throws while being *constructed* is reported as unavailable
+ * rather than failing the whole route: one broken adapter should not stop a
+ * user seeing that the other four are fine.
+ */
+export async function probeProviders(
+  knownAgentNames: ReadonlySet<string>,
+): Promise<{ id: string; available: boolean; reason?: string }[]> {
+  const probes = AVAILABLE_PROVIDER_IDS.map(async (id) => {
+    try {
+      const provider = makeProvider(id, 'readiness probe', knownAgentNames);
+      const availability = await provider.isAvailable();
+      return {
+        id,
+        available: availability.ok,
+        ...(availability.reason === undefined ? {} : { reason: availability.reason }),
+      };
+    } catch (error) {
+      return {
+        id,
+        available: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+
+  return Promise.all(probes);
+}
 
 /**
  * Build the provider for one run.
@@ -295,10 +357,39 @@ export function makeProvider(
     });
   }
 
+  if (id === 'openai' || id === 'deepseek') {
+    // One adapter for both: DeepSeek serves the OpenAI Chat Completions shape,
+    // and everything that differs between them — key variable, base URL, model
+    // — is already absorbed by `resolveApiConfig`. A second near-identical file
+    // would be two places to fix the next streaming bug.
+    return new OpenAiCompatibleProvider(id, {
+      ...(options.model === undefined ? {} : { model: options.model }),
+      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+    });
+  }
+
+  if (id === 'anthropic') {
+    return new AnthropicProvider({
+      ...(options.model === undefined ? {} : { model: options.model }),
+      ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
+    });
+  }
+
   throw new UnknownProviderError(
     `unknown provider "${id}". Known: ${AVAILABLE_PROVIDER_IDS.join(', ')}.`,
   );
 }
+
+/**
+ * `maxCostUsd` reaches only the Claude Code adapter.
+ *
+ * The CLI has `--max-budget-usd`; a raw API call has no equivalent, so for the
+ * HTTP providers spend is bounded only by `maxOutputTokens` per call and the
+ * tool-round limit. That is a real gap rather than an oversight, and it is
+ * recorded here because the option is accepted by `makeProvider` for every
+ * provider and silently ignored by three of them — which is exactly the sort of
+ * thing that reads as working until the bill arrives.
+ */
 
 /**
  * Raised when the requested provider id cannot be constructed.

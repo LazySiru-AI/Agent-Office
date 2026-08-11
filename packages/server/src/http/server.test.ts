@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from 'vitest';
+﻿import { afterEach, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import { API, ServerMessageSchema, type ServerMessage } from '@agent-office/shared';
 import { MemoryRunStore } from '../store/memoryStore.js';
@@ -62,6 +62,17 @@ function expectApiError(body: string): string {
   return String(error);
 }
 
+/**
+ * Timeout for the handful of tests that drive a whole run end to end.
+ *
+ * Not a blanket raise. These each load a registry, start a supervisor and walk
+ * a full plan through the store — genuinely 3-5 seconds of real work, so
+ * vitest's 5s default was always within noise of failing. It began failing
+ * reliably once Phase 7 added ~190 tests: the work did not get slower, it just
+ * stopped being alone on the disk. Raising the default for every test would
+ * hide a real hang somewhere else, so only the honestly-slow tests get room.
+ */
+const SLOW_RUN_TIMEOUT_MS = 20_000;
 describe('GET /api/health', () => {
   it('answers without touching the store, so it works as a readiness probe', async () => {
     const { app } = await setup();
@@ -106,7 +117,7 @@ describe('POST /api/runs', () => {
     const run = await waitForTerminal(supervisor, runId);
     expect(run.status).toBe('done');
     expect(run.assignments).toHaveLength(3);
-  });
+  }, SLOW_RUN_TIMEOUT_MS);
 
   it('answers while the run is still executing', async () => {
     // The scripted provider finishes a whole run in milliseconds, so proving
@@ -250,7 +261,7 @@ describe('POST /api/runs/:runId/cancel (FR-M9)', () => {
 
     expect(response.statusCode).toBe(409);
     expect(expectApiError(response.body)).toMatch(/already finished/);
-  });
+  }, SLOW_RUN_TIMEOUT_MS);
 
   it('returns 404 for an unknown run', async () => {
     const { app } = await setup();

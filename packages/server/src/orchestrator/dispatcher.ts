@@ -52,6 +52,23 @@ export interface DispatchDeps {
   run: RunState;
   registry: Registry;
   provider: AgentProvider;
+  /**
+   * Per-agent provider selection (Phase 7).
+   *
+   * Returning `undefined` means "use the run's provider", which is what makes
+   * this additive: a caller that does not care never supplies it, and the run
+   * behaves exactly as before. It is a function rather than a
+   * `Record<agentName, AgentProvider>` because a provider is a live object with
+   * a connection and a cost, and building all of them up front to route one
+   * assignment would be wasteful for the common case where they are all the
+   * same.
+   *
+   * Why per *agent* and not per *assignment*: the reason to vary a provider is
+   * a property of the specialist, not of the job — a cheap model for a
+   * mechanical summarisation agent, a stronger one for the reviewer. Keying on
+   * assignment id would mean re-deciding for every plan.
+   */
+  providerFor?: (agentName: string) => AgentProvider | undefined;
   store: RunStore;
   /** Cancellation (FR-M9). */
   signal: AbortSignal;
@@ -99,6 +116,7 @@ interface DispatchContext {
   plan: RunPlan;
   registry: Registry;
   provider: AgentProvider;
+  providerFor: ((agentName: string) => AgentProvider | undefined) | undefined;
   store: RunStore;
   signal: AbortSignal;
   options: DispatchOptions;
@@ -129,6 +147,7 @@ export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
     plan,
     registry: deps.registry,
     provider: deps.provider,
+    providerFor: deps.providerFor,
     store: deps.store,
     signal: deps.signal,
     options: { ...DEFAULT_DISPATCH_OPTIONS, ...deps.options },
@@ -232,8 +251,13 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
   let fatalError: string | undefined;
   const usage = { ...EMPTY_USAGE };
 
+  // Resolved per assignment, not hoisted: a run may legitimately field two
+  // providers, and caching one here would silently apply the first
+  // assignment's choice to the rest.
+  const provider = ctx.providerFor?.(assignment.agentName) ?? ctx.provider;
+
   try {
-    for await (const event of ctx.provider.run({
+    for await (const event of provider.run({
       assignmentId,
       systemPrompt: agent.systemPrompt,
       task: brief,

@@ -4,12 +4,14 @@ import {
   AgentListResponseSchema,
   CreateRunRequestSchema,
   CreateRunResponseSchema,
+  ProviderListResponseSchema,
   ReportResponseSchema,
   RunEventsResponseSchema,
   RunListResponseSchema,
   RunStateSchema,
   type AgentSummary,
   type CreateRunRequest,
+  type ProviderInfo,
   type ReportResponse,
   type RunEventsResponse,
   type RunState,
@@ -74,6 +76,17 @@ export function fetchAgents(): Promise<AgentSummary[]> {
 
 export function fetchRuns(): Promise<RunSummary[]> {
   return getJson(API.runs(), RunListResponseSchema).then((r) => r.runs);
+}
+
+/**
+ * Which providers this server can actually run (Phase 7).
+ *
+ * Availability depends on the server's environment — an API key, a CLI on its
+ * PATH — none of which the browser can see. Offering a provider the server
+ * cannot construct would mean a run that fails a minute after it starts.
+ */
+export function fetchProviders(): Promise<ProviderInfo[]> {
+  return getJson(API.providers(), ProviderListResponseSchema).then((r) => r.providers);
 }
 
 export function fetchRun(runId: string): Promise<RunState> {

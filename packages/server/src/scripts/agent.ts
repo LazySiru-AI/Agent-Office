@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import type { AgentEvent } from '@agent-office/shared';
 import { ClaudeCodeProvider } from '../providers/claude-code/provider.js';
 import { resolveClaudeCodeTools } from '../providers/claude-code/tools.js';
+import { loadDotEnv } from '../env.js';
 import { loadRegistry } from '../registry/index.js';
 
 /**
@@ -119,6 +120,9 @@ function render(event: AgentEvent): string {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+
+  // Before the provider resolves its key from the environment.
+  loadDotEnv(DEFAULT_REPO_ROOT);
 
   const registry = await loadRegistry(DEFAULT_REPO_ROOT);
   const agent = registry.byName.get(options.agentName);

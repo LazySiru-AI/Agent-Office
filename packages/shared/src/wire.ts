@@ -31,6 +31,16 @@ import { RunStatusSchema } from './status.js';
 export const API = {
   health: () => '/api/health',
   agents: () => '/api/agents',
+  /**
+   * Which providers this server can actually construct, and why not (Phase 7).
+   *
+   * Answered by the server rather than assumed by the client because
+   * availability depends on the *server's* environment — an API key, a CLI on
+   * its PATH. The browser has no way to know any of that, and a settings panel
+   * that offered `anthropic` on a machine with no key would be offering a run
+   * that fails a minute later.
+   */
+  providers: () => '/api/providers',
   runs: () => '/api/runs',
   run: (runId: string) => `/api/runs/${encodeURIComponent(runId)}`,
   cancelRun: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/cancel`,
@@ -120,6 +130,32 @@ export const AgentListResponseSchema = z.object({
 });
 
 export type AgentListResponse = z.infer<typeof AgentListResponseSchema>;
+
+/**
+ * One provider's readiness (Phase 7).
+ *
+ * `reason` is deliberately human text rather than a code: the only consumer is
+ * a line in a settings panel, and "ANTHROPIC_API_KEY is not set" is the whole
+ * answer. A code would need a lookup table on the client that could only ever
+ * say the same sentence less directly.
+ *
+ * Note what is absent: no key, no endpoint, no model. Availability is the only
+ * thing the browser needs, and anything more would put credentials one
+ * screenshot away from being shared.
+ */
+export const ProviderInfoSchema = z.object({
+  id: z.string().min(1),
+  available: z.boolean(),
+  reason: z.string().optional(),
+});
+
+export type ProviderInfo = z.infer<typeof ProviderInfoSchema>;
+
+export const ProviderListResponseSchema = z.object({
+  providers: z.array(ProviderInfoSchema),
+});
+
+export type ProviderListResponse = z.infer<typeof ProviderListResponseSchema>;
 
 export const ReportResponseSchema = z.object({
   path: z.string(),

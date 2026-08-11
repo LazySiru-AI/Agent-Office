@@ -237,10 +237,15 @@ button[aria-pressed='true'] {
   gap: 0.25rem;
 }
 
+/* Two rows now, not one: the status chip, live dot and age sit above the task
+   text rather than competing with it for the same line. A sidebar this narrow
+   cannot show a badge, a timestamp and a sentence side by side without the
+   sentence becoming three words. */
 .run-list-item {
   display: flex;
-  align-items: center;
-  gap: 0.4rem;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0.25rem;
   width: 100%;
   text-align: left;
   padding: 0.4rem;
@@ -249,6 +254,49 @@ button[aria-pressed='true'] {
   color: var(--ao-ink);
   font-size: 0.85rem;
   font-family: var(--ao-font-sans);
+}
+
+.run-list-head {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.run-list-age {
+  margin-left: auto;
+  font-family: var(--ao-font-mono);
+  font-size: 0.72rem;
+  color: var(--ao-ink-mute);
+}
+
+.run-list-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  margin-bottom: 0.6rem;
+}
+
+.run-list-search {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+  font-size: 0.75rem;
+}
+
+.run-list-search input {
+  width: 100%;
+}
+
+.run-list-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+}
+
+.run-list-filters button {
+  padding: 0.15rem 0.45rem;
+  font-size: 0.72rem;
+  font-family: var(--ao-font-mono);
 }
 
 .run-list-item.selected {
@@ -554,6 +602,78 @@ button[aria-pressed='true'] {
   display: flex;
   gap: 0.4rem;
   align-items: center;
+}
+
+/* --- Settings panel (Phase 7) ---
+   Layout only. The provider buttons inherit the global `button` and
+   `button[aria-pressed='true']` rules, so a selected provider reads as "on" in
+   the same visual language as every other toggle in the app. */
+
+.settings-panel {
+  border-top: 1px solid var(--ao-line);
+  padding-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.settings-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.settings-label {
+  flex-basis: 100%;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ao-ink-mute);
+}
+
+.settings-group button {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+}
+
+.settings-field {
+  flex-basis: 100%;
+  display: grid;
+  grid-template-columns: 1fr minmax(5rem, auto);
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.8rem;
+}
+
+.settings-field input {
+  width: 100%;
+}
+
+/* A disabled provider stays visible: "anthropic exists but has no key" is more
+   useful than an option that silently isn't there. */
+.settings-provider-reason {
+  flex-basis: 100%;
+  font-size: 0.72rem;
+  color: var(--ao-ink-mute);
+  font-family: var(--ao-font-mono);
+}
+
+.settings-error {
+  flex-basis: 100%;
+  grid-column: 1 / -1;
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--ao-status-bad);
+}
+
+.task-form-summary {
+  font-size: 0.78rem;
+}
+
+.task-form-summary code {
+  font-family: var(--ao-font-mono);
+  color: var(--ao-accent);
 }
 
 /* --- Display controls (FR-U5, FR-U7) ---

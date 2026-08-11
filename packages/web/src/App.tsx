@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { AgentSummary } from '@agent-office/shared';
-import { fetchAgents } from './api.js';
+import type { ProviderInfo } from '@agent-office/shared';
+import { fetchAgents, fetchProviders } from './api.js';
 import { buildAgentModelIndex } from './costModel.js';
 import { AssignmentTable } from './panels/AssignmentTable.js';
 import { DisplayControls } from './panels/DisplayControls.js';
@@ -11,10 +12,12 @@ import { ReplayControls } from './panels/ReplayControls.js';
 import { ReportViewer } from './panels/ReportViewer.js';
 import { RunHeader } from './panels/RunHeader.js';
 import { RunList } from './panels/RunList.js';
+import { SettingsPanel } from './panels/SettingsPanel.js';
 import { TaskForm } from './panels/TaskForm.js';
 import { OfficeCanvas } from './sim/OfficeCanvas.js';
 import { useReplay } from './state/useReplay.js';
 import { useAgentOffice } from './state/useRun.js';
+import { useSettings } from './state/useSettings.js';
 import { useTheme } from './theme/useTheme.js';
 
 /**
@@ -45,6 +48,17 @@ export function App(): JSX.Element {
   // conditional would mean the palette stops tracking the OS the moment that
   // branch unmounts.
   const theme = useTheme();
+  const settings = useSettings();
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+
+  // A provider the server has already said it cannot construct is not a
+  // settings *error* — the value is perfectly valid — but starting a run with
+  // it is guaranteed to fail a moment later. Blocking here turns a confusing
+  // mid-run failure into a reason shown next to the control that caused it.
+  // Unknown providers are not blocked: an empty or failed `/api/providers`
+  // must not lock the user out of starting anything.
+  const selectedProvider = providers.find((p) => p.id === settings.settings.provider);
+  const providerUnavailable = selectedProvider !== undefined && !selectedProvider.available;
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentsError, setAgentsError] = useState<string | undefined>(undefined);
   const [selectedReportPath, setSelectedReportPath] = useState<string | undefined>(undefined);
@@ -58,6 +72,16 @@ export function App(): JSX.Element {
     fetchAgents()
       .then(setAgents)
       .catch((err: unknown) => setAgentsError(err instanceof Error ? err.message : String(err)));
+  }, []);
+
+  // Availability depends on the server's environment — a key, a CLI on its
+  // PATH — so the browser has to ask. A failure here is deliberately not
+  // surfaced as an error: the settings panel simply shows no providers, which
+  // is honest, and the run itself still reports a real reason if one is picked.
+  useEffect(() => {
+    fetchProviders()
+      .then(setProviders)
+      .catch(() => setProviders([]));
   }, []);
 
   // A newly selected run has no bearing on a previously chosen assignment
@@ -86,12 +110,29 @@ export function App(): JSX.Element {
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <TaskForm onStart={office.startRun} busy={false} />
+        <TaskForm
+          onStart={office.startRun}
+          provider={settings.settings.provider}
+          concurrency={settings.settings.concurrency}
+          settingsInvalid={Object.keys(settings.errors).length > 0 || providerUnavailable}
+          {...(providerUnavailable
+            ? { blockedReason: selectedProvider?.reason ?? `${settings.settings.provider} is unavailable` }
+            : {})}
+          busy={false}
+        />
         {office.runsError !== undefined && <p className="form-error">{office.runsError}</p>}
         <RunList runs={office.runs} selectedRunId={office.selectedRunId} onSelect={office.selectRun} />
         {agentsError !== undefined && (
           <p className="form-error">agent roster unavailable: {agentsError}</p>
         )}
+
+        <SettingsPanel
+          settings={settings.settings}
+          errors={settings.errors}
+          providers={providers}
+          onChange={settings.setSetting}
+          onReset={settings.reset}
+        />
 
         {/* Last in the sidebar, and outside the `shownRun` guard below: display
             preferences must be reachable before a run exists, which is exactly

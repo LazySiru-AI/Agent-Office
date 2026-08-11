@@ -39,6 +39,17 @@ export const SYNTHESIS_REPORT_PATH = 'report.md';
 export interface ExecuteRunDeps {
   registry: Registry;
   provider: AgentProvider;
+  /**
+   * Per-agent provider override (Phase 7). Passed straight through to the
+   * dispatcher; see the note on `DispatchDeps.providerFor`.
+   *
+   * Only the *assignment* dispatch consults it. The Manager's planning and
+   * synthesis turns stay on the run's provider deliberately: they are the two
+   * calls that decide what the whole run does and how it reads, and letting
+   * them vary per agent would mean a run whose plan came from one model and
+   * whose report came from another, with nothing recording which.
+   */
+  providerFor?: (agentName: string) => AgentProvider | undefined;
   store: RunStore;
   /** The user's task, verbatim. */
   task: string;

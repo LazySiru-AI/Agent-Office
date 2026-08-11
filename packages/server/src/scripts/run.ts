@@ -2,7 +2,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { AgentEvent } from '@agent-office/shared';
 import { loadRegistry } from '../registry/index.js';
-import { makeProvider } from '../providers/factory.js';
+import { loadDotEnv } from '../env.js';
+import { DEFAULT_PROVIDER, makeProvider } from '../providers/factory.js';
 import { FileRunStore, defaultRunsRoot } from '../store/fileStore.js';
 import { executeRun } from '../orchestrator/runner.js';
 
@@ -37,7 +38,8 @@ const USAGE = `
 Usage: npm run run -- "<task>" [options]
 
 Options:
-  --provider <id>      scripted (default, free) or claude-code (real spend).
+  --provider <id>      Engine to run agents through (default: claude-code,
+                       which spends real money). 'scripted' is free.
   --concurrency <n>    Parallel assignments per phase (default 3).
   --timeout <ms>       Per-assignment timeout (default 600000).
   --budget <tokens>    Total run token budget. Unlimited when omitted.
@@ -96,7 +98,7 @@ function parseArgs(argv: string[]): CliOptions {
 
   return {
     task,
-    provider: flags.get('provider') ?? 'scripted',
+    provider: flags.get('provider') ?? DEFAULT_PROVIDER,
     repoRoot: path.resolve(flags.get('repo-root') ?? process.env['AGENT_OFFICE_REPO_ROOT'] ?? DEFAULT_REPO_ROOT),
     runsRoot: path.resolve(flags.get('runs-root') ?? defaultRunsRoot()),
     quiet: flags.get('quiet') === 'true',
@@ -108,6 +110,9 @@ function parseArgs(argv: string[]): CliOptions {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+
+  // Before any provider resolves its key from the environment.
+  loadDotEnv(options.repoRoot);
 
   // The registry loads first: the scripted provider's canned plan has to name
   // agents that actually exist, and is validated against these names.

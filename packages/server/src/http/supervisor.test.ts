@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+﻿import { describe, expect, it } from 'vitest';
 import {
   EVENT_BUFFER_LIMIT,
   type RunState,
@@ -18,7 +18,7 @@ import {
 /**
  * The supervisor is the only part of Phase 3 that owns *time*: a run outlives
  * the request that started it. These tests are therefore mostly about what is
- * true at particular moments — right after `startRun` returns, while a run is
+ * true at particular moments â€” right after `startRun` returns, while a run is
  * hanging, and after it has ended.
  */
 
@@ -37,6 +37,17 @@ function makeSupervisor(
   return { supervisor, store, warnings };
 }
 
+/**
+ * Timeout for the handful of tests that drive a whole run end to end.
+ *
+ * Not a blanket raise. These each load a registry, start a supervisor and walk
+ * a full plan through the store — genuinely 3-5 seconds of real work, so
+ * vitest's 5s default was always within noise of failing. It began failing
+ * reliably once Phase 7 added ~190 tests: the work did not get slower, it just
+ * stopped being alone on the disk. Raising the default for every test would
+ * hide a real hang somewhere else, so only the honestly-slow tests get room.
+ */
+const SLOW_RUN_TIMEOUT_MS = 20_000;
 describe('RingBuffer', () => {
   it('keeps the newest entries and reports that it dropped the rest', () => {
     // The dropped flag is what `snapshot.truncated` is built from. Without it a
@@ -100,7 +111,7 @@ describe('RunSupervisor.startRun', () => {
     expect(run.assignments.every((assignment) => assignment.status === 'done')).toBe(true);
     expect(run.reportPath).toBe('report.md');
     expect(supervisor.liveRunIds()).not.toContain(runId);
-  });
+  }, SLOW_RUN_TIMEOUT_MS);
 
   it('rejects an unknown provider without creating a run', async () => {
     const store = new MemoryRunStore();
@@ -116,7 +127,7 @@ describe('RunSupervisor.startRun', () => {
 describe('RunSupervisor buffering and snapshots (NFR-2)', () => {
   it('serves a live run from memory with its buffered events', async () => {
     // `lead` hangs, so the run is guaranteed to still be executing when the
-    // snapshot is taken — which is the state a mid-run refresh lands in.
+    // snapshot is taken â€” which is the state a mid-run refresh lands in.
     const { supervisor } = makeSupervisor({ lead: { hang: true } });
 
     const runId = await supervisor.startRun({ task: 'Analyse the thing.' });
@@ -221,7 +232,7 @@ describe('RunSupervisor subscriptions', () => {
     expect(received).toHaveLength(countAtUnsubscribe);
     // Two full orchestrator runs, back to back. Vitest's 5s default is tight
     // for that on its own, and Phase 5 added a suite that launches a real
-    // browser in a parallel worker — enough CPU contention to tip this over.
+    // browser in a parallel worker â€” enough CPU contention to tip this over.
     // The generous budget is about scheduling, not about waiting for anything:
     // every wait in here polls at 5ms and returns as soon as its condition holds.
   }, 30_000);
@@ -303,7 +314,7 @@ describe('RunSupervisor cancellation (FR-M9)', () => {
 describe('RunSupervisor failure containment', () => {
   it('survives a store that cannot persist, instead of taking the process down', async () => {
     // The background task is awaited by nobody, so an escaping rejection would
-    // be an unhandled rejection — which ends the Node process and every other
+    // be an unhandled rejection â€” which ends the Node process and every other
     // run with it. This test would fail as an unhandled rejection, not an
     // assertion, if that containment were removed.
     const store = new MemoryRunStore();

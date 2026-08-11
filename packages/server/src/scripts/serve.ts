@@ -1,8 +1,9 @@
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { loadDotEnv } from '../env.js';
 import { buildServer } from '../http/server.js';
 import { RunSupervisor } from '../http/supervisor.js';
-import { AVAILABLE_PROVIDER_IDS } from '../providers/factory.js';
+import { AVAILABLE_PROVIDER_IDS, DEFAULT_PROVIDER } from '../providers/factory.js';
 import { loadRegistry } from '../registry/index.js';
 import { FileRunStore, defaultRunsRoot } from '../store/fileStore.js';
 
@@ -48,7 +49,8 @@ const USAGE = `
 Usage: npm run serve [-- options]
 
 Options:
-  --provider <id>      Default provider for new runs (default: scripted).
+  --provider <id>      Default provider for new runs (default: ${DEFAULT_PROVIDER}).
+                       Use 'scripted' for a free, no-model dry run.
   --port <n>           Listen port (default ${DEFAULT_PORT}, or $PORT).
   --concurrency <n>    Default parallel assignments per phase (default 3).
   --timeout <ms>       Default per-assignment timeout (default 600000).
@@ -99,7 +101,7 @@ function parseArgs(argv: string[]): CliOptions {
   const timeoutMs = numeric('timeout');
 
   return {
-    provider: flags.get('provider') ?? 'scripted',
+    provider: flags.get('provider') ?? DEFAULT_PROVIDER,
     port: numeric('port', process.env['PORT']) ?? DEFAULT_PORT,
     repoRoot: path.resolve(
       flags.get('repo-root') ?? process.env['AGENT_OFFICE_REPO_ROOT'] ?? DEFAULT_REPO_ROOT,
@@ -113,6 +115,15 @@ function parseArgs(argv: string[]): CliOptions {
 
 async function main(): Promise<void> {
   const options = parseArgs(process.argv.slice(2));
+
+  // Before anything reads `process.env`: the provider adapters resolve their
+  // keys at construction, and a `.env` loaded after that would be ignored.
+  const env = loadDotEnv(options.repoRoot);
+  if (env.path !== undefined && env.applied.length > 0) {
+    // Names only, never values — a terminal scrollback is the one place people
+    // paste from without reading.
+    process.stdout.write(`Loaded ${env.applied.length} variable(s) from .env: ${env.applied.join(', ')}\n`);
+  }
 
   if (!AVAILABLE_PROVIDER_IDS.includes(options.provider as (typeof AVAILABLE_PROVIDER_IDS)[number])) {
     // Checked at startup rather than on the first request: a typo in a flag

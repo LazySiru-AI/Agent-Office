@@ -463,7 +463,7 @@ routing errors documented and addressed.
 produce a sensible team and a valid PDF, the two tax agents are written
 (catalog: 156), the review loop is built and wired, and three routing defects
 were found and fixed. But every team above was chosen by the scripted provider's
-*presets*, not by a model — the `claude` CLI is not available on this machine —
+*presets*, not by a model — the Claude Code CLI is installed but not signed in —
 so the teams are correct by construction and **the Manager's routing judgement
 remains untested**. "Tune Manager selection prompts where routing picks the
 wrong team" is therefore deferred, not delivered: there is nothing to tune until
@@ -488,6 +488,26 @@ Also corrected here: `ASSIGNMENT_TRANSITIONS` claimed to support FR-M10 via
 
 **Exit:** the same task runs identically through Claude Code and through a raw
 API provider, with only a dropdown changing.
+
+**Outcome — built, and the exit criterion is unprovable here.** All three
+adapters exist behind the same seam, the dropdown is real, and provider choice
+is per run *or per agent*. What cannot be done on this machine is the comparison
+the criterion asks for: there is no API key, and the Claude Code CLI is
+installed but not signed in, so no task has run through any of them. The
+adapters are verified against local fake servers speaking the documented wire
+format — which proves this code's behaviour and proves nothing about whether
+that format matches the live API. That distinction is stated in every file
+concerned rather than glossed.
+
+The filesystem tools an API provider must supply itself are the part that *is*
+fully verified, because escaping a sandbox needs no credentials: traversal,
+absolute and UNC paths, prefix-sibling directories and case-insensitive
+comparison are all tested against a real filesystem. Symlink escapes are
+implemented but unverified — Windows refused to create a symlink without
+Developer Mode, and those four tests skip loudly rather than passing quietly.
+
+SQLite was not adopted. The plan made it conditional on JSON-on-disk hurting,
+and at thirty runs it does not.
 
 ### Phase 8 — Dark neon terminal interface — **done**
 

@@ -18,8 +18,8 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2, 3, 4, 5, 6 and 8 are done and verified.** 820 tests pass,
-typecheck is clean, the registry indexes 156 agents, and you can drive a run
+**Phases 0, 2, 3, 4, 5, 6, 7 and 8 are done.** 1,006 tests pass, typecheck is
+clean, the registry indexes 156 agents, and you can drive a run
 from the browser — watch the team work in a pixel office, click a character to inspect
 it, refresh mid-run without losing it, cancel it, read the reports in-app,
 replay a finished run offline, and download a themed PDF. The whole app wears
@@ -38,7 +38,7 @@ installed on the machine, fully offline.
 | 4 | Pixel office sim | done |
 | 5 | Designer step + PDF export | done |
 | 6 | Domain breadth + review loop | done (routing untested — no model) |
-| 7 | More providers | not started |
+| 7 | Anthropic / OpenAI / DeepSeek adapters | built (unverified — no key) |
 | 8 | Dark neon terminal interface | done |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
@@ -52,6 +52,21 @@ claude auth login
 
 Then `npm run agent -- "<task>"` runs a single agent for real. That is the first
 thing in this project that spends money.
+
+**The local CLI is the default provider for every agent.** If you would rather
+use a raw API, copy `.env.example` to `.env` and add a key:
+
+```bash
+cp .env.example .env
+```
+
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` or `DEEPSEEK_API_KEY` is enough — the
+settings panel picks the provider up on the next server start and says why any
+provider it cannot use is unavailable. `.env` is gitignored. Keys are read by
+the server only; they are never sent to, stored by, or displayed in the browser.
+
+Use `--provider scripted` (or the Settings panel) for a free dry run that calls
+no model at all.
 
 ## Layout
 
@@ -78,10 +93,17 @@ Print the agent registry (the Phase 0 exit criterion — it should list 156):
 npm run registry:dump
 ```
 
-Run a task end to end with the no-cost scripted provider:
+Run a task end to end with the no-cost scripted provider (no model is called):
 
 ```bash
 npm run run -- "Review our vendor NDA for unusual terms" --provider scripted
+```
+
+Or for real, through whichever provider is configured — the local CLI by
+default:
+
+```bash
+npm run run -- "Review our vendor NDA for unusual terms"
 ```
 
 Run a single agent through the real Claude Code CLI (needs `claude auth login`,
