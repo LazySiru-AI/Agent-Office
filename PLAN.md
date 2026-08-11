@@ -273,13 +273,17 @@ the style.
 |---|---|---|
 | FR-S1 | M | Render a top-down pixel office: Manager desk plus one desk per assigned agent, laid out on a grid that reflows for 1–12 agents. |
 | FR-S2 | M | Each agent gets a deterministic sprite: `hash(agentName)` → base sprite + palette, so the same agent always looks the same across runs. |
-| FR-S3 | M | Character behaviour is derived purely from assignment status (table §1.5). No animation state that the orchestrator doesn't own. |
+| FR-S3 | M | Character behaviour is derived purely from orchestrator-owned state — assignment status (table §1.5), and from Phase 9 the current tool. No animation state the orchestrator doesn't own. *(Widened by FR-S11: "purely from assignment status" was the original wording, and it ruled out the `tool` events we already emit and never drew. The invariant that matters is the second sentence, not the first.)* |
 | FR-S4 | M | A nameplate shows the agent's name; hovering shows its category and one-line description. |
 | FR-S5 | M | Clicking a character opens an inspect panel: live log tail, current tool activity, token usage, and its report when ready. |
 | FR-S6 | S | Hand-off animation — the character physically carries a paper sprite to the Manager on `reporting`. |
 | FR-S7 | S | Runs at 60fps with 12 animated characters on integrated graphics; pauses rendering when the tab is hidden. |
 | FR-S8 | C | Ambient detail: coffee machine, plants, day/night tint tracking run duration. |
 | FR-S9 | C | Sprite pack is swappable via a manifest, so the art can be replaced without code changes. |
+| FR-S10 | M | The office states each agent's **model**, and its live token spend, cost and current tool, without requiring a click. How much of that each desk shows is user-controlled (minimal / normal / verbose), because the office's advantage over the table is that it is scannable. |
+| FR-S11 | S | The `working` animation is refined by the current tool — reading tools read, writing tools type — sourced from the `tool` events the adapter already emits. Refines FR-S3; status remains the source of truth for *behaviour*, tool only for which working loop plays. |
+| FR-S12 | S | Hover and **keyboard focus** produce the same character highlight as clicking. The office's text alternative is a real focusable control per agent, so a mouse-only highlight would regress the keyboard access it provides. |
+| FR-S13 | C | User-controlled zoom, at integer steps only — fractional scaling blurs pixel art, which is why the renderer picks whole numbers today. |
 
 **Art sourcing.** v1 uses a CC0/permissive pack (Kenney-style) behind the FR-S9
 manifest abstraction. Licence terms must be checked and recorded in a
@@ -553,6 +557,132 @@ eight colour tokens rather than the eighteen statuses, so the status list lives
 only in TypeScript where it is compile-checked. Scanlines and flicker were not
 built; the motion switch and reduced-motion gating cover the effects that exist.
 
+### Phase 9 — The office that tells you what it is doing
+
+Prompted by a review of [pixel-agents](https://github.com/pixel-agents-hq/pixel-agents)
+(8.8k stars, actively developed), which solves a near-identical problem — Claude
+Code sessions as pixel characters in a shared office — and solves parts of it
+better than we do. This phase takes the parts worth taking, credits them, and
+deliberately declines the rest.
+
+**The finding that motivates the phase.** `CharacterView` (`sim/model.ts`)
+carries `assignmentId`, `agentName`, `status`, `behaviour`, `appearance`, `home`
+and `target`. That is all the office knows. It does **not** know the agent's
+model, its provider, its token spend, its cost, or which tool it is running —
+every one of which we already have, and show, in `AssignmentTable` and
+`InspectPanel`. So the app's *default* view is its least informative one: a
+character types at a desk and the only way to learn it is `code-reviewer` on
+`haiku` having spent $0.004 is to switch to the table or click the sprite. The
+office looks like the product and behaves like a decoration.
+
+**What pixel-agents does better, and why.**
+
+| Their technique | Our current state |
+|---|---|
+| `Character.currentTool` drives a read-vs-type animation | We emit `tool` events with names and the sim ignores them entirely |
+| Bubble fade-in, per-pixel spawn/despawn transition | Binary state swaps — a character teleports between animations |
+| Hover and selection drawn as a silhouette outline at two alphas | One selection ring; no hover affordance |
+| Overlay text labels near a character ("Waiting for input") | A nameplate with a name and nothing else |
+| Explicit zoom controls | Automatic integer scale only; no user control |
+| Idle wander with rest cycles | Idle is a single static loop |
+
+**What we have that they do not, and should lean into.** A real Manager with a
+validated plan, phases and dependencies; per-agent models from catalog
+frontmatter; real cost accounting; and replay. Their roadmap lists orchestrator
+characters and token-budget health bars as *future* work. We have the data for
+both today and simply do not draw it.
+
+#### 9.1 Put the run's own facts on the floor (the core of the phase)
+
+- Extend `CharacterView` with `model`, `provider`, `usage`, `costUsd` and
+  `currentTool`. All of it exists already — `agentModelByName` and
+  `summariseRunCost` are built in `App.tsx` and never reach `buildScene`.
+- **Two-line nameplate**: agent name, then a dim model badge (`haiku`,
+  `sonnet`, `—` for the 8 agents that declare none). The model is the single
+  most requested missing fact and the cheapest to add.
+- **A "now" line** under a working character, from the most recent `tool` event:
+  `Read src/auth.ts`, `Grep TODO`. `LogPane` already formats exactly this
+  string; the formatter moves somewhere both can call.
+- **A spend readout** per character, off by default behind a `DisplayControls`
+  toggle. Cost per agent is the thing you want when a run surprises you and
+  clutter the rest of the time.
+- **Density is a setting, not a guess.** One control — minimal / normal /
+  verbose — governs how much of the above each plate shows. A neon office that
+  renders five facts per desk at all times is less readable than one that
+  renders a name, which is the failure mode this phase must not ship.
+
+#### 9.2 Tool-driven animation
+
+`ASSIGNMENT_BEHAVIOUR` stays the single source of truth for *status* →
+behaviour. Tool refines only the `working` case: reading tools (`Read`, `Glob`,
+`Grep`) select a read loop, writing tools a type loop, everything else the
+current default. This is pixel-agents' `isReadingTool` idea applied to a map we
+already own, and it is the highest ratio of visible life to code in the phase.
+
+#### 9.3 Transitions instead of swaps
+
+Bubbles fade rather than appear. A character arriving gets a brief materialise
+effect; one reaching a terminal status gets a settle. A status change pulses the
+nameplate once. **All of it behind the existing `prefers-reduced-motion` check
+and the motion toggle (FR-U5)** — and the *information* must never live in the
+motion, since a reduced-motion user sees none of it.
+
+#### 9.4 Hover, selection, and keyboard parity
+
+Adopt the outline-silhouette technique: full alpha for selected, half for hover.
+**The keyboard path drives the identical highlight** — the office's text
+alternative (`OfficeTextAlternative`, added in the second QA pass) already
+exposes one focusable button per agent, and focusing one must light the same
+character. Otherwise this phase builds a mouse-only affordance on top of the
+keyboard access we just added.
+
+#### 9.5 Draw the thing they do not have: the plan
+
+- Phase banding on the floor, so "phase 2 is running" is visible rather than
+  inferred.
+- A reviewer that walks to its target's desk rather than to the Manager, since
+  FR-M10 means the dependency is the point.
+- The Manager's own turn made visible — it outspends the team on a small run and
+  is currently the least legible actor in the office.
+
+#### 9.6 Zoom and camera
+
+Explicit zoom in/out at integer steps, with the current auto-fit as the default
+and a reset. The integer-scale rule stays: fractional zoom blurs pixel art, and
+the 520px host already falls back to 1x on a three-row team.
+
+#### Deliberately not taken from pixel-agents
+
+The office layout editor, the furniture catalog, pets, asset-pack import, and
+sound notifications. Each is good work and each belongs to a different product:
+theirs is an ambient companion you decorate and leave running, ours is a tool
+you point at one task and read the report from. A tile painter would be the
+largest feature in this repo and would not make a single run easier to
+understand.
+
+**Exit:**
+
+1. Every fact the assignment table shows about a running agent — model, tokens,
+   cost, current tool — is legible from the office view without clicking, at the
+   default density.
+2. A working character animates differently for a read than for a write, driven
+   by real `tool` events.
+3. Focusing an agent from the keyboard highlights the same character clicking it
+   does, and the text alternative states model and current tool alongside status.
+4. Motion off and `prefers-reduced-motion` both still yield a fully usable,
+   fully informative office — nothing in 9.1 depends on an animation.
+5. No new colour literal in the client: everything added here resolves through
+   `theme/tokens.ts` (FR-U2), and the contrast grid covers any new text token.
+
+**Risk — clutter, and it is the whole risk.** Every item in 9.1 makes one desk
+busier, and the office's advantage over the table is that it is *scannable*. The
+density control is the mitigation, but the honest test is criterion 1 read
+against a five-agent run at default density: if the plate is unreadable there,
+the default is wrong, not the criterion. Second risk: 9.1 duplicates facts the
+table already renders, so both must read from one source — `costModel.ts` — or
+the office and the table will eventually disagree about what a run cost, which
+is precisely the class of defect the last two QA passes kept finding.
+
 ---
 
 ## 4. Risks
@@ -587,3 +717,12 @@ the product can *do*.
 The one thing worth resisting: building the office before Phase 3 proves the data
 flow. The sim is the fun part and the least informative one — if the orchestrator
 is wrong, a beautiful office just animates the wrong thing convincingly.
+
+Phase 9 inverts that warning rather than contradicting it. It is the right thing
+to take *now*, and only now, because the condition the warning set has been met:
+the orchestrator is proven, Phase 1's exit criterion is closed against a real
+signed-in CLI, and the numbers the office would display — model, tokens, cost —
+are ones two QA passes have already established are correct. Drawing them in
+Phase 4 would have been animating unverified figures convincingly; drawing them
+now is showing verified ones. It also touches only the client and no contract, so
+like Phase 8 it can be interleaved with anything still open.
