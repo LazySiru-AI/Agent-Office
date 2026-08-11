@@ -131,12 +131,16 @@ npm run run -- "Review our vendor NDA for unusual terms" --provider scripted
 
 ### Phase 0 exit criterion — met
 
-`npm run registry:dump` prints all **154** agents with their category and tool
+`npm run registry:dump` prints all **156** agents with their category and tool
 list, and **fails loudly** — with file path and line — on any malformed
 frontmatter, rather than silently dropping the offending agent.
 
-Verified: it prints 154 across 10 categories.
+Verified: it prints 156 across 10 categories.
 
-Note the count: `categories/**/*.md` matches 164 files, but 10 of those are
-category `README.md` files. The parser skips them. 154 is the number the dump
+Note the count: `categories/**/*.md` matches 166 files, but 10 of those are
+category `README.md` files. The parser skips them. 156 is the number the dump
 must print; anything else means the skip rule or the glob is wrong.
+
+The catalog was 154 as vendored. Phase 6 authored `tax-advisor` and
+`tax-compliance-specialist` into `07-specialized-domains`, because the catalog
+had no tax specialist of any kind — see `PROGRESS.md`.

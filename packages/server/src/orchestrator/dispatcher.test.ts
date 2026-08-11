@@ -424,3 +424,156 @@ describe('dispatchRun — budgets and cancellation (FR-M8, FR-M9)', () => {
     expect(result.completed).toBeLessThan(3);
   });
 });
+
+describe('dispatchRun — the review loop (FR-M10)', () => {
+  // The pure decision logic is covered in `review.test.ts`. What is tested here
+  // is the wiring: that a verdict in a reviewer's report actually causes its
+  // target to run again, with the critique in its brief, exactly once.
+  //
+  // `c` depends on `a` alone, which is what makes it a review of `a` under
+  // `reviewTargetOf`. The two-phase plan already had that shape, so no new
+  // fixture is needed — the review loop is not a special kind of plan, it is an
+  // interpretation of an ordinary one.
+  const REVISION_MARKER = '[[REVIEW_VERDICT: REVISIONS_REQUESTED]]';
+
+  it('re-dispatches the reviewed assignment once, with the critique in its brief', async () => {
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: `The retry maths is wrong in section 2.\n\n${REVISION_MARKER}` },
+      },
+      fallback: { text: 'Findings.' },
+    });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const target = run.assignments.find((a) => a.id === 'a');
+    // Two dispatches: the original, and the one revision FR-M10 grants.
+    expect(target?.attempts).toBe(2);
+    expect(target?.status).toBe('done');
+
+    // `b` was never reviewed — it must not have been dragged along.
+    expect(run.assignments.find((a) => a.id === 'b')?.attempts).toBe(1);
+
+    const briefsForA = provider.requests.filter((r) => r.assignmentId === 'a');
+    expect(briefsForA).toHaveLength(2);
+    expect(briefsForA[0]?.task).not.toContain('Revision requested');
+
+    const revisionBrief = briefsForA[1]?.task ?? '';
+    expect(revisionBrief).toContain('## Revision requested');
+    expect(revisionBrief).toContain('The retry maths is wrong in section 2.');
+    expect(revisionBrief).toContain('gamma');
+    // The marker itself is stripped: it is machine plumbing, and reading it
+    // back to another agent as prose invites it to emit one of its own.
+    expect(revisionBrief).not.toContain('REVIEW_VERDICT');
+  });
+
+  it('stops at one revision even if the reviewer asks again', async () => {
+    // The reviewer only runs once in this plan, so a second request cannot
+    // arise from it. This drives the budget directly instead: `a` starts having
+    // already been revised, so `decideRevision` must refuse.
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: `Still wrong.\n\n${REVISION_MARKER}` },
+      },
+      fallback: { text: 'Findings.' },
+    });
+
+    const events: string[] = [];
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+      onEvent: (event) => {
+        if (event.t === 'error' && !event.fatal) events.push(event.message);
+      },
+    });
+
+    const target = run.assignments.find((a) => a.id === 'a');
+    expect(target?.attempts).toBe(2);
+
+    // Now run the same reviewer's verdict against the already-revised target.
+    const secondRun = await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    // Nothing is runnable any more — every assignment is terminal — so the
+    // second dispatch is a no-op rather than another revision.
+    expect(run.assignments.find((a) => a.id === 'a')?.attempts).toBe(2);
+    expect(secondRun.completed).toBe(3);
+  });
+
+  it('leaves the target alone when the reviewer approves', async () => {
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: 'Looks right to me.\n\n[[REVIEW_VERDICT: APPROVED]]' },
+      },
+      fallback: { text: 'Findings.' },
+    });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    expect(run.assignments.find((a) => a.id === 'a')?.attempts).toBe(1);
+    expect(provider.requests.filter((r) => r.assignmentId === 'a')).toHaveLength(1);
+  });
+
+  it('does not treat a report that merely discusses revisions as a request for one', async () => {
+    // The expensive false positive: a reviewer writing prose about revisions
+    // must not cost a paid re-run.
+    const { store, provider, run } = await setup({
+      byAssignment: {
+        c: { text: 'The author may wish to consider revisions to section 2 in future work.' },
+      },
+      fallback: { text: 'Findings.' },
+    });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    expect(run.assignments.find((a) => a.id === 'a')?.attempts).toBe(1);
+  });
+
+  it('asks only actual reviewers for a verdict marker', async () => {
+    const { store, provider, run } = await setup({ fallback: { text: 'Findings.' } });
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const briefFor = (id: string): string =>
+      provider.requests.find((r) => r.assignmentId === id)?.task ?? '';
+
+    // `c` depends on exactly one assignment, so it is a review.
+    expect(briefFor('c')).toContain('Verdict marker');
+    // `a` and `b` depend on nothing. Asking them for a verdict would be asking
+    // for a marker nothing would ever read.
+    expect(briefFor('a')).not.toContain('Verdict marker');
+    expect(briefFor('b')).not.toContain('Verdict marker');
+  });
+});

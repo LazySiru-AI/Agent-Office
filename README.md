@@ -3,7 +3,7 @@
 Give a task to one point of contact — the Manager — and watch a team of
 specialists do it.
 
-The Manager reads the task, picks the right agents from a catalog of 154
+The Manager reads the task, picks the right agents from a catalog of 156
 specialists, and distributes the work. Each agent works its part and files a
 report. The Manager merges them into one document, a designer agent styles it,
 and you download a PDF.
@@ -18,9 +18,9 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2, 3, 4, 5 and 8 are done and verified.** 744 tests pass, typecheck
-is clean, the registry indexes 154 agents, and you can drive a run from the
-browser — watch the team work in a pixel office, click a character to inspect
+**Phases 0, 2, 3, 4, 5, 6 and 8 are done and verified.** 820 tests pass,
+typecheck is clean, the registry indexes 156 agents, and you can drive a run
+from the browser — watch the team work in a pixel office, click a character to inspect
 it, refresh mid-run without losing it, cancel it, read the reports in-app,
 replay a finished run offline, and download a themed PDF. The whole app wears
 one dark neon terminal theme, with a light option and a motion switch. See
@@ -37,7 +37,8 @@ installed on the machine, fully offline.
 | 3 | Web shell + live wiring | done |
 | 4 | Pixel office sim | done |
 | 5 | Designer step + PDF export | done |
-| 6–7 | Domain breadth, more providers | not started |
+| 6 | Domain breadth + review loop | done (routing untested — no model) |
+| 7 | More providers | not started |
 | 8 | Dark neon terminal interface | done |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
@@ -55,7 +56,7 @@ thing in this project that spends money.
 ## Layout
 
 ```
-categories/     154 vendored subagent definitions, indexed at startup
+categories/     156 subagent definitions (154 vendored + 2 authored here)
 packages/
   shared/       contracts both sides agree on: run state, plan, events
   server/       registry, providers, orchestrator, persistence
@@ -71,7 +72,7 @@ Requires Node.js 20+ (v24.19.0 is installed here — see `SETUP.md`).
 npm install
 ```
 
-Print the agent registry (the Phase 0 exit criterion — it should list 154):
+Print the agent registry (the Phase 0 exit criterion — it should list 156):
 
 ```bash
 npm run registry:dump
@@ -126,6 +127,13 @@ It is committed here rather than referenced, so the registry always has
 something to index and agent definitions can be tuned for this project without
 depending on an upstream checkout. `tools/subagent-catalog/` can refresh from
 upstream when wanted.
+
+Two of the 156 are written here rather than vendored: `tax-advisor` and
+`tax-compliance-specialist`. The upstream catalog has `legal-advisor`,
+`risk-manager`, `fintech-engineer` and `quant-analyst` but no tax specialist of
+any kind, which left the tax use case being answered by a general business
+analyst. They follow the catalog's own file format, so a future upstream refresh
+leaves them untouched.
 
 ## Documents
 

@@ -77,10 +77,33 @@ const ASSIGNMENT_TRANSITIONS: Record<AssignmentStatus, readonly AssignmentStatus
   briefing: ['working', 'blocked'],
   working: ['reporting', 'blocked'],
   blocked: ['working', 'briefing'],
-  // FR-M10: a reviewer may send an assignment back, so `reporting` can loop to
-  // `working` once. The retry budget is enforced by the dispatcher, not here.
-  reporting: ['done', 'working'],
-  done: [],
+  reporting: ['done'],
+  // FR-M10: a reviewer may send its target back for one revision.
+  //
+  // This edge leaves a terminal status, which is why it is spelled out here
+  // rather than left to `canTransitionAssignment`'s general rules. It has to
+  // leave `done`: a reviewer necessarily runs in a *later phase* than the work
+  // it reviews, phases run strictly in sequence, and a phase only starts once
+  // the previous one has drained — so by the time any critique exists, its
+  // target reached `done` long ago.
+  //
+  // An earlier version of this table put the FR-M10 edge on `reporting`
+  // (`reporting -> working`), which reads plausibly and is unreachable in
+  // practice: `reporting` lasts only the few milliseconds between a provider
+  // finishing and its report being written, and no reviewer can observe it. The
+  // comment claiming to support FR-M10 was therefore false for three phases.
+  //
+  // The edge lands on `briefing`, not `working`, because a re-dispatch is an
+  // ordinary dispatch: it goes back through the same `executeAssignment` path
+  // that assembles a brief, and that path opens with `briefing`. Pointing this
+  // at `working` would have required the dispatcher to special-case the entry
+  // point for revisions — a second code path for the case most likely to be
+  // under-tested.
+  //
+  // The revision budget is enforced by the dispatcher (see `review.ts`), not
+  // here: a state machine that counted attempts would need to know what an
+  // attempt costs, which is exactly the sort of thing `shared` must not know.
+  done: ['briefing'],
   failed: [],
   skipped: [],
 };
@@ -91,10 +114,21 @@ export function canTransitionRun(from: RunStatus, to: RunStatus): boolean {
   return RUN_TRANSITIONS[from].includes(to);
 }
 
+/**
+ * The table is consulted **before** the terminal check, so an edge written
+ * explicitly above wins.
+ *
+ * That ordering is what lets FR-M10's `done -> working` exist without making
+ * `done` non-terminal everywhere else. `isAssignmentTerminal` keeps its meaning
+ * — "no further work is scheduled by default", which is what the replay reader
+ * and the run accounting rely on — while the one revision edge the requirement
+ * calls for is legal because it was written down. `failed` and `skipped` have
+ * empty rows and so remain sealed completely.
+ */
 export function canTransitionAssignment(from: AssignmentStatus, to: AssignmentStatus): boolean {
+  if (ASSIGNMENT_TRANSITIONS[from].includes(to)) return true;
   if (isAssignmentTerminal(from)) return false;
-  if (to === 'failed') return true;
-  return ASSIGNMENT_TRANSITIONS[from].includes(to);
+  return to === 'failed';
 }
 
 /**

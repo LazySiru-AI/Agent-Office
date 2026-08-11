@@ -872,3 +872,143 @@ which a test now asserts by reading the sim files back off disk.
   live-dot pulse, the active-status glow, and a static under-desk work glow).
 - `accentDim`, `line` and `lineFirm` are exempt from the contrast grid as
   decorative. A test pins that claim so it cannot rot into an excuse.
+
+---
+
+## Phase 6 — Domain breadth
+
+Exit criterion: five domain tasks each produce a sensible team and a coherent
+PDF, with routing errors documented and addressed.
+
+### The gap the phase was named after
+
+The catalog had `legal-advisor`, `risk-manager`, `fintech-engineer` and
+`quant-analyst` — and **no tax specialist of any kind**. The symptom was sitting
+in the code: the scripted provider's `tax` preset fielded `business-analyst` as
+its lead, because there was nothing better to name.
+
+Two agents were authored into `07-specialized-domains`, in the catalog's own
+format, dividing the domain the way `legal-advisor` and `compliance-auditor`
+divide legal:
+
+- **`tax-advisor`** — position and structure. What the treatment is and what to
+  do about it.
+- **`tax-compliance-specialist`** — obligation and defensibility. What must be
+  filed, by when, with what evidence, and whether it survives an audit.
+
+Both are jurisdiction-neutral by construction — the single most common failure
+mode for a tax agent is quietly assuming US federal rules — and both carry an
+explicit professional-responsibility section: state the statute relied on, never
+present a fact-dependent position as certain, and say when a licensed local
+practitioner is required. One of them declines to bless positions designed
+mainly to obscure substance.
+
+The catalog is now **156**. The 154-agent assertion firing was the intended
+behaviour, not an obstacle: it is the only thing that forces the README and
+SETUP counts to be corrected in the same commit as the files.
+
+### The domain matrix
+
+Five tasks, run end to end through the scripted provider:
+
+| Domain | Team | Theme | PDF |
+|---|---|---|---|
+| software | backend-developer, security-auditor, code-reviewer | engineering | 76,018 B |
+| legal | legal-advisor, compliance-auditor, risk-manager | legal | 76,679 B |
+| tax | tax-advisor, tax-compliance-specialist, risk-manager | financial | 69,725 B |
+| research | research-analyst, data-researcher, competitive-analyst | research | 113,322 B |
+| product | product-manager, ux-researcher, business-analyst | research | 118,311 B |
+
+All five reached `done` and produced a valid `%PDF-`. Product has no theme of its
+own — there are four themes and five domains — so it lands on `research`, which
+is the closest fit rather than a defect.
+
+### Findings
+
+- **`includes('tax')` is true of "syntax".** The scripted router matched
+  keywords as substrings, so a task about a syntax error would have been handed
+  to the tax team, and "elevator telemetry" to the same. Now matched on whole
+  words, with both traps pinned as tests.
+- **A preset naming a missing agent used to fall back silently.** That is the
+  one case where degrading quietly hides exactly the routing defect this phase
+  exists to find, so it now throws and names the missing agent. Only "no preset
+  matched at all" still falls back.
+- **FR-M10's transition was unreachable, and had been for three phases.** The
+  state machine carried `reporting -> working` with a comment claiming it
+  supported the review loop. It cannot: a reviewer necessarily runs in a later
+  phase than its target, phases drain before the next begins, and `reporting`
+  lasts only the milliseconds between a provider finishing and its report being
+  written. No reviewer can ever observe it. The real edge is `done -> briefing`,
+  and it is now written down as the single documented exception to "nothing
+  leaves a terminal state" — `failed` and `skipped` stay sealed.
+- **A 40-candidate pre-filter loses agents the Manager would have picked.** See
+  below. This is the phase's most consequential result.
+
+### FR-R4: built, measured, and deliberately not switched on
+
+The BM25 pre-filter works and cuts the roster digest from **11,067 to 2,748
+tokens — 75% smaller**. It ranks the tax query beautifully: `tax-advisor` scores
+14.07 against 4.13 for the next non-tax agent, because the agent is named after
+the domain.
+
+It is still not wired into `planRun`, and the reason is a number:
+
+```
+[FR-R4 recall @40] 10/16 wanted agents survive the cut
+  software  kept 3/4  lost: security-auditor
+  legal     kept 2/3  lost: risk-manager
+  tax       kept 2/3  lost: risk-manager
+  research  kept 1/3  lost: research-analyst, data-researcher
+  product   kept 2/3  lost: ux-researcher
+```
+
+Precision is the wrong thing to measure for a pre-filter. Ranking a good agent
+fourth instead of first costs nothing; **cutting it means the Manager cannot
+choose it however well it reasons.** Most agents score exactly 0.000 for any
+given task, so a top-40 is "the handful that matched, plus the alphabetical head
+of the zero-scoring tail" — and `security-auditor` surviving the software cut
+would be a property of the alphabet, not of the ranker.
+
+Two failure modes drive it, both inherent to literal-token BM25:
+
+- **No stemming.** The task said "payments", the agent is `payment-integration`,
+  and one trailing `s` scored the most relevant agent in the catalog at zero.
+  This one was measured and then fixed — regular plurals are now folded, which
+  lifted `payment-integration` to #2 and brought `fintech-engineer` into the top
+  10. Deliberately plurals only: Porter would also fold `-ing` and `-ed`, and in
+  a corpus this small that collapses distinctions that carry meaning.
+- **Polysemy, which stemming cannot touch.** "State of the art" matches
+  `terraform-engineer`, `react-specialist` and `angular-architect` on
+  application state. `research-analyst` and `data-researcher` score zero,
+  because a task about surveying literature shares no literal token with their
+  descriptions.
+
+Two tests originally written to pin known-bad behaviour now fail because the
+behaviour improved. They were rewritten to the measured reality rather than
+deleted — the software one still asserts that a coincidental
+"review"+"authentication" collision wins the top slot, because it does.
+
+### Verified
+
+- 820 tests pass; typecheck clean across all three workspaces.
+- `npm run registry:dump` prints 156 across 10 categories.
+- Five domains, five teams, five valid PDFs (table above).
+- The review loop was tested at the wiring level, not only as pure logic: a
+  verdict marker re-dispatches its target exactly once, with the critique in the
+  brief and the marker stripped out of it; an approval leaves the target alone;
+  and a report that merely *discusses* revisions does not trigger a paid re-run.
+
+### Known gaps carried forward
+
+- **Still no model has planned anything.** The `claude` CLI is not on this
+  machine's PATH, so every plan in the matrix above came from the scripted
+  provider's canned presets. That means the teams are *correct by construction*
+  — a preset chose them — and this phase has therefore not tested the Manager's
+  judgement at all. "Tune Manager selection prompts where routing picks the
+  wrong team" cannot be done until a model is picking teams. The matrix proves
+  the pipeline, the report themes and the PDFs; it does not prove the routing.
+- FR-R4 is available but unused, for the recall reason above. Enabling it needs
+  either better recall (embeddings, or expanding a query with the roster's own
+  vocabulary) or a floor that always keeps a domain's obvious generalists.
+- The review loop never re-reviews. That is FR-M10 as written ("once"), but it
+  means nobody checks whether the revision actually addressed the critique.

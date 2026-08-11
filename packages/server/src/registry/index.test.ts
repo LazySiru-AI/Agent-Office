@@ -32,8 +32,14 @@ const EXPECTED_CATEGORIES: string[] = [...AGENT_CATEGORIES];
 /**
  * Locked count. If this changes, an agent was added or removed and both this
  * number and the main README should be updated together.
+ *
+ * 154 through Phase 5. Phase 6 authored `tax-advisor` and
+ * `tax-compliance-specialist` to close the catalog's tax gap, taking it to 156.
+ * This assertion firing was the intended behaviour, not an obstacle: it is the
+ * only thing that forces the README and SETUP counts to be updated in the same
+ * commit as the files themselves.
  */
-const EXPECTED_AGENT_COUNT = 154;
+const EXPECTED_AGENT_COUNT = 156;
 
 function agentFile(name: string, description: string, extra: string[] = []): string {
   return [

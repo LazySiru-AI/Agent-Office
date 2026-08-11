@@ -298,16 +298,21 @@ describe('resolveClaudeCodeTools: against the real 154-agent registry', () => {
     // Sanity bounds on the real catalog, established by the grep in the task
     // brief: 154 agents, 114 of which request Bash, and a handful of MCP-style
     // names that cannot be honoured.
-    expect(registry.agents.length).toBe(154);
+    //
+    // Phase 6 took the catalog to 156 by authoring the two tax specialists.
+    // `bashAgents` deliberately stays at 114: neither tax agent requests `Bash`,
+    // because neither runs commands — the same reasoning as `legal-advisor`.
+    // That this number did *not* move is the assertion worth having here.
+    expect(registry.agents.length).toBe(156);
     expect(bashAgents.length).toBe(114);
     expect(totalRequested).toBeGreaterThan(totalResolved);
     expect(totalDroppedUnknown).toBeGreaterThan(0);
     // No catalog agent currently spells a sandbox-unsafe built-in by name.
     expect(totalDroppedUnsafe).toBe(0);
-    // Every agent resolves at least Read (154 of 154 request it), so nobody
+    // Every agent resolves at least Read (156 of 156 request it), so nobody
     // should land on the empty/all-dropped case in the current catalog.
     expect(agentsWithZeroResolvedTools).toBe(0);
-    expect(agentsWithAtLeastOneTool).toBe(154);
+    expect(agentsWithAtLeastOneTool).toBe(156);
 
     // Every Bash request on win32 resolves to PowerShell, never left as Bash
     // and never dropped.

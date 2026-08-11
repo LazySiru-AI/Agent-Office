@@ -15,6 +15,12 @@ import type { Registry } from '../registry/index.js';
 import type { AgentProvider } from '../providers/types.js';
 import type { RunStore } from '../store/types.js';
 import { buildAssignmentBrief, type UpstreamReport } from './brief.js';
+import {
+  buildRevisionNote,
+  decideRevision,
+  parseReviewVerdict,
+  reviewTargetOf,
+} from './review.js';
 
 /**
  * The dispatcher (FR-M4, FR-M5, FR-M6, FR-M8).
@@ -100,6 +106,16 @@ interface DispatchContext {
   onStateChange: ((run: RunState) => void) | undefined;
   /** Set when the token budget trips, to halt remaining phases. */
   halted?: 'cancelled' | 'token-budget';
+  /**
+   * Critiques waiting to be attached to a re-dispatched assignment's brief
+   * (FR-M10), keyed by target assignment id.
+   *
+   * Held here rather than on `AssignmentState` because it is transient
+   * scheduling detail, not run state: it exists for exactly one re-dispatch and
+   * has no meaning once that brief is built. Putting it on the persisted state
+   * would mean a resumed run carrying a critique it had already acted on.
+   */
+  pendingRevisionNotes: Map<string, string>;
 }
 
 export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
@@ -118,6 +134,7 @@ export async function dispatchRun(deps: DispatchDeps): Promise<DispatchResult> {
     options: { ...DEFAULT_DISPATCH_OPTIONS, ...deps.options },
     onEvent: deps.onEvent,
     onStateChange: deps.onStateChange,
+    pendingRevisionNotes: new Map(),
   };
 
   for (const phase of plan.phases) {
@@ -184,6 +201,11 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
     attempts: assignment.attempts + 1,
   });
 
+  // Consumed, not merely read: a critique is for one re-dispatch. Leaving it in
+  // the map would attach it again if this assignment ever ran a third time.
+  const revisionNote = ctx.pendingRevisionNotes.get(assignmentId);
+  ctx.pendingRevisionNotes.delete(assignmentId);
+
   let brief: string;
   try {
     const upstreamReports = await loadUpstreamReports(ctx, assignment);
@@ -192,6 +214,8 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
       task: ctx.run.task,
       assignment,
       upstreamReports,
+      isReview: reviewTargetOf(assignment) !== undefined,
+      ...(revisionNote === undefined ? {} : { revisionNote }),
     });
   } catch (error) {
     await failAssignment(ctx, assignmentId, `could not assemble brief: ${describe(error)}`);
@@ -274,6 +298,72 @@ async function executeAssignment(ctx: DispatchContext, assignmentId: string): Pr
     reportPath: assignment.deliverable,
     endedAt: Date.now(),
   });
+
+  await applyReviewVerdict(ctx, assignment, text.trim());
+}
+
+/**
+ * FR-M10: if this assignment was a review and it asked for revisions, send its
+ * target back once.
+ *
+ * The re-dispatch runs here, inside the *reviewer's* execution, rather than by
+ * rewinding the phase loop. That is the whole trick: a reviewer necessarily
+ * sits in a later phase than its target, phases run strictly in order, and
+ * `dispatchRun`'s loop has no notion of going back — so a design that needed to
+ * re-enter a drained phase would have meant rewriting the scheduler. Re-running
+ * the target from here needs none of that, and it keeps the revision inside the
+ * phase that asked for it, which is also where a reader would look for it.
+ *
+ * The reviewer does **not** re-review the revised work. That would be the
+ * natural next thing to want, and it is deliberately absent: reviewing again
+ * means another provider call, and then a verdict on *that*, and the loop has
+ * no principled end. FR-M10 says "once", and once is what this does.
+ */
+async function applyReviewVerdict(
+  ctx: DispatchContext,
+  reviewer: AssignmentState,
+  reportText: string,
+): Promise<void> {
+  const targetId = reviewTargetOf(reviewer);
+  if (targetId === undefined) return;
+
+  const outcome = parseReviewVerdict(reportText);
+  const target = findAssignment(ctx.run, targetId);
+  const decision = decideRevision({ reviewer, outcome, target });
+
+  if (!decision.redispatch) {
+    // A refusal is worth surfacing but is not a failure: the run continues with
+    // the work as it stands, and the reviewer's critique is still in its report
+    // for a human to read. Silence here would make an exhausted revision budget
+    // indistinguishable from an approval.
+    if (decision.refusedBecause !== undefined) {
+      ctx.onEvent?.({
+        t: 'error',
+        assignmentId: reviewer.id,
+        message: `revisions requested for "${targetId}" but not applied (${decision.refusedBecause})`,
+        fatal: false,
+      });
+    }
+    return;
+  }
+
+  if (ctx.signal.aborted || ctx.halted !== undefined) return;
+
+  ctx.pendingRevisionNotes.set(
+    targetId,
+    buildRevisionNote({
+      reviewerAgentName: reviewer.agentName,
+      critique: outcome.critique ?? '',
+    }),
+  );
+
+  // `endedAt` is cleared first because the assignment has not ended any more —
+  // leaving the old timestamp would make the replay show it finishing before it
+  // restarted. Then it goes back through `executeAssignment` unchanged: that
+  // function opens with `done -> briefing`, which `shared/src/status.ts` permits
+  // for exactly this, and it will pick the critique out of the map itself.
+  await patchAssignment(ctx, targetId, { endedAt: undefined });
+  await executeAssignment(ctx, targetId);
 }
 
 /** Load the reports this assignment declared a dependency on, in order. */

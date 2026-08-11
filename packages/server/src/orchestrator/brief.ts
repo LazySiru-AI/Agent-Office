@@ -1,4 +1,5 @@
 import type { AgentDef, AssignmentState } from '@agent-office/shared';
+import { REVIEW_VERDICT_INSTRUCTION } from './review.js';
 
 /**
  * Assemble the brief one assignment receives (FR-M5).
@@ -29,6 +30,15 @@ export interface BriefInput {
   upstreamReports: UpstreamReport[];
   /** Optional critique when re-dispatching after a reviewer send-back (FR-M10). */
   revisionNote?: string;
+  /**
+   * Whether this assignment reviews exactly one earlier assignment (FR-M10).
+   *
+   * When set, the brief asks for a verdict marker. It is only asked of actual
+   * reviewers because a marker in a non-reviewer's report would be parsed and
+   * acted on by nothing — and because every extra instruction in a brief is a
+   * chance for the agent to spend its attention on ceremony rather than work.
+   */
+  isReview?: boolean;
 }
 
 /**
@@ -47,7 +57,7 @@ export function agentMarker(agentName: string): string {
 }
 
 export function buildAssignmentBrief(input: BriefInput): string {
-  const { agent, task, assignment, upstreamReports, revisionNote } = input;
+  const { agent, task, assignment, upstreamReports, revisionNote, isReview } = input;
 
   const sections: string[] = [
     agentMarker(agent.name),
@@ -108,6 +118,13 @@ export function buildAssignmentBrief(input: BriefInput): string {
     'Do not include the overall task restatement or a preamble about what you',
     'were asked to do. Lead with your actual findings.',
   );
+
+  // Last, so it is the final thing the agent reads before writing — a marker
+  // that must be the report's last line is best asked for at the end of the
+  // brief rather than buried above the output instructions.
+  if (isReview === true) {
+    sections.push('', REVIEW_VERDICT_INSTRUCTION);
+  }
 
   return sections.join('\n');
 }

@@ -45,11 +45,16 @@ const SCRIPTED_DOMAINS: ScriptedDomain[] = [
     reviewers: ['compliance-auditor', 'risk-manager'],
   },
   {
+    // Until Phase 6 this preset fielded `business-analyst` as its lead, because
+    // the catalog had no tax specialist at all — a general analyst standing in
+    // for one was the most visible symptom of that gap. `tax-advisor` and
+    // `tax-compliance-specialist` now exist, and the pairing mirrors legal's:
+    // one agent takes the position, the other owns what must be filed.
     domain: 'tax',
     reportStyle: 'advisory',
-    keywords: ['tax', 'vat', 'deduction', 'filing', 'audit', 'accounting'],
-    lead: 'business-analyst',
-    reviewers: ['risk-manager', 'research-analyst'],
+    keywords: ['tax', 'vat', 'gst', 'deduction', 'filing', 'withholding', 'accounting'],
+    lead: 'tax-advisor',
+    reviewers: ['tax-compliance-specialist', 'risk-manager'],
   },
   {
     domain: 'software',
@@ -57,6 +62,20 @@ const SCRIPTED_DOMAINS: ScriptedDomain[] = [
     keywords: ['code', 'api', 'bug', 'refactor', 'auth', 'service', 'module', 'performance'],
     lead: 'backend-developer',
     reviewers: ['security-auditor', 'code-reviewer'],
+  },
+  {
+    domain: 'research',
+    reportStyle: 'research-brief',
+    keywords: ['research', 'literature', 'survey', 'state of the art', 'study', 'evidence'],
+    lead: 'research-analyst',
+    reviewers: ['data-researcher', 'competitive-analyst'],
+  },
+  {
+    domain: 'product',
+    reportStyle: 'briefing',
+    keywords: ['roadmap', 'backlog', 'onboarding', 'feature', 'user', 'metrics', 'launch'],
+    lead: 'product-manager',
+    reviewers: ['ux-researcher', 'business-analyst'],
   },
 ];
 
@@ -69,22 +88,54 @@ const SCRIPTED_FALLBACK_DOMAIN: ScriptedDomain = {
   reviewers: ['business-analyst', 'technical-writer'],
 };
 
+/**
+ * Whole-word keyword match, not substring.
+ *
+ * `includes('tax')` is true of "syntax", and `includes('vat')` of "elevator" —
+ * so the crude matcher this replaced would field a tax team for a task about
+ * syntax errors. The matching is still deliberately simple (a real provider
+ * ignores all of this), but "simple" should not mean "wrong in a way that is
+ * funny only until someone trusts it".
+ *
+ * Multi-word keywords are matched as phrases, with the same boundary rule at
+ * each end.
+ */
+function mentions(haystack: string, keyword: string): boolean {
+  const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(?:^|[^a-z0-9])${escaped}(?:[^a-z0-9]|$)`, 'i').test(haystack);
+}
+
 function chooseScriptedDomain(task: string, known: ReadonlySet<string>): ScriptedDomain {
   const haystack = task.toLowerCase();
   const matched = SCRIPTED_DOMAINS.find((candidate) =>
-    candidate.keywords.some((keyword) => haystack.includes(keyword)),
+    candidate.keywords.some((keyword) => mentions(haystack, keyword)),
   );
 
-  for (const candidate of [matched, SCRIPTED_FALLBACK_DOMAIN]) {
-    if (candidate === undefined) continue;
-    const team = [candidate.lead, ...candidate.reviewers];
-    if (team.every((name) => known.has(name))) return candidate;
+  // A preset whose team is missing from the registry is a bug in the preset, not
+  // a reason to quietly field a different team. The catalog is vendored and
+  // fixed, so an unknown name here means someone renamed an agent or mistyped
+  // one — and silently falling back would hide exactly the routing defect this
+  // phase exists to find. Only "no preset matched" legitimately falls back.
+  if (matched !== undefined) {
+    const missing = [matched.lead, ...matched.reviewers].filter((name) => !known.has(name));
+    if (missing.length > 0) {
+      throw new Error(
+        `the scripted "${matched.domain}" team names agents that are not in the registry: ` +
+          `${missing.join(', ')}. Update SCRIPTED_DOMAINS in src/providers/factory.ts.`,
+      );
+    }
+    return matched;
   }
 
-  throw new Error(
-    'the scripted provider\'s canned teams reference agents that are not in the registry. ' +
-      'Update SCRIPTED_DOMAINS in src/providers/factory.ts.',
-  );
+  const fallbackTeam = [SCRIPTED_FALLBACK_DOMAIN.lead, ...SCRIPTED_FALLBACK_DOMAIN.reviewers];
+  const missingFallback = fallbackTeam.filter((name) => !known.has(name));
+  if (missingFallback.length > 0) {
+    throw new Error(
+      "the scripted provider's fallback team references agents that are not in the registry: " +
+        `${missingFallback.join(', ')}. Update SCRIPTED_FALLBACK_DOMAIN in src/providers/factory.ts.`,
+    );
+  }
+  return SCRIPTED_FALLBACK_DOMAIN;
 }
 
 /**

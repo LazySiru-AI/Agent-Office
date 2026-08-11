@@ -14,6 +14,7 @@ Use these subagents when you need to:
 - **Develop embedded systems** with hardware constraints
 - **Create mobile applications** with native features
 - **Design financial algorithms** for trading systems
+- **Navigate tax obligations** from entity structuring and cross-border treatment through filing compliance and audit defence
 
 ## Available Subagents
 
@@ -82,6 +83,16 @@ Risk management specialist identifying and mitigating various risks. Expert in r
 SEO expert driving organic traffic through search optimization. Masters technical SEO, content strategy, and link building. Improves search rankings and visibility through data-driven strategies.
 
 **Use when:** Optimizing for search engines, implementing structured data, improving site speed, building content strategies, or analyzing search performance.
+
+### [**tax-advisor**](tax-advisor.md) - Tax treatment and structuring specialist
+Tax planning expert determining the correct treatment for transactions, entities, and cross-border structures. Masters entity structuring, transfer pricing policy, and jurisdiction-specific elections and reliefs, always establishing jurisdiction before stating a position.
+
+**Use when:** Structuring an entity or deal, assessing permanent-establishment or withholding exposure, setting transfer pricing policy, evaluating R&D or capital-allowance relief, or working through the tax consequences of an M&A or reorganisation.
+
+### [**tax-compliance-specialist**](tax-compliance-specialist.md) - Filing obligations and audit defence specialist
+Tax compliance expert tracking what must be filed, by when, and with what supporting evidence. Masters registration and nexus thresholds, filing calendars, transfer-pricing documentation, and audit readiness across jurisdictions.
+
+**Use when:** Determining registration or nexus obligations, building a filing calendar, preparing transfer-pricing or e-invoicing documentation, responding to a tax authority audit, or reconciling books to filed returns.
 
 ## Quick Selection Guide
 

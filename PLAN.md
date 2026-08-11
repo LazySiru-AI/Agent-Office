@@ -459,6 +459,25 @@ Make the non-software claim real.
 **Exit:** five domain tasks each produce a sensible team and a coherent PDF, with
 routing errors documented and addressed.
 
+**Outcome — done, with one exit criterion only half-met.** The five domains each
+produce a sensible team and a valid PDF, the two tax agents are written
+(catalog: 156), the review loop is built and wired, and three routing defects
+were found and fixed. But every team above was chosen by the scripted provider's
+*presets*, not by a model — the `claude` CLI is not available on this machine —
+so the teams are correct by construction and **the Manager's routing judgement
+remains untested**. "Tune Manager selection prompts where routing picks the
+wrong team" is therefore deferred, not delivered: there is nothing to tune until
+a model is doing the picking.
+
+FR-R4's pre-filter is built and measured (11,067 → 2,748 digest tokens) but
+deliberately left unwired: a 40-candidate cut loses 6 of 16 agents a human would
+pick, and a pre-filter that removes the right agent is worse than no filter. See
+`PROGRESS.md` for the recall numbers.
+
+Also corrected here: `ASSIGNMENT_TRANSITIONS` claimed to support FR-M10 via
+`reporting -> working`, an edge no reviewer can ever reach. The real one is
+`done -> briefing`.
+
 ### Phase 7 — Provider expansion + polish
 
 - Anthropic API, OpenAI and DeepSeek adapters behind the same interface, with

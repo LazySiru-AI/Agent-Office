@@ -58,7 +58,15 @@ describe('assignment transitions', () => {
   });
 
   it('supports the reviewer send-back loop (FR-M10)', () => {
-    expect(canTransitionAssignment('reporting', 'working')).toBe(true);
+    // From `done`, not from `reporting`. A reviewer runs in a later phase than
+    // the work it reviews, and phases drain before the next one starts, so its
+    // target is always `done` by the time a critique exists. The old
+    // `reporting -> working` edge was unreachable in practice.
+    // To `briefing`, because a re-dispatch is an ordinary dispatch and goes
+    // through the same path as the first one.
+    expect(canTransitionAssignment('done', 'briefing')).toBe(true);
+    expect(canTransitionAssignment('done', 'working')).toBe(false);
+    expect(canTransitionAssignment('reporting', 'working')).toBe(false);
   });
 
   it('lets a blocked assignment resume', () => {
@@ -66,11 +74,26 @@ describe('assignment transitions', () => {
     expect(canTransitionAssignment('blocked', 'working')).toBe(true);
   });
 
-  it('allows nothing out of a terminal state', () => {
+  it('allows nothing out of a terminal state, except the one FR-M10 revision edge', () => {
+    // `done -> working` is the single documented exception, and it is written
+    // into the transition table rather than granted by a general rule. Anything
+    // else escaping a terminal status is a bug — most of all out of `failed` or
+    // `skipped`, which must stay sealed.
     for (const from of ASSIGNMENT_STATUSES.filter(isAssignmentTerminal)) {
       for (const to of ASSIGNMENT_STATUSES) {
-        expect(canTransitionAssignment(from, to)).toBe(false);
+        const isRevisionEdge = from === 'done' && to === 'briefing';
+        expect(
+          canTransitionAssignment(from, to),
+          `${from} -> ${to} should be ${isRevisionEdge ? 'legal' : 'illegal'}`,
+        ).toBe(isRevisionEdge);
       }
+    }
+  });
+
+  it('keeps failed and skipped completely sealed', () => {
+    for (const to of ASSIGNMENT_STATUSES) {
+      expect(canTransitionAssignment('failed', to)).toBe(false);
+      expect(canTransitionAssignment('skipped', to)).toBe(false);
     }
   });
 
