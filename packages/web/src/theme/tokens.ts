@@ -223,9 +223,20 @@ export const OFFICE = {
   shelfBooksAlt: '#3f6fb5',
   /** Framed art on the wall. */
   frame: '#8a6540',
-  /** The lounge couch. */
+  /**
+   * The lounge couch, in three tones.
+   *
+   * Three rather than two, because two was not enough to draw one. The first
+   * version had only a lit and a mid tone and rendered as a magenta rail: a
+   * couch seen from this angle is read almost entirely through *banding* — a
+   * lit backrest above a shadowed one, a lit seat cushion below that, then a
+   * dark skirt underneath — and with two tones there is no bottom to the
+   * object, so it reads as a flat bar rather than something with a front. All
+   * three are sampled off the reference.
+   */
   couch: '#972651',
   couchLight: '#c25769',
+  couchDark: '#532e3d',
 
   // -- text and overlays ---------------------------------------------------
 

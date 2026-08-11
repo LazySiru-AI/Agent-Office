@@ -94,6 +94,7 @@ const BOOKS_ALT = OFFICE.shelfBooksAlt;
 const FRAME = OFFICE.frame;
 const COUCH = OFFICE.couch;
 const COUCH_LIGHT = OFFICE.couchLight;
+const COUCH_DARK = OFFICE.couchDark;
 const CARPET = OFFICE.carpet;
 const CARPET_DARK = OFFICE.carpetDark;
 
@@ -377,41 +378,93 @@ function buildWallArt(): PixelGrid {
   return grid;
 }
 
-/** A two-seat couch for the lounge strip. */
+/**
+ * A two-seat couch for the lounge strip.
+ *
+ * Redrawn after the first version shipped and was looked at in the running
+ * office, where it read unmistakably as a magenta *rail* rather than furniture.
+ * The cause was structural, not a matter of a few pixels: it had two horizontal
+ * bands (a lit back, a darker seat) and nothing underneath them, so the object
+ * had a top and no front — which is exactly what a bar looks like.
+ *
+ * Sampled off the reference at 7x, a couch from this camera angle is read
+ * almost entirely through **banding**, six deep:
+ *
+ *   1. a thin dark rail along the very top of the backrest
+ *   2. the lit top face of the backrest
+ *   3. the shadowed front face of the backrest
+ *   4. the lit seat cushion — the largest single area, and the couch's "light"
+ *   5. a thin dark line where the seat meets its front edge
+ *   6. a dark skirt below that, which is what gives the whole thing a bottom
+ *
+ * …plus dark arm columns down both ends and two small light feet under the
+ * skirt. The feet matter more than their four pixels suggest: they are what
+ * lifts the couch off the floor instead of letting it sit flush like a painted
+ * rectangle. This is why the shape needed to be four rows taller than before —
+ * six bands do not fit in the old height, and the previous version was
+ * effectively the top two of them with the object's whole lower half missing.
+ */
 function buildCouch(): PixelGrid {
   const width = 26;
-  const height = 16;
+  const height = 20;
   const grid = createGrid(width, height);
 
   const armWidth = 2;
-  const bodyLeft = armWidth;
-  const bodyWidth = width - armWidth * 2;
-  const backTop = 3;
-  const seatTop = 8;
-  const seatBottom = 12;
+  const bodyLeft = 1;
+  const bodyWidth = width - 2;
+  const cushionLeft = bodyLeft + armWidth;
+  const cushionWidth = bodyWidth - armWidth * 2;
 
-  // Back cushion: a lit top band, a darker seat band beneath it, so the couch
-  // reads as two stacked cushions rather than one flat block.
-  fillRect(grid, bodyLeft, backTop, bodyWidth, seatTop - backTop, COUCH_LIGHT);
-  fillRect(grid, bodyLeft, seatTop, bodyWidth, seatBottom - seatTop, COUCH);
-  outlineRect(grid, bodyLeft, backTop, bodyWidth, seatBottom - backTop, OUTLINE);
+  // The six bands, top to bottom. Each `y` is the first row of its band, so the
+  // arithmetic below reads in the same order the couch is drawn.
+  const railTop = 1;
+  const backLitTop = 2;
+  const backShadeTop = 4;
+  const seatTop = 7;
+  const seatEdge = 11;
+  const skirtTop = 12;
+  const skirtRows = 3;
+  const bodyBottom = skirtTop + skirtRows; // exclusive
 
-  // Arms: their own outlined blocks, taller than the back cushion by one row
-  // on each end, so they read as bolsters rather than a wider backrest. Each
-  // touches its own side of the grid, so (matching the file header's flush
-  // convention) only the outer column of each arm goes without a line — the
-  // couch is meant to run edge-to-edge in its footprint.
-  const armTop = backTop - 1;
-  const armHeight = seatBottom - backTop + 2;
-  fillRect(grid, 0, armTop, armWidth, armHeight, COUCH);
-  fillRect(grid, width - armWidth, armTop, armWidth, armHeight, COUCH);
-  outlineRect(grid, 0, armTop, armWidth, armHeight, OUTLINE);
-  outlineRect(grid, width - armWidth, armTop, armWidth, armHeight, OUTLINE);
+  // Arms first, full height, so the cushion bands paint over their inner edge
+  // and the two read as one piece of furniture rather than three abutting
+  // blocks.
+  //
+  // The mid tone, not the dark one. Drawn dark they matched the skirt exactly,
+  // and together with the outline that put a continuous dark border on all four
+  // sides of the lit cushions — at which point the thing stopped reading as a
+  // couch and started reading as a flatscreen television. An arm is part of the
+  // upholstery, so it belongs to the couch's own colour, and only the skirt
+  // (which is genuinely in shadow, under everything else) goes darkest.
+  fillRect(grid, bodyLeft, railTop, armWidth, bodyBottom - railTop, COUCH);
+  fillRect(grid, bodyLeft + bodyWidth - armWidth, railTop, armWidth, bodyBottom - railTop, COUCH);
 
-  // Seam between the two seat cushions — the one interior line the reference
-  // draws on its couch.
-  const seamX = bodyLeft + Math.floor(bodyWidth / 2);
-  fillRect(grid, seamX, seatTop, 1, seatBottom - seatTop, COUCH_LIGHT);
+  fillRect(grid, cushionLeft, railTop, cushionWidth, 1, COUCH_DARK);
+  fillRect(grid, cushionLeft, backLitTop, cushionWidth, backShadeTop - backLitTop, COUCH_LIGHT);
+  fillRect(grid, cushionLeft, backShadeTop, cushionWidth, seatTop - backShadeTop, COUCH);
+  fillRect(grid, cushionLeft, seatTop, cushionWidth, seatEdge - seatTop, COUCH_LIGHT);
+  fillRect(grid, cushionLeft, seatEdge, cushionWidth, 1, COUCH);
+  // The skirt runs the full body width, under the arms as well — it is the base
+  // the whole couch stands on, not a third cushion.
+  fillRect(grid, bodyLeft, skirtTop, bodyWidth, skirtRows, COUCH_DARK);
+
+  // No vertical seam between the seat cushions, deliberately — the reference
+  // does not draw one on a couch seen side-on, and ours did. A full-height
+  // divider down the middle of the lit area splits it into two equal panels,
+  // which is the other half of what made this read as a television. The cushion
+  // count is not information anybody needs from a prop in the corner.
+
+  outlineRect(grid, bodyLeft, railTop, bodyWidth, bodyBottom - railTop, OUTLINE);
+
+  // Feet. `chair` rather than a colour of their own: it is the office's neutral
+  // furniture-hardware grey, and a couch foot and a chair base are the same
+  // kind of object. Two rows so they are visible at 1x, where one row of a
+  // 2px-wide foot disappears.
+  const footRow = bodyBottom + 1;
+  for (const x of [bodyLeft + 2, bodyLeft + bodyWidth - 4]) {
+    fillRect(grid, x, footRow, 2, 2, CHAIR);
+    fillRect(grid, x, footRow + 2, 2, 1, OUTLINE);
+  }
 
   return grid;
 }
