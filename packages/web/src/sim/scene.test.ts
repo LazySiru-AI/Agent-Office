@@ -1,4 +1,7 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
+import { ASSIGNMENT_BEHAVIOUR, type AssignmentStatus, type CharacterBehaviour } from '@agent-office/shared';
 import { TILE } from './model.js';
 import {
   ARRIVAL_EPSILON_TILES,
@@ -6,6 +9,7 @@ import {
   computeViewport,
   hasArrived,
   hitTest,
+  isWorkGlowing,
   nextAnimationFrame,
   resolveFacing,
   stepTowards,
@@ -242,5 +246,57 @@ describe('hitTest (FR-S5 inspect)', () => {
     expect(hitTest(entities, { x: 43, y: 40 })).toBeUndefined();
     expect(hitTest(entities, { x: 50, y: 33 })).toBeUndefined();
     expect(hitTest(entities, { x: 50, y: 51 })).toBeUndefined();
+  });
+});
+
+describe('isWorkGlowing (FR-U3 — the desk glow)', () => {
+  function behaviourFor(animation: CharacterBehaviour['animation']): CharacterBehaviour {
+    return { animation, location: 'desk', bubble: 'none', carrying: false };
+  }
+
+  it('glows only for the "type" animation, which only "working" ever produces', () => {
+    expect(isWorkGlowing(behaviourFor('type'))).toBe(true);
+    expect(isWorkGlowing(behaviourFor('idle'))).toBe(false);
+    expect(isWorkGlowing(behaviourFor('idle_relaxed'))).toBe(false);
+    expect(isWorkGlowing(behaviourFor('idle_slumped'))).toBe(false);
+    expect(isWorkGlowing(behaviourFor('walk'))).toBe(false);
+  });
+
+  it('agrees with ASSIGNMENT_BEHAVIOUR — exactly the "working" status glows', () => {
+    // This is the guarantee that matters: the glow tracks the same table
+    // FR-S3 already uses to drive everything else about a character, so
+    // there is no second "is this agent busy" answer that could disagree
+    // with the animation actually on screen.
+    const statuses = Object.keys(ASSIGNMENT_BEHAVIOUR) as AssignmentStatus[];
+    for (const status of statuses) {
+      const glowing = isWorkGlowing(ASSIGNMENT_BEHAVIOUR[status]);
+      expect(glowing).toBe(status === 'working');
+    }
+  });
+});
+
+describe('FR-U2 — one palette, no second copy in this directory', () => {
+  // The exit criterion, made mechanical: after the FR-U3 palette swap, every
+  // colour in the pixel office comes from `theme/tokens.ts`. A literal hex or
+  // Pixi-number colour reappearing in one of these three files is exactly
+  // how the office and the chrome drifted apart before this phase — so this
+  // reads the files back and greps them the same way the requirement does,
+  // rather than trusting that a future edit will remember the rule.
+  const COLOUR_LITERAL = /#[0-9a-fA-F]{6}|0x[0-9a-fA-F]{6}/g;
+  const sourceFiles = ['model.ts', 'sprites.ts', 'scene.ts'];
+
+  it('contains no hex or Pixi-number colour literal outside theme/tokens.ts', () => {
+    for (const file of sourceFiles) {
+      const path = fileURLToPath(new URL(`./${file}`, import.meta.url));
+      const text = readFileSync(path, 'utf8');
+      const matches = text.match(COLOUR_LITERAL) ?? [];
+      // `hashName` in model.ts uses FNV-1a magic numbers (0x811c9dc5,
+      // 0x01000193) which are hash constants, not colours, and happen to
+      // contain six-hex-digit runs the same regex the requirement specifies
+      // would flag. They are the one expected match; anything beyond them is
+      // a real colour literal that should have come from a token instead.
+      const unexpected = matches.filter((m) => m !== '0x811c9d' && m !== '0x010001');
+      expect(unexpected, `${file} should source all colour from theme/tokens.ts, found: ${unexpected.join(', ')}`).toEqual([]);
+    }
   });
 });

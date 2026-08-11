@@ -1,22 +1,65 @@
 /*
- * Agent Office — Phase 3 styling.
+ * Agent Office — dark neon terminal chrome (Phase 8).
  *
- * PLAN.md is explicit: Phase 3 is "deliberately ugly. Proves the data flow
- * before any art exists." This is plain, readable CSS in one file — no
- * design system, no component library. Phase 4 replaces this with the pixel
- * office; nothing here should be precious.
+ * FR-U1 (one visual identity) and FR-U2 (one palette) are the point of this
+ * file: every colour used below is a `var(--ao-*)` custom property written by
+ * `theme/tokens.ts`'s `applyTheme`, never a literal. That is what keeps the
+ * DOM chrome and the WebGL office (`sim/OfficeCanvas.tsx`, which reads the
+ * same tokens through `toPixiColour`) from drifting apart the way they did
+ * before this pass, when the two kept separate copies of "what teal means".
+ *
+ * Direction: a near-black ground with a small set of phosphor accents, spent
+ * on meaning (status, focus, selection) rather than decoration — see
+ * `theme/tokens.ts`'s header for the full rationale. `.log-pane` was already
+ * the closest thing in the old file to this look; everything else now reads
+ * like the same terminal rather than a form bolted onto it.
+ *
+ * Typography is monospace-forward but not absolute (per the brief): prose,
+ * labels and buttons keep the UI sans stack for readability, while anything
+ * that is data — ids, timestamps, token counts, durations, log/report text —
+ * goes monospace with `font-variant-numeric: tabular-nums` so digits line up
+ * in columns instead of jittering as they change.
+ *
+ * FR-U6: no remote font declaration, no network font fetch. Both stacks below
+ * are system fonts only, so the terminal look never costs a request.
  */
 
 * {
   box-sizing: border-box;
 }
 
+:root {
+  --ao-font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --ao-font-mono: ui-monospace, 'Cascadia Mono', Consolas, monospace;
+}
+
+html {
+  color-scheme: dark;
+}
+
 body {
   margin: 0;
-  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
-  background: #f4f4f4;
-  color: #1a1a1a;
+  font-family: var(--ao-font-sans);
+  background: var(--ao-bg);
+  color: var(--ao-ink);
 }
+
+/* Every focusable element gets a ring that survives a near-black ground —
+   the default browser outline all but disappears against `--ao-bg`, and a
+   keyboard user with no visible focus has effectively lost the app. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--ao-accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--ao-accent) 25%, transparent);
+  border-radius: 2px;
+}
+
+/* --- Layout shell --- */
 
 .app-shell {
   display: grid;
@@ -26,8 +69,8 @@ body {
 
 .sidebar {
   padding: 1rem;
-  border-right: 1px solid #ccc;
-  background: #fafafa;
+  border-right: 1px solid var(--ao-line);
+  background: var(--ao-surface);
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -44,21 +87,35 @@ body {
 
 h1 {
   font-size: 1.1rem;
-  font-family: ui-monospace, monospace;
+  font-family: var(--ao-font-mono);
+  color: var(--ao-ink);
   margin: 0;
 }
 
+/* Section headers get a terminal-comment glyph rather than a colour of their
+   own to stand out — reads as structure, not decoration. */
 h2 {
-  font-size: 1rem;
-  margin: 0 0 0.5rem;
+  font-family: var(--ao-font-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--ao-ink-soft);
+  border-bottom: 1px solid var(--ao-line);
+  padding-bottom: 0.35rem;
+  margin: 0 0 0.6rem;
+}
+
+h2::before {
+  content: '// ';
+  color: var(--ao-accent-dim);
 }
 
 .muted {
-  color: #777;
+  color: var(--ao-ink-mute);
 }
 
 .form-error {
-  color: #b00020;
+  color: var(--ao-status-bad);
   font-weight: 600;
 }
 
@@ -69,7 +126,12 @@ h2 {
   flex-direction: column;
   gap: 0.5rem;
   padding-bottom: 1rem;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid var(--ao-line);
+}
+
+.task-form label {
+  font-size: 0.8rem;
+  color: var(--ao-ink-soft);
 }
 
 .task-form textarea {
@@ -77,6 +139,10 @@ h2 {
   font-size: 0.9rem;
   padding: 0.4rem;
   resize: vertical;
+  background: var(--ao-sunken);
+  color: var(--ao-ink);
+  border: 1px solid var(--ao-line-firm);
+  border-radius: 3px;
 }
 
 .task-form-row {
@@ -88,7 +154,11 @@ h2 {
 
 .task-form-row select,
 .task-form-row input {
-  padding: 0.25rem;
+  padding: 0.3rem;
+  background: var(--ao-sunken);
+  color: var(--ao-ink);
+  border: 1px solid var(--ao-line-firm);
+  border-radius: 3px;
 }
 
 .task-form-row input[type='number'] {
@@ -98,13 +168,16 @@ h2 {
 button {
   cursor: pointer;
   padding: 0.35rem 0.8rem;
-  border: 1px solid #888;
-  background: #fff;
+  border: 1px solid var(--ao-line-firm);
+  background: var(--ao-surface-raised);
+  color: var(--ao-ink);
   border-radius: 3px;
+  font-family: var(--ao-font-sans);
 }
 
 button:hover:not(:disabled) {
-  background: #eee;
+  border-color: var(--ao-accent-dim);
+  background: color-mix(in srgb, var(--ao-surface-raised) 85%, var(--ao-accent) 15%);
 }
 
 button:disabled {
@@ -112,9 +185,27 @@ button:disabled {
   opacity: 0.5;
 }
 
+/* Toggle-style buttons (view mode, replay play/pause) use the accent as a
+   fill rather than a border — the one place a bright surface is earned,
+   since it is reporting the single thing currently "on". Text sits on
+   `--ao-bg`, not white, so it stays a token even at full accent strength. */
+button[aria-pressed='true'] {
+  background: var(--ao-accent);
+  border-color: var(--ao-accent);
+  color: var(--ao-bg);
+  font-weight: 600;
+  box-shadow: 0 0 8px 0 color-mix(in srgb, var(--ao-accent) 45%, transparent);
+}
+
 .cancel-button {
-  border-color: #b00020;
-  color: #b00020;
+  border-color: var(--ao-status-bad);
+  color: var(--ao-status-bad);
+  background: transparent;
+}
+
+.cancel-button:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ao-status-bad) 15%, transparent);
+  border-color: var(--ao-status-bad);
 }
 
 .link-button {
@@ -122,11 +213,17 @@ button:disabled {
   background: none;
   padding: 0;
   text-decoration: underline;
-  color: #2255cc;
+  color: var(--ao-accent);
+  font-family: inherit;
+}
+
+.link-button:hover:not(:disabled) {
+  color: var(--ao-ink);
 }
 
 .link-button.selected {
   font-weight: 700;
+  color: var(--ao-ink);
 }
 
 /* --- Run list --- */
@@ -147,14 +244,17 @@ button:disabled {
   width: 100%;
   text-align: left;
   padding: 0.4rem;
-  border: 1px solid #ddd;
-  background: #fff;
+  border: 1px solid var(--ao-line);
+  background: var(--ao-surface);
+  color: var(--ao-ink);
   font-size: 0.85rem;
+  font-family: var(--ao-font-sans);
 }
 
 .run-list-item.selected {
-  border-color: #2255cc;
-  background: #eaf0ff;
+  border-color: var(--ao-accent);
+  background: color-mix(in srgb, var(--ao-surface-raised) 80%, var(--ao-accent) 20%);
+  box-shadow: 0 0 6px 0 color-mix(in srgb, var(--ao-accent) 35%, transparent);
 }
 
 .run-list-task {
@@ -168,15 +268,48 @@ button:disabled {
   width: 0.5rem;
   height: 0.5rem;
   border-radius: 50%;
-  background: #2fa84f;
+  background: var(--ao-status-good);
   flex-shrink: 0;
+}
+
+/* A live run gets a slow breathing pulse rather than a static dot — but only
+   when the reader hasn't asked for less motion (FR-U5), and never when the
+   in-app motion toggle (`data-ao-motion="off"`, owned elsewhere) is set. */
+@media (prefers-reduced-motion: no-preference) {
+  :root:not([data-ao-motion='off']) .live-dot {
+    animation: ao-pulse-opacity 2s ease-in-out infinite;
+  }
+
+  :root:not([data-ao-motion='off']) .status-tone-active {
+    animation: ao-pulse-glow 2.4s ease-in-out infinite;
+  }
+}
+
+@keyframes ao-pulse-opacity {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes ao-pulse-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, currentColor 0%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 6px 1px color-mix(in srgb, currentColor 55%, transparent);
+  }
 }
 
 /* --- Run header --- */
 
 .run-header {
   padding-bottom: 0.75rem;
-  border-bottom: 1px solid #ddd;
+  border-bottom: 1px solid var(--ao-line);
 }
 
 .run-header-row {
@@ -187,72 +320,98 @@ button:disabled {
 
 .run-task {
   font-size: 0.9rem;
-  color: #333;
+  color: var(--ao-ink-soft);
 }
 
 .run-cost {
-  font-family: ui-monospace, monospace;
+  font-family: var(--ao-font-mono);
+  font-variant-numeric: tabular-nums;
   font-size: 0.85rem;
+  color: var(--ao-ink-soft);
 }
 
-/* --- Status badges: covers every RunStatus and AssignmentStatus in status.ts --- */
+/* --- Status badges (FR-U4) ---
+ *
+ * These rules key on the eight **tokens**, not on the eighteen statuses.
+ * That distinction is the whole point. `theme/status.ts` owns the
+ * status → token mapping as a `Record` over the shared unions, so adding a
+ * status there is a compile error until it is given a colour; if this file
+ * enumerated statuses instead, a new one would silently render as an
+ * unstyled grey chip that no test could catch, because CSS selectors that
+ * match nothing are not an error. `StatusBadge.tsx` resolves the token and
+ * the glyph in TypeScript and hands this file a `status-tone-*` class.
+ *
+ * Status must not rely on hue alone. The badge keeps its text label, and on
+ * top of that each tone gets its own leading glyph (rendered as real text by
+ * the component, so screen readers and greyscale displays both get it) and
+ * its own border weight — shape, not just colour, carries the distinction.
+ *
+ * The chip itself stays dark (`--ao-sunken`) with the status colour on the
+ * text and border only (`currentColor`). Neon text on a dark chip is legible
+ * at every one of these hues; a neon *fill* would force a fresh "is the text
+ * dark or light on this fill" decision per status and would spend glow
+ * everywhere, which is exactly what makes a neon UI unreadable.
+ */
 
 .status-badge {
-  display: inline-block;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3em;
   padding: 0.1rem 0.5rem;
   border-radius: 999px;
-  font-size: 0.75rem;
-  font-weight: 600;
+  font-family: var(--ao-font-mono);
+  font-size: 0.72rem;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.02em;
-  color: #fff;
+  letter-spacing: 0.03em;
+  background: var(--ao-sunken);
+  border: 1px solid currentColor;
   white-space: nowrap;
 }
 
-.status-queued,
-.status-pending {
-  background: #9aa0a6;
+/* The glyph is a real element, not a ::before, so it is part of the
+   accessible name and survives a stylesheet that fails to load. */
+.status-glyph {
+  font-weight: 400;
 }
 
-.status-planning,
-.status-briefing {
-  background: #8a5fd6;
+.status-tone-idle {
+  color: var(--ao-status-idle);
 }
 
-.status-dispatching,
-.status-blocked {
-  background: #d68a00;
+.status-tone-planning {
+  color: var(--ao-status-planning);
 }
 
-.status-running,
-.status-working {
-  background: #2255cc;
+.status-tone-waiting {
+  color: var(--ao-status-waiting);
 }
 
-.status-synthesizing,
-.status-reporting {
-  background: #0f9d8c;
+.status-tone-active {
+  color: var(--ao-status-active);
+  border-width: 1.5px;
 }
 
-.status-designing {
-  background: #0f9d8c;
+.status-tone-finishing {
+  color: var(--ao-status-finishing);
 }
 
-.status-report_ready {
-  background: #2fa84f;
+.status-tone-good {
+  color: var(--ao-status-good);
 }
 
-.status-done {
-  background: #2fa84f;
+/* The one tone allowed a tinted chip: failure is the single state where
+   under-signalling is the worse failure mode, so it also gets a heavier
+   border and a faint background tint on top of its glyph. */
+.status-tone-bad {
+  color: var(--ao-status-bad);
+  border-width: 2px;
+  background: color-mix(in srgb, var(--ao-status-bad) 14%, var(--ao-sunken));
 }
 
-.status-failed {
-  background: #b00020;
-}
-
-.status-cancelled,
-.status-skipped {
-  background: #555;
+.status-tone-stopped {
+  color: var(--ao-status-stopped);
+  opacity: 0.85;
 }
 
 /* --- Assignment table --- */
@@ -260,22 +419,30 @@ button:disabled {
 .assignment-table {
   width: 100%;
   border-collapse: collapse;
+  font-family: var(--ao-font-mono);
+  font-variant-numeric: tabular-nums;
   font-size: 0.85rem;
+  color: var(--ao-ink);
 }
 
 .assignment-table th,
 .assignment-table td {
-  border: 1px solid #ddd;
+  border: 1px solid var(--ao-line);
   padding: 0.35rem 0.5rem;
   text-align: left;
 }
 
 .assignment-table th {
-  background: #eee;
+  background: var(--ao-surface-raised);
+  color: var(--ao-ink-soft);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
 }
 
 .assignment-table tr.row-failed {
-  background: #fdecec;
+  background: color-mix(in srgb, var(--ao-status-bad) 10%, transparent);
 }
 
 /* --- Log pane --- */
@@ -283,11 +450,12 @@ button:disabled {
 .log-pane {
   height: 260px;
   overflow-y: auto;
-  background: #111;
-  color: #ddd;
-  font-family: ui-monospace, 'Consolas', monospace;
+  background: var(--ao-sunken);
+  color: var(--ao-ink-soft);
+  font-family: var(--ao-font-mono);
   font-size: 0.8rem;
   padding: 0.5rem;
+  border: 1px solid var(--ao-line);
   border-radius: 3px;
 }
 
@@ -300,16 +468,17 @@ button:disabled {
 }
 
 .log-ts {
-  color: #888;
+  color: var(--ao-ink-mute);
+  font-variant-numeric: tabular-nums;
   flex-shrink: 0;
 }
 
 .log-line-log .log-text {
-  color: #7ec4ff;
+  color: var(--ao-status-finishing);
 }
 
 .log-line-event .log-text {
-  color: #ddd;
+  color: var(--ao-ink-soft);
 }
 
 /* --- Report viewer --- */
@@ -329,28 +498,32 @@ button:disabled {
 .markdown {
   white-space: pre-wrap;
   word-break: break-word;
-  background: #fff;
-  border: 1px solid #ddd;
+  background: var(--ao-surface);
+  border: 1px solid var(--ao-line);
+  color: var(--ao-ink);
   padding: 0.75rem;
-  font-family: ui-monospace, 'Consolas', monospace;
+  font-family: var(--ao-font-mono);
   font-size: 0.85rem;
   max-height: 500px;
   overflow-y: auto;
 }
 
-/* --- Phase 4: office sim --- */
-
-/* The canvas host. The renderer sizes its canvas from this element's client
-   box, so this MUST establish a bounded height — a host with only `min-height`
-   and no upper bound lets the canvas grow to the document's height, which is
-   how it first rendered at 118x8918. */
+/* --- Office sim host ---
+ *
+ * Sizing (height, the integer-scale rule) is untouched — the renderer reads
+ * this element's client box, per the comment kept below. Only the frame
+ * around it is restyled to match the rest of the terminal: a sunken bezel
+ * rather than a plain grey box, so the office reads as a screen embedded in
+ * the page instead of a leftover placeholder.
+ */
 .office-canvas {
   position: relative;
   display: flex;
   justify-content: center;
   align-items: center;
-  background: #2b2b33;
-  border: 1px solid #ddd;
+  background: var(--ao-sunken);
+  border: 1px solid var(--ao-line-firm);
+  box-shadow: inset 0 0 24px 0 color-mix(in srgb, var(--ao-bg) 60%, transparent);
   overflow: hidden;
   width: 100%;
   /* Sized against the integer-scale rule, not picked by eye. The renderer uses
@@ -371,7 +544,7 @@ button:disabled {
 }
 
 .office-empty {
-  color: #bbb;
+  color: var(--ao-ink-mute);
   font-size: 0.85rem;
   padding: 2rem;
   text-align: center;
@@ -383,16 +556,47 @@ button:disabled {
   align-items: center;
 }
 
-.view-toggle button[aria-pressed='true'] {
-  background: #333;
-  color: #fff;
+/* --- Display controls (FR-U5, FR-U7) ---
+   Layout only. The buttons deliberately inherit the global `button` and
+   `button[aria-pressed='true']` rules above, so the selected theme and motion
+   options read as "on" in exactly the same visual language as the office/table
+   toggle — a settings panel that invented its own selected-state would be one
+   more thing to keep in sync for no gain. */
+
+.display-controls {
+  margin-top: auto;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--ao-line);
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.display-controls-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+}
+
+.display-controls-group button {
+  padding: 0.2rem 0.55rem;
+  font-size: 0.8rem;
+}
+
+.display-controls-label {
+  flex-basis: 100%;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--ao-ink-mute);
 }
 
 /* --- Inspect panel (FR-S5) --- */
 
 .inspect-panel {
-  border: 1px solid #ccc;
-  background: #fafafa;
+  border: 1px solid var(--ao-line-firm);
+  background: var(--ao-surface-raised);
   padding: 0.75rem 0.9rem;
   display: flex;
   flex-direction: column;
@@ -409,18 +613,21 @@ button:disabled {
 .inspect-head h3 {
   margin: 0;
   font-size: 1rem;
+  color: var(--ao-ink);
 }
 
 .inspect-category {
   margin: 0;
   font-size: 0.75rem;
-  color: #777;
+  color: var(--ao-ink-mute);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 .inspect-description {
   margin: 0;
   font-size: 0.85rem;
-  color: #444;
+  color: var(--ao-ink-soft);
 }
 
 .inspect-stats {
@@ -434,13 +641,15 @@ button:disabled {
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #777;
+  color: var(--ao-ink-mute);
 }
 
 .inspect-stats dd {
   margin: 0;
   font-size: 0.9rem;
+  font-family: var(--ao-font-mono);
   font-variant-numeric: tabular-nums;
+  color: var(--ao-ink);
 }
 
 .inspect-objective h4,
@@ -449,26 +658,33 @@ button:disabled {
   font-size: 0.8rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  color: #777;
+  color: var(--ao-ink-mute);
 }
 
 .inspect-objective p {
   margin: 0;
   font-size: 0.85rem;
+  color: var(--ao-ink-soft);
 }
 
 .inspect-activity ul {
   margin: 0;
   padding-left: 1rem;
   font-size: 0.8rem;
-  font-family: ui-monospace, 'Consolas', monospace;
+  font-family: var(--ao-font-mono);
+  color: var(--ao-ink-soft);
   display: flex;
   flex-direction: column;
   gap: 0.2rem;
 }
 
-.error-fatal { color: #a3271c; }
-.error-warn { color: #8a6d1f; }
+.error-fatal {
+  color: var(--ao-status-bad);
+}
+
+.error-warn {
+  color: var(--ao-status-waiting);
+}
 
 /* --- Replay controls (NFR-7) --- */
 
@@ -478,24 +694,33 @@ button:disabled {
   align-items: center;
   gap: 0.6rem;
   padding: 0.5rem 0.6rem;
-  border: 1px solid #ddd;
-  background: #f5f5f5;
+  border: 1px solid var(--ao-line);
+  background: var(--ao-surface);
+  color: var(--ao-ink-soft);
   font-size: 0.85rem;
+}
+
+.replay-controls-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
 }
 
 .replay-controls input[type='range'] {
   flex: 1;
   min-width: 140px;
+  accent-color: var(--ao-accent);
 }
 
 .replay-elapsed {
   font-variant-numeric: tabular-nums;
-  font-family: ui-monospace, 'Consolas', monospace;
+  font-family: var(--ao-font-mono);
   font-size: 0.8rem;
+  color: var(--ao-ink);
 }
 
 .replay-partial {
-  color: #8a6d1f;
+  color: var(--ao-status-waiting);
   font-size: 0.75rem;
 }
 
@@ -511,19 +736,21 @@ button:disabled {
 .pdf-button {
   display: inline-block;
   padding: 0.45rem 0.9rem;
-  background: #1f2933;
-  color: #fff;
+  background: var(--ao-accent);
+  color: var(--ao-bg);
   text-decoration: none;
   border-radius: 3px;
   font-size: 0.9rem;
+  font-weight: 600;
 }
 
 .pdf-button:hover,
 .pdf-button:focus-visible {
-  background: #33414f;
+  background: var(--ao-accent-dim);
+  color: var(--ao-bg);
 }
 
 .pdf-theme {
   font-size: 0.8rem;
-  color: #666;
+  color: var(--ao-ink-mute);
 }

@@ -1,4 +1,5 @@
 import { BODY_VARIANTS, HAIR_STYLES, type AgentAppearance } from './model.js';
+import { OFFICE, THEMES } from '../theme/tokens.js';
 import {
   FRAMES_PER_ANIMATION,
   SPRITE_HEIGHT,
@@ -85,7 +86,15 @@ function wrap(n: number, size: number): number {
   return m < 0 ? m + size : m;
 }
 
-const OUTLINE = '#141414';
+// Eyes and shoe soles: a structural detail of "this is a person", not part of
+// any agent's identity, so it stays constant while skin/hair/shirt/trousers
+// are palette-driven (see the file header). It still has to come from tokens
+// (FR-U2 — no second colour source in this directory). It has its own token
+// rather than borrowing the backdrop's: an outline that tracked
+// `OFFICE.background` would silently disappear the day the floor is retuned
+// darker, and "the characters lost their eyes" is not a bug anyone would
+// trace back to a background tweak.
+const OUTLINE = OFFICE.outline;
 
 // Layout constants below assume the contract's current 12×16 box. They are
 // not derived from SPRITE_WIDTH/SPRITE_HEIGHT arithmetically — a 12×16 pixel
@@ -405,23 +414,42 @@ const frame: FrameGenerator = (key) => {
 // --- Props -------------------------------------------------------------
 //
 // Props carry no AgentAppearance, so unlike the character above their
-// colours are ordinary constants — there is no palette for them to respect.
-// They are static (no inputs at all), so rather than the keyed cache above
-// each is simply built once at module load into a fixed six-entry table: the
-// cheapest possible memoisation, bounded by construction rather than a check.
+// colours are ordinary constants rather than slices of a per-agent ramp —
+// but they are still office colours, so FR-U2 still applies: every one below
+// is sourced from `theme/tokens.ts`, not authored here. They are static (no
+// inputs at all), so rather than the keyed cache above each is simply built
+// once at module load into a fixed six-entry table: the cheapest possible
+// memoisation, bounded by construction rather than a check.
 
-const DESK_WOOD = '#8a6a45';
-const DESK_WOOD_DARK = '#6b4f30';
-const DESK_LEG = '#3a2b1c';
-// The one visual cue that this is the Manager's desk and not an agent's —
-// brass trim and a nameplate the ordinary desk does not get.
-const MANAGER_TRIM = '#c9a227';
-const PAPER_COLOUR = '#f2ead9';
-const PAPER_LINE = '#9a8f78';
-const SPEECH_FILL = '#f4f4f4';
-const ALERT_FILL = '#e0a72a';
-const ERROR_FILL = '#c1443a';
-const MARK_LIGHT = '#ffffff';
+// Naturalistic wood browns before this phase; now the office's own dark
+// terminal tones, exactly as FR-U3 asks — a palette swap, not a redraw. The
+// names on the right read oddly against "wood" only until you remember there
+// is no wood on a CRT.
+const DESK_WOOD = OFFICE.desk;
+const DESK_WOOD_DARK = OFFICE.deskEdge;
+// Darker than the desktop, so the furniture reads as solid rather than as a
+// floating plank.
+const DESK_LEG = OFFICE.deskLeg;
+// The one visual cue that this is the Manager's desk and not an agent's.
+// `OFFICE.managerDesk` exists precisely for this — a distinct desk colour
+// standing in for what used to be a brass trim stripe.
+const MANAGER_TRIM = OFFICE.managerDesk;
+const PAPER_COLOUR = OFFICE.paper;
+// The tick marks drawn on the paper prop — dimmer than the page they sit on,
+// so a report reads as written-on rather than as a blank rectangle.
+const PAPER_LINE = OFFICE.paperLine;
+// The neutral speech bubble and the light mark drawn on the alert/error
+// bubbles both want the same thing: the office's lightest, most paper-like
+// tone for contrast against a dark or saturated fill. `OFFICE.paper` is that
+// tone, so both alias it rather than each inventing its own near-white.
+const SPEECH_FILL = OFFICE.paper;
+const MARK_LIGHT = OFFICE.paper;
+// Alert/error bubbles intentionally track the chrome's own status hues
+// (`THEMES.dark`, not `THEMES[mode]` — the office never follows the light
+// theme, see `theme/tokens.ts`), so "blocked" and "failed" read as the same
+// colour here as they do everywhere else the app shows status.
+const ALERT_FILL = THEMES.dark.statusWaiting;
+const ERROR_FILL = THEMES.dark.statusBad;
 
 function buildDesk(): PixelGrid {
   const grid = createGrid();

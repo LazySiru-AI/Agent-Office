@@ -1,4 +1,5 @@
 import type { RunSummary } from '@agent-office/shared';
+import { StatusBadge } from './StatusBadge.js';
 
 /**
  * Past and in-flight runs (`GET /api/runs`, kept live via the `runs` push
@@ -28,7 +29,7 @@ export function RunList({ runs, selectedRunId, onSelect }: RunListProps): JSX.El
               className={run.id === selectedRunId ? 'run-list-item selected' : 'run-list-item'}
               onClick={() => onSelect(run.id)}
             >
-              <span className={`status-badge status-${run.status}`}>{run.status}</span>
+              <StatusBadge status={run.status} />
               <span className="run-list-task" title={run.task}>
                 {truncate(run.task, 60)}
               </span>

@@ -470,7 +470,7 @@ routing errors documented and addressed.
 **Exit:** the same task runs identically through Claude Code and through a raw
 API provider, with only a dropdown changing.
 
-### Phase 8 — Dark neon terminal interface
+### Phase 8 — Dark neon terminal interface — **done**
 
 The app's own visual identity (§2.6). Independent of everything else: it changes
 no orchestrator behaviour, no contract and no provider, which is why it can be
@@ -503,6 +503,16 @@ colour value in the client.
 **Risk:** this is the phase most likely to be judged on taste rather than
 correctness, and the one where "a bit more polish" has no natural end. The exit
 criteria above are deliberately checkable for that reason.
+
+**Outcome:** all four exit criteria met — see `PROGRESS.md`. Two things the plan
+did not anticipate. The contrast bar had to be measured against *every* surface
+a colour lands on, not the page background: panels sit on `surfaceRaised`, which
+in dark is lighter than `bg`, and auditing against `bg` alone passed eight pairs
+that fail on the surface they actually render on. And the status vocabulary
+turned out to exist in three places, not one — the stylesheet now keys on the
+eight colour tokens rather than the eighteen statuses, so the status list lives
+only in TypeScript where it is compile-checked. Scanlines and flicker were not
+built; the motion switch and reduced-motion gating cover the effects that exist.
 
 ---
 

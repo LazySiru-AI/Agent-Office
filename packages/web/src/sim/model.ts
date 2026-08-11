@@ -5,6 +5,7 @@ import {
   type CharacterBehaviour,
   type RunState,
 } from '@agent-office/shared';
+import { SPRITE_RAMP } from '../theme/tokens.js';
 
 /**
  * The office as data (PLAN.md §1.2, FR-S1–FR-S3).
@@ -129,20 +130,20 @@ export interface AgentAppearance {
 /**
  * Palettes kept small and deliberately low-saturation, so status colour — the
  * one thing the user must read at a glance — is never competing with a shirt.
+ *
+ * FR-U2/FR-U3: these four names are aliases onto `SPRITE_RAMP` in
+ * `theme/tokens.ts`, not a second definition. Before this change the office
+ * carried its own 23 hex literals here, independent of the ones the chrome
+ * used; a retune (this phase's phosphor palette swap) meant hunting down and
+ * editing two places that were supposed to agree. Re-exporting the ramps
+ * under their original names means `appearanceFor`'s slicing below — and
+ * every caller of these four exports — needs no change at all: the palette
+ * moved, the shapes (5/6/8/4 entries respectively) did not.
  */
-export const SKIN_TONES = ['#f0c9a4', '#dda57c', '#b57c53', '#8d5a3b', '#6b4227'] as const;
-export const HAIR_COLOURS = ['#2b2118', '#5a3a22', '#8a5a2b', '#c9a227', '#9a9a9a', '#3a2b4a'] as const;
-export const SHIRT_COLOURS = [
-  '#4a6b8a',
-  '#6b7f5a',
-  '#8a5f4a',
-  '#5f5a7f',
-  '#7f6f4a',
-  '#4a7f75',
-  '#7a4a5f',
-  '#5b6470',
-] as const;
-export const TROUSER_COLOURS = ['#3a3f4a', '#4a4030', '#2f3a35', '#443344'] as const;
+export const SKIN_TONES = SPRITE_RAMP.skin;
+export const HAIR_COLOURS = SPRITE_RAMP.hair;
+export const SHIRT_COLOURS = SPRITE_RAMP.shirt;
+export const TROUSER_COLOURS = SPRITE_RAMP.trousers;
 
 export const BODY_VARIANTS = 3;
 export const HAIR_STYLES = 4;

@@ -788,3 +788,87 @@ of why it must not grow into a planner.
   become text placeholders rather than being fetched.
 - The cover shows estimated cost only when the caller computes one; the CLI path
   does not, so it prints an em dash.
+
+---
+
+## Phase 8 — Dark neon terminal interface
+
+Exit criterion: the whole app — not just the office — reads as one dark neon
+terminal, with the palette defined exactly once and status still legible
+without colour.
+
+### How it was built
+
+The palette went first, as a plain TypeScript module, before any agent started.
+That ordering mattered more here than in earlier phases: four agents were about
+to edit the stylesheet, the sprite generator, the scene and a settings panel in
+parallel, and a colour is precisely the kind of value each of them would
+otherwise have invented locally. `theme/tokens.ts` gave them something to import
+instead.
+
+Four sonnet agents then worked disjoint files: the stylesheet (zero colour
+literals, all `var(--ao-*)`), the status→token mapping plus a WCAG audit, the
+office palette swap, and the theme/motion toggles.
+
+### The count that justified the phase
+
+**99 hex literals** in the client before this: 61 in `styles.css`, 23 in
+`sim/model.ts`, 11 in `sim/sprites.ts`, plus five numeric colours in
+`sim/scene.ts`. Two renderers, two private copies of "what working looks like".
+Afterwards the only colour values in `packages/web/src` are in `tokens.ts`,
+which a test now asserts by reading the sim files back off disk.
+
+### Findings
+
+- **The contrast audit was measured against the wrong grounds.** The agent
+  checked every colour against `--ao-bg` and found one failure. But
+  `styles.css` puts panels on `surfaceRaised` and status chips on `sunken`, and
+  in dark `surfaceRaised` is *lighter* than `bg` — so `bg` is the easiest
+  ground, not the representative one. Auditing the full 4×13 grid found **eight**
+  sub-AA pairs, including `statusStopped` at **2.85:1** on the surface it
+  actually renders on. `cancelled` and `skipped` badges were effectively
+  unreadable. Six token values were retuned; the test now enumerates every
+  (text, ground) pair in both themes rather than sampling one.
+- **Three copies of the status vocabulary.** The shared unions, `status.ts`'s
+  `Record`, and eighteen `.status-<status>` CSS rules with their own glyph set —
+  which had already drifted from the glyphs `status.ts` exported to nobody. A
+  CSS selector that matches nothing is not an error, so a nineteenth status
+  would have rendered as an unstyled chip silently. The stylesheet now keys on
+  the eight *tokens*; `StatusBadge.tsx` resolves status→tone in TypeScript,
+  where the mapping is total and a new status is a compile error.
+- **The office does not follow the light theme, deliberately.** A CRT is a
+  screen, and a screen is dark whatever the room is. Inverting it would also
+  mean regenerating every sprite texture on a theme switch.
+- Sprite ramps are tuned dimmer than the status hues on purpose: a desk full of
+  characters must never out-shout the one badge saying something failed.
+
+### Verified in the browser
+
+- Boots dark with no white flash — `applyBootTheme()` runs before `createRoot`,
+  since a stylesheet written entirely against custom properties has no colours
+  at all until they are set.
+- Switching to light repaints tokens, body and badges (`--ao-bg` `#0b0e12` →
+  `#f2f5f8`, badge `rgb(71,224,122)` → `rgb(24,110,55)`); switching back
+  restores. Motion Off sets `data-ao-motion="off"`. Both persist to
+  `localStorage` and survive reload.
+- Badges render glyph-plus-label (`✓done`), so greyscale and colour-blind
+  readers get the state from shape and text.
+- No console errors, and no font or network request beyond the app itself
+  (FR-U6).
+
+**744 tests pass; typecheck is clean.**
+
+### Known gaps carried forward
+
+- **The office's rendered pixels are not verified in-browser.** Pixi does not
+  preserve the WebGL drawing buffer, so a canvas readback returns black — that
+  is a limitation of the check, not a finding about the office. Its palette is
+  covered by unit tests (including one asserting no colour literals survive in
+  `sim/`), not by a screenshot.
+- Screenshots were unavailable in this environment, so every visual claim above
+  rests on computed styles and the DOM rather than on an image.
+- FR-U5's scanline and flicker effects were not built. The motion switch and
+  `prefers-reduced-motion` gating are in place for the effects that exist (the
+  live-dot pulse, the active-status glow, and a static under-desk work glow).
+- `accentDim`, `line` and `lineFirm` are exempt from the contrast grid as
+  decorative. A test pins that claim so it cannot rot into an excuse.

@@ -10,6 +10,7 @@ import {
   type Point,
 } from './model.js';
 import type { Facing, PixelGrid, PropName, SpriteAnimation, SpriteManifest } from './spriteContract.js';
+import { OFFICE, toPixiColour } from '../theme/tokens.js';
 
 /**
  * The pixel-office renderer (PLAN.md §1.2, FR-S1–FR-S7).
@@ -220,6 +221,22 @@ export function hitTest(entities: readonly HitTestEntity[], point: Point): strin
   return undefined;
 }
 
+/**
+ * Whether a desk should show the work glow (FR-U3's one new affordance for
+ * this phase).
+ *
+ * Reads `behaviour.animation` — the same field `syncCharacters` already uses
+ * to pick the body sprite — rather than comparing `status === 'working'`
+ * separately. `ASSIGNMENT_BEHAVIOUR` in `@agent-office/shared` is the single
+ * place status maps to what's on screen (FR-S3); a second comparison here
+ * would be a second source that could quietly drift from the first if the
+ * behaviour table ever changed. No new state is introduced — this is a pure
+ * read of a `CharacterView` the scene already has.
+ */
+export function isWorkGlowing(behaviour: CharacterView['behaviour']): boolean {
+  return behaviour.animation === 'type';
+}
+
 // ---------------------------------------------------------------------------
 // Sprite-texture plumbing. Talks to the DOM (canvas, `Texture.from`) but not
 // to an `Application`, so it stays out of the way of the pure section above.
@@ -315,12 +332,21 @@ interface CharacterRenderState {
   lastTextureKey: string | undefined;
 }
 
-const FLOOR_LIGHT = 0x2c313a;
-const FLOOR_DARK = 0x262b33;
-const BACKGROUND_COLOUR = 0x14161a;
+// FR-U2/FR-U3: every colour the renderer paints comes from `OFFICE` via
+// `toPixiColour` — Pixi wants numbers, `OFFICE` holds strings for the DOM
+// side of the same palette, so this is the one conversion point rather than
+// a second copy of the values themselves.
+const FLOOR_LIGHT = toPixiColour(OFFICE.floorLight);
+const FLOOR_DARK = toPixiColour(OFFICE.floorDark);
+const BACKGROUND_COLOUR = toPixiColour(OFFICE.background);
 const NAMEPLATE_GAP_PX = 2;
-const NAMEPLATE_COLOUR = 0xd8dee9;
-const SELECTION_RING_COLOUR = 0xffe066;
+const NAMEPLATE_COLOUR = toPixiColour(OFFICE.nameplate);
+const SELECTION_RING_COLOUR = toPixiColour(OFFICE.selection);
+/** Cast under a desk whose agent is currently `working` — see `isWorkGlowing`. */
+const WORK_GLOW_COLOUR = toPixiColour(OFFICE.workGlow);
+/** Soft, not solid — a glow that competed with the selection ring or a status
+ * bubble for attention would defeat the point of keeping status legible. */
+const WORK_GLOW_ALPHA = 0.35;
 
 /**
  * Drives one PixiJS `Application` from a stream of `OfficeScene` snapshots.
@@ -335,8 +361,11 @@ export class OfficeSceneRenderer {
   private readonly callbacks: OfficeSceneCallbacks;
 
   private app: Application | undefined;
-  private world: Container | undefined; // scaled+letterboxed: floor, desks, characters
+  private world: Container | undefined; // scaled+letterboxed: floor, glow, desks, characters
   private floorLayer: Container | undefined;
+  // Between the floor and the desks, so a glow reads as light spilling out
+  // from under a desk rather than painted on top of it.
+  private workGlowLayer: Container | undefined;
   private deskLayer: Container | undefined;
   private characterLayer: Container | undefined;
   private uiLayer: Container | undefined; // unscaled overlay: nameplates, kept crisp at any zoom
@@ -415,9 +444,10 @@ export class OfficeSceneRenderer {
 
     this.world = new Container();
     this.floorLayer = new Container();
+    this.workGlowLayer = new Container();
     this.deskLayer = new Container();
     this.characterLayer = new Container();
-    this.world.addChild(this.floorLayer, this.deskLayer, this.characterLayer);
+    this.world.addChild(this.floorLayer, this.workGlowLayer, this.deskLayer, this.characterLayer);
 
     this.uiLayer = new Container();
 
@@ -459,6 +489,7 @@ export class OfficeSceneRenderer {
     this.latestLayout = scene.layout;
     this.rebuildFloorAndDesks(scene.layout);
     this.syncCharacters(scene.characters);
+    this.rebuildWorkGlows(scene.characters);
     if (this.lastContainerWidth !== undefined && this.lastContainerHeight !== undefined) {
       this.applyViewport(this.lastContainerWidth, this.lastContainerHeight);
     }
@@ -564,6 +595,7 @@ export class OfficeSceneRenderer {
 
     this.world = undefined;
     this.floorLayer = undefined;
+    this.workGlowLayer = undefined;
     this.deskLayer = undefined;
     this.characterLayer = undefined;
     this.uiLayer = undefined;
@@ -679,6 +711,38 @@ export class OfficeSceneRenderer {
     const px = tileToPixel(tile);
     sprite.position.set(px.x + TILE / 2, px.y + TILE);
     return sprite;
+  }
+
+  /**
+   * The one new affordance this phase adds (FR-U3): a glow under every desk
+   * whose character `isWorkGlowing`.
+   *
+   * Rebuilt from `scene.characters` on every `applyScene` call rather than
+   * kept as incremental per-character state — exactly how `rebuildFloorAndDesks`
+   * just above already treats the desks themselves. That keeps this method
+   * total and stateless: there is nothing here to get out of sync, because
+   * nothing here is remembered between calls.
+   *
+   * FR-U5: no animation loop reads or writes anything on this layer — the
+   * glow is a flat fill, so it is motion-safe by construction rather than by
+   * checking `reducedMotion` (that flag only matters to `onTick`, which never
+   * touches `workGlowLayer`).
+   */
+  private rebuildWorkGlows(characters: readonly CharacterView[]): void {
+    if (this.workGlowLayer === undefined) return;
+
+    for (const child of this.workGlowLayer.removeChildren()) child.destroy();
+
+    for (const view of characters) {
+      if (!isWorkGlowing(view.behaviour)) continue;
+
+      const px = tileToPixel(view.home.desk);
+      const glow = new Graphics();
+      glow
+        .ellipse(px.x + TILE / 2, px.y + TILE, TILE * 0.6, TILE * 0.3)
+        .fill({ color: WORK_GLOW_COLOUR, alpha: WORK_GLOW_ALPHA });
+      this.workGlowLayer.addChild(glow);
+    }
   }
 
   private syncCharacters(characters: readonly CharacterView[]): void {

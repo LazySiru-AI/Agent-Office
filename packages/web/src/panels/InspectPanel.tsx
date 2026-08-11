@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import type { AgentSummary, AssignmentState, LoggedAgentEvent } from '@agent-office/shared';
 import { assignmentCostUsd, formatCostUsd } from '../costModel.js';
+import { StatusBadge } from './StatusBadge.js';
 
 /**
  * The click-to-inspect panel (FR-S5).
@@ -69,7 +70,7 @@ export function InspectPanel({
         <div>
           <dt>Status</dt>
           <dd>
-            <span className={`status-badge status-${assignment.status}`}>{assignment.status}</span>
+            <StatusBadge status={assignment.status} />
           </dd>
         </div>
         <div>

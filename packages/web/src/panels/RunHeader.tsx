@@ -1,6 +1,7 @@
 import { isRunTerminal, type RunState } from '@agent-office/shared';
 import { formatCostUsd, summariseRunCost } from '../costModel.js';
 import type { SocketStatus } from '../state/socket.js';
+import { StatusBadge } from './StatusBadge.js';
 
 /**
  * Run summary strip: status, cancel button, and the per-run NFR-5 cost
@@ -47,7 +48,7 @@ export function RunHeader({
     <div className="run-header">
       <div className="run-header-row">
         <h1>{run.id}</h1>
-        <span className={`status-badge status-${run.status}`}>{run.status}</span>
+        <StatusBadge status={run.status} />
         {canCancel && (
           <button type="button" className="cancel-button" onClick={onCancel}>
             Cancel run

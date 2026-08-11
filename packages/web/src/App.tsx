@@ -3,6 +3,7 @@ import type { AgentSummary } from '@agent-office/shared';
 import { fetchAgents } from './api.js';
 import { buildAgentModelIndex } from './costModel.js';
 import { AssignmentTable } from './panels/AssignmentTable.js';
+import { DisplayControls } from './panels/DisplayControls.js';
 import { InspectPanel } from './panels/InspectPanel.js';
 import { LogPane } from './panels/LogPane.js';
 import { PdfDownload } from './panels/PdfDownload.js';
@@ -14,6 +15,7 @@ import { TaskForm } from './panels/TaskForm.js';
 import { OfficeCanvas } from './sim/OfficeCanvas.js';
 import { useReplay } from './state/useReplay.js';
 import { useAgentOffice } from './state/useRun.js';
+import { useTheme } from './theme/useTheme.js';
 
 /**
  * Phase 4 shell: the office replaces the table as the primary view.
@@ -37,6 +39,12 @@ type ViewMode = 'office' | 'table';
 
 export function App(): JSX.Element {
   const office = useAgentOffice();
+  // Owned at the shell, not inside a panel: `applyBootTheme()` has already
+  // painted the palette before React existed (see `main.tsx`), and this hook
+  // takes ownership of it from the first commit onwards. Mounting it anywhere
+  // conditional would mean the palette stops tracking the OS the moment that
+  // branch unmounts.
+  const theme = useTheme();
   const [agents, setAgents] = useState<AgentSummary[]>([]);
   const [agentsError, setAgentsError] = useState<string | undefined>(undefined);
   const [selectedReportPath, setSelectedReportPath] = useState<string | undefined>(undefined);
@@ -84,6 +92,18 @@ export function App(): JSX.Element {
         {agentsError !== undefined && (
           <p className="form-error">agent roster unavailable: {agentsError}</p>
         )}
+
+        {/* Last in the sidebar, and outside the `shownRun` guard below: display
+            preferences must be reachable before a run exists, which is exactly
+            when someone lands on the app and wants the lights turned up. */}
+        <DisplayControls
+          themePreference={theme.themePreference}
+          resolvedTheme={theme.resolvedTheme}
+          onThemePreferenceChange={theme.setThemePreference}
+          motionPreference={theme.motionPreference}
+          resolvedMotion={theme.resolvedMotion}
+          onMotionPreferenceChange={theme.setMotionPreference}
+        />
       </aside>
 
       <main className="main">

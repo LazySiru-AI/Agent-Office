@@ -18,12 +18,13 @@ report over to the Manager when done.
 
 ## Status
 
-**Phases 0, 2, 3, 4 and 5 are done and verified.** 590 tests pass, typecheck is
-clean, the registry indexes 154 agents, and you can drive a run from the browser
-— watch the team work in a pixel office, click a character to inspect it,
-refresh mid-run without losing it, cancel it, read the reports in-app, replay a
-finished run offline, and download a themed PDF. See `PROGRESS.md` for what had
-to be repaired to get there.
+**Phases 0, 2, 3, 4, 5 and 8 are done and verified.** 744 tests pass, typecheck
+is clean, the registry indexes 154 agents, and you can drive a run from the
+browser — watch the team work in a pixel office, click a character to inspect
+it, refresh mid-run without losing it, cancel it, read the reports in-app,
+replay a finished run offline, and download a themed PDF. The whole app wears
+one dark neon terminal theme, with a light option and a motion switch. See
+`PROGRESS.md` for what had to be repaired to get there.
 
 The PDF needs no extra dependency: it is printed by the Chrome or Edge already
 installed on the machine, fully offline.
@@ -37,7 +38,7 @@ installed on the machine, fully offline.
 | 4 | Pixel office sim | done |
 | 5 | Designer step + PDF export | done |
 | 6–7 | Domain breadth, more providers | not started |
-| 8 | Dark neon terminal interface | not started |
+| 8 | Dark neon terminal interface | done |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
 has been driven against the real CLI — real spawn, real argv, real stream-json —
@@ -105,6 +106,11 @@ scripted provider down enough to watch statuses change and test refresh-mid-run.
 The office is the default view. Click a character to inspect that agent; the
 `Table` toggle brings back the plain assignment table, and `Replay` re-runs a
 finished run from its saved event log — no provider, no tokens, no cost.
+
+The app opens dark. The `Theme` and `Motion` controls at the foot of the sidebar
+switch to a light theme or follow the OS, and turn animation off independently
+of `prefers-reduced-motion`. The office itself stays dark in either theme — it
+is a screen, and a screen does not change colour with the room.
 
 Run the tests:
 

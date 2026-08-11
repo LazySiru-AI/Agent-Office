@@ -1,5 +1,6 @@
 import type { AssignmentState } from '@agent-office/shared';
 import { assignmentCostUsd, formatCostUsd } from '../costModel.js';
+import { StatusBadge } from './StatusBadge.js';
 
 /**
  * The plain table PLAN.md Phase 3 asks for — no office sim yet (that's
@@ -53,7 +54,7 @@ export function AssignmentTable({
               <td>{a.agentName}</td>
               <td>{a.phaseId}</td>
               <td>
-                <span className={`status-badge status-${a.status}`}>{a.status}</span>
+                <StatusBadge status={a.status} />
               </td>
               <td>{a.attempts}</td>
               <td>
