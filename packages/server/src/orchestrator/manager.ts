@@ -8,6 +8,7 @@ import {
 import type { ZodError } from 'zod';
 import type { Registry } from '../registry/index.js';
 import { buildRegistry, buildRosterDigest, estimateTokens } from '../registry/index.js';
+import { DEFAULT_CANDIDATE_LIMIT, selectCandidates } from '../registry/select.js';
 import type { AgentProvider } from '../providers/types.js';
 
 /**
@@ -633,8 +634,37 @@ export interface PlanRunDeps {
   maxRepairAttempts?: number;
   /** Every provider event is forwarded here, plus one non-fatal error per rejection. */
   onEvent?: ManagerEventListener;
-  /** FR-R4 groundwork: show the Manager a pre-filtered candidate list. */
+  /** FR-R4: an explicit roster to show the Manager. Overrides {@link candidateLimit}. */
   candidateAgents?: readonly string[];
+  /**
+   * FR-R4: derive a shortlist of this many agents for the task, via
+   * `selectCandidates`, instead of showing the whole roster.
+   *
+   * **Opt-in, and deliberately not defaulted on.** The token case for
+   * shortlisting is strong — the roster digest is 11,067 tokens for all 156
+   * agents against 2,748 for the top 40, on the most-repeated prompt in the
+   * system (the planning prompt is re-sent whole on every repair attempt). The
+   * recall case is not. `select.test.ts`'s own sweep, against the live
+   * registry, measures how many of the agents a human would pick survive the
+   * cut:
+   *
+   *     @40=10/16  @60=11/16  @80=11/16  @100=11/16  @120=11/16  @140=15/16  @156=16/16
+   *
+   * At 40 the research scenario keeps one of its three obvious picks, and
+   * `security-auditor` is lost from a security task — BM25 has no stemming or
+   * sense disambiguation, so an agent whose description shares no literal token
+   * with the task scores exactly zero. The test that produces that table is
+   * named for its conclusion: no cut is both safe and a saving.
+   *
+   * So the plan quality this would cost is real and measured, while the tokens
+   * it saves are only tokens. It stays available and unset. Turning it on is a
+   * decision to accept that trade, which is why it has to be made explicitly by
+   * a caller rather than inherited from a default here.
+   *
+   * {@link DEFAULT_CANDIDATE_LIMIT} is the value FR-R4 proposed, for a caller
+   * that wants it.
+   */
+  candidateLimit?: number;
   /** NFR-1. Planning writes nothing, but the provider seam requires a directory. */
   workspaceDir?: string;
   /** Planning is pure reasoning; defaults to no tools at all. */
@@ -663,8 +693,23 @@ export async function planRun(deps: PlanRunDeps): Promise<RunPlan> {
 
   const log = deps.logger ?? defaultLogger;
   const systemPrompt = buildManagerSystemPrompt(registry, { mode: 'planning' });
+
+  // FR-R4. An explicit list wins; otherwise a limit asks for a derived
+  // shortlist; otherwise the Manager sees the whole roster. See the doc comment
+  // on `candidateLimit` for why the shortlist is opt-in rather than the default.
+  //
+  // Narrowing here is only ever a *prompt* narrowing: `knownNames` below still
+  // validates against the entire registry, so a Manager that names an agent
+  // outside the shortlist is still accepted. The cut can cost relevance — which
+  // is measured, and the reason it is off by default — but never correctness.
+  const candidateAgents =
+    deps.candidateAgents ??
+    (deps.candidateLimit === undefined
+      ? undefined
+      : selectCandidates(registry, task, { limit: deps.candidateLimit }));
+
   const basePrompt = buildPlanningPrompt(registry, task, {
-    ...(deps.candidateAgents === undefined ? {} : { candidateAgents: deps.candidateAgents }),
+    ...(candidateAgents === undefined ? {} : { candidateAgents }),
   });
 
   // FR-M3 checks against the *whole* registry, not just the prompt roster: an

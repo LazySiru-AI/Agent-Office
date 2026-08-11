@@ -188,10 +188,14 @@ export function scriptedPlanJson(task: string, known: ReadonlySet<string>): stri
 /**
  * Provider ids this build can actually construct.
  *
- * Deliberately narrower than `PROVIDER_IDS`, which enumerates every id the
- * event/telemetry types know about including ones no adapter exists for yet.
- * The HTTP layer quotes this list when it rejects a request, so a user who asks
- * for `anthropic` is told what is available instead of what is conceivable.
+ * This once was narrower than `PROVIDER_IDS` — that list enumerates every id
+ * the event/telemetry types know about, and for a while it included ids no
+ * adapter existed for yet. The two now hold the same five members (they differ
+ * only in order), because every declared id has an adapter. Kept as a separate
+ * constant rather than aliased to `PROVIDER_IDS`: the next id will again be
+ * declared for telemetry before it can be constructed, and the HTTP layer
+ * quotes *this* list when it rejects a request, so a user is told what is
+ * available rather than what is conceivable.
  */
 export const AVAILABLE_PROVIDER_IDS = [
   'scripted',
@@ -280,21 +284,30 @@ export interface MakeProviderOptions {
    * Per-assignment spend ceiling (FR-M8). Ignored by the scripted provider,
    * which spends nothing. Unset means no cap.
    *
-   * Forwarded to every real provider below, but only the Claude Code adapter
-   * currently acts on it — the CLI has `--max-budget-usd`, the API-based
-   * adapters have no equivalent yet and bound spend only via
-   * `maxOutputTokens` and the tool-round limit. Still passed to `anthropic`
-   * and the OpenAI-compatible adapter so that the day their own options type
-   * accepts it, the value is already reaching them.
+   * Every real adapter now acts on it, by two different mechanisms. The Claude
+   * Code adapter forwards it to the CLI's own `--max-budget-usd`. The
+   * `anthropic` and OpenAI-compatible adapters meter spend themselves against
+   * `pricing.ts`, and refuse to run at all when the resolved model has no known
+   * price — stricter than the CLI, and deliberately so: a cap that silently
+   * does not apply is the defect this option exists to close.
+   *
+   * Per *assignment*, not per run. Nothing here accumulates across the
+   * assignments of one run, so an N-assignment plan can spend up to N times
+   * this value. See `supervisor.ts`, which passes one provider instance — and
+   * therefore this one ceiling — to every invocation.
    */
   maxCostUsd?: number;
 
   /**
-   * Passed to `--model`. Unset means the CLI's configured default.
+   * The run-wide model. Unset means each adapter's configured default.
    *
-   * Provider-wide rather than per-agent: `AgentRunRequest` carries no model, so
-   * the catalog's per-agent `model:` frontmatter cannot reach the adapter yet.
-   * See the note in `claude-code/provider.ts`.
+   * Provider-wide, and *not* the only way a model is chosen: `AgentRunRequest`
+   * also carries the catalog's per-agent `model:` frontmatter, and every
+   * adapter consumes it (`claude-code/provider.ts`'s `buildArgs`, and
+   * `resolveAgentModel` for the `anthropic` and OpenAI-compatible adapters).
+   * This option wins where both are set — a run-wide instruction outranks an
+   * agent's standing preference — and each adapter reports the substitution
+   * rather than applying it silently.
    */
   model?: string;
 
@@ -368,18 +381,13 @@ export function makeProvider(
     // and everything that differs between them — key variable, base URL, model
     // — is already absorbed by `resolveApiConfig`. A second near-identical file
     // would be two places to fix the next streaming bug.
-    //
-    // Built as a variable rather than inline so `maxCostUsd` below type-checks
-    // against `OpenAiCompatibleProvider`'s current constructor without an `as`
-    // cast: see the note on `maxCostUsd` a few lines down.
     const providerOptions = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),
-      // FR-M8's spend cap reaches this adapter only once its own options type
-      // accepts `maxCostUsd` — a change owned by another fixer, landing in
-      // parallel with this one. Forwarding it now, unconditionally on the
-      // option being set here, means the day that lands nothing needs to
-      // change in `factory.ts`: the value is already on the wire.
+      // `OpenAiCompatibleProviderOptions.maxCostUsd` is declared now, so this is
+      // a plain forward rather than the speculative one it used to be. The
+      // adapter meters spend against `pricing.ts` itself and refuses to run an
+      // unpriced model rather than run uncapped.
       ...(options.maxCostUsd === undefined ? {} : { maxCostUsd: options.maxCostUsd }),
     };
     return new OpenAiCompatibleProvider(id, providerOptions);
@@ -387,7 +395,7 @@ export function makeProvider(
 
   if (id === 'anthropic') {
     // Same reasoning as the OpenAI-compatible branch above: `maxCostUsd` is
-    // forwarded ahead of `AnthropicProviderOptions` declaring it.
+    // declared by `AnthropicProviderOptions` and metered by the adapter itself.
     const providerOptions = {
       ...(options.model === undefined ? {} : { model: options.model }),
       ...(options.onDiagnostic === undefined ? {} : { onDiagnostic: options.onDiagnostic }),

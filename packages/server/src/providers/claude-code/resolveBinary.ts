@@ -3,6 +3,8 @@ import { readdir, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { ProviderAvailability } from '../types.js';
+import { killTree } from './childProcess.js';
+import { resolveSpawnTarget } from './windowsSpawn.js';
 
 /**
  * CLI discovery and the availability preflight for the Claude Code provider.
@@ -392,12 +394,42 @@ async function runAuthStatusViaSpawn(binaryPath: string, timeoutMs: number): Pro
     let settled = false;
     let stdout = '';
 
-    const child = spawn(binaryPath, ['auth', 'status'], { windowsHide: true });
+    // A `.cmd`/`.bat` shim needs the `cmd.exe` detour (see `windowsSpawn.ts`);
+    // anything else is spawned as-is.
+    const target = resolveSpawnTarget(binaryPath, ['auth', 'status']);
+
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(target.command, target.args, {
+        windowsHide: true,
+        ...(target.windowsVerbatimArguments === undefined
+          ? {}
+          : { windowsVerbatimArguments: target.windowsVerbatimArguments }),
+      });
+    } catch (error) {
+      // `spawn` can throw *synchronously* rather than emitting `error` — a
+      // Windows batch shim does exactly that, and `resolveSpawnTarget` refuses
+      // an unquotable argument the same way. Inside a promise executor an
+      // uncaught throw becomes a rejection, which would break the "Never
+      // throws" contract `checkClaudeCodeAvailability` documents and surface to
+      // the user as an HTTP 500 instead of a 503 naming the real problem.
+      resolve({
+        stdout: '',
+        exitCode: null,
+        timedOut: false,
+        spawnError: error instanceof Error ? error.message : String(error),
+      });
+      return;
+    }
 
     const timer = setTimeout(() => {
       if (settled) return;
       settled = true;
-      child.kill();
+      // `killTree`, not `child.kill()`. On the Windows batch path `child` is the
+      // `cmd.exe` wrapper, and killing it would leave the CLI it launched
+      // running with our pipes held open — a wedged preflight would then orphan
+      // a process on every attempt. `taskkill /T` walks the tree instead.
+      killTree(child);
       resolve({ stdout, exitCode: null, timedOut: true });
     }, timeoutMs);
 

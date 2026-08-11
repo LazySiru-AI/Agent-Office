@@ -479,6 +479,84 @@ describe('planRun', () => {
     expect(provider.requests[0]?.allowedTools).toEqual([]);
   });
 
+  /**
+   * FR-R4 wiring. `selectCandidates` existed with no production caller at all
+   * for a while; these pin the seam that makes it reachable, and — just as
+   * importantly — pin that it stays OFF unless a caller asks. The measured
+   * recall cost of the cut is in `select.test.ts`'s sweep and in the doc comment
+   * on `PlanRunDeps.candidateLimit`; a future change that quietly defaults it on
+   * should fail here rather than silently narrow what the Manager can see.
+   */
+  it('shows the whole roster by default, without pre-filtering', async () => {
+    const provider = new ScriptedProvider({
+      byAssignment: { [MANAGER_PLAN_ASSIGNMENT_ID]: { text: VALID_PLAN_JSON } },
+    });
+    const registry = testRegistry();
+
+    await planRun({ registry, provider, task: TASK, signal: liveSignal() });
+
+    const prompt = provider.requests[0]?.task ?? '';
+    expect(prompt).toContain(`(${registry.agents.length} agents)`);
+    expect(prompt).not.toContain('pre-selected candidates');
+  });
+
+  it('narrows the prompt to a ranked shortlist when candidateLimit is set', async () => {
+    const provider = new ScriptedProvider({
+      byAssignment: { [MANAGER_PLAN_ASSIGNMENT_ID]: { text: VALID_PLAN_JSON } },
+    });
+
+    await planRun({
+      registry: testRegistry(),
+      provider,
+      task: TASK,
+      signal: liveSignal(),
+      candidateLimit: 2,
+    });
+
+    const prompt = provider.requests[0]?.task ?? '';
+    expect(prompt).toContain('2 pre-selected candidates, best first');
+  });
+
+  it('lets an explicit candidateAgents list win over candidateLimit', async () => {
+    const provider = new ScriptedProvider({
+      byAssignment: { [MANAGER_PLAN_ASSIGNMENT_ID]: { text: VALID_PLAN_JSON } },
+    });
+    const registry = testRegistry();
+    const chosen = registry.agents[0]?.name ?? '';
+
+    await planRun({
+      registry,
+      provider,
+      task: TASK,
+      signal: liveSignal(),
+      candidateAgents: [chosen],
+      candidateLimit: 40,
+    });
+
+    const prompt = provider.requests[0]?.task ?? '';
+    expect(prompt).toContain('1 pre-selected candidates, best first');
+  });
+
+  it('still accepts a plan naming an agent the shortlist left out', async () => {
+    // The narrowing is a prompt concern only: validation runs against the whole
+    // registry, so a filtered-out agent stays runnable. This is what makes the
+    // cut cost relevance rather than correctness.
+    const provider = new ScriptedProvider({
+      byAssignment: { [MANAGER_PLAN_ASSIGNMENT_ID]: { text: VALID_PLAN_JSON } },
+    });
+
+    const plan = await planRun({
+      registry: testRegistry(),
+      provider,
+      task: TASK,
+      signal: liveSignal(),
+      candidateLimit: 1,
+    });
+
+    expect(plan.summary).toBe(VALID_PLAN.summary);
+    expect(provider.requests).toHaveLength(1);
+  });
+
   it('forwards every provider event to onEvent', async () => {
     const provider = new ScriptedProvider({
       byAssignment: {

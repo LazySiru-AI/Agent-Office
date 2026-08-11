@@ -204,7 +204,8 @@ export function validateSettings(settings: RunSettings): Partial<Record<keyof Ru
 
   if (settings.maxCostUsd !== undefined) {
     if (!Number.isFinite(settings.maxCostUsd) || settings.maxCostUsd <= 0) {
-      errors.maxCostUsd = 'Cost budget must be a positive number of US dollars, or left blank for no limit.';
+      errors.maxCostUsd =
+        'Cost budget per assignment must be a positive number of US dollars, or left blank for no limit.';
     }
   }
 

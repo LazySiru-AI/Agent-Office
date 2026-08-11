@@ -1,5 +1,6 @@
 import {
   EMPTY_USAGE,
+  addUsage,
   canTransitionRun,
   isRunTerminal,
   type AgentEvent,
@@ -57,6 +58,15 @@ export interface ExecuteRunDeps {
   dispatch?: Partial<DispatchOptions>;
   /** FR-M2 repair budget for planning. */
   maxRepairAttempts?: number;
+  /**
+   * FR-R4: shrink the planning prompt to this many ranked candidates instead of
+   * the whole roster. Unset — the default — shows every agent.
+   *
+   * Forwarded to `planRun`, whose `candidateLimit` doc carries the measured
+   * token-saving-versus-recall trade this is opting into. It is surfaced here so
+   * the choice is reachable by an operator, not so it should be taken lightly.
+   */
+  candidateLimit?: number;
   onEvent?: (event: AgentEvent) => void;
   onStateChange?: (run: RunState) => void;
   logger?: (message: string) => void;
@@ -142,11 +152,16 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
       await deps.store.appendEvent(run.id, event.assignmentId, event);
 
       if (event.t === 'usage') {
-        const current = run.managerUsage ?? EMPTY_USAGE;
-        run.managerUsage = {
-          inputTokens: current.inputTokens + event.inputTokens,
-          outputTokens: current.outputTokens + event.outputTokens,
-        };
+        run.managerUsage = addUsage(run.managerUsage ?? EMPTY_USAGE, {
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+          ...(event.cacheReadTokens === undefined
+            ? {}
+            : { cacheReadTokens: event.cacheReadTokens }),
+          ...(event.cacheWriteTokens === undefined
+            ? {}
+            : { cacheWriteTokens: event.cacheWriteTokens }),
+        });
       }
     }
     deps.onEvent?.(event);
@@ -177,6 +192,7 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
       ...(deps.maxRepairAttempts === undefined
         ? {}
         : { maxRepairAttempts: deps.maxRepairAttempts }),
+      ...(deps.candidateLimit === undefined ? {} : { candidateLimit: deps.candidateLimit }),
       onEvent,
       workspaceDir: await deps.store.workspaceDir(run.id),
     });

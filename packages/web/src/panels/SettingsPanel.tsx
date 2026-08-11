@@ -159,7 +159,7 @@ export function SettingsPanel({ settings, errors, providers, onChange, onReset }
         </div>
 
         <div className="settings-field">
-          <label htmlFor="settings-cost-budget">Cost budget (USD, optional)</label>
+          <label htmlFor="settings-cost-budget">Cost budget per assignment (USD, optional)</label>
           <input
             id="settings-cost-budget"
             type="number"
@@ -167,7 +167,11 @@ export function SettingsPanel({ settings, errors, providers, onChange, onReset }
             placeholder="no limit"
             value={settings.maxCostUsd ?? ''}
             aria-invalid={errors.maxCostUsd !== undefined}
-            aria-describedby={errors.maxCostUsd !== undefined ? 'settings-cost-budget-error' : undefined}
+            aria-describedby={
+              errors.maxCostUsd !== undefined
+                ? 'settings-cost-budget-error settings-cost-budget-hint'
+                : 'settings-cost-budget-hint'
+            }
             onChange={(e) => onChange('maxCostUsd', parseOptionalNumber(e.target.value))}
           />
           {errors.maxCostUsd !== undefined && (
@@ -175,6 +179,21 @@ export function SettingsPanel({ settings, errors, providers, onChange, onReset }
               {errors.maxCostUsd}
             </p>
           )}
+          {/*
+           * Unlike `runTokenBudget` just above, this ceiling is not run-wide:
+           * one provider instance is built per run and the same limit is
+           * handed to every assignment invocation, so nothing accumulates
+           * spend across them. Sitting directly under a field that *is*
+           * run-wide, with matching "(optional)" wording and the same "no
+           * limit" placeholder, this field reads as run-wide too unless the
+           * scope is spelled out here. Reusing `settings-provider-reason`
+           * rather than adding a new class — it is already this file's
+           * pattern for a non-error, field-scoped note wired through
+           * `aria-describedby`.
+           */}
+          <p className="settings-provider-reason" id="settings-cost-budget-hint">
+            Applies separately to each assignment. An N-assignment run can spend up to N times this value.
+          </p>
         </div>
       </div>
 

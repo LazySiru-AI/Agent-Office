@@ -42,7 +42,13 @@ export interface TaskFormProps {
   assignmentTimeoutMs: number;
   /** Optional run-wide token budget (FR-M8); absent means "no limit", matching `RunSettings`. */
   runTokenBudget?: number;
-  /** Optional run-wide USD cost budget (FR-M8, NFR-5); absent means "no limit", matching `RunSettings`. */
+  /**
+   * Optional USD cost budget (FR-M8, NFR-5); absent means "no limit",
+   * matching `RunSettings`. Unlike `runTokenBudget` above, this is enforced
+   * *per assignment*, not run-wide: the server hands the same ceiling to
+   * every assignment invocation rather than tracking spend across them, so
+   * an N-assignment run can spend up to N times this value.
+   */
   maxCostUsd?: number;
   /** True when the current settings are unusable; blocks the submit. */
   settingsInvalid: boolean;

@@ -1,4 +1,5 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { resolveSpawnTarget } from './windowsSpawn.js';
 
 /**
  * Child-process lifecycle for the Claude Code adapter.
@@ -21,7 +22,13 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
  * POSIX gets the same guarantee from a process group: `detached: true` makes the
  * child a group leader, and killing `-pid` signals the whole group.
  */
-export function killTree(child: ChildProcessWithoutNullStreams, signal: NodeJS.Signals = 'SIGTERM'): void {
+/*
+ * Typed against `ChildProcess` rather than `ChildProcessWithoutNullStreams`
+ * because only `pid`/`exitCode`/`signalCode`/`kill` are touched, and the auth
+ * preflight in `resolveBinary.ts` needs the same tree kill for a child it
+ * spawned without the full pipe triple.
+ */
+export function killTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGTERM'): void {
   if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
 
   if (process.platform === 'win32') {
@@ -78,8 +85,17 @@ export interface SpawnedChild {
 }
 
 export function spawnClaude(options: SpawnOptions): SpawnedChild {
-  const child = spawn(options.binary, options.args, {
+  // A `.cmd`/`.bat` shim cannot be spawned directly on Windows — Node throws
+  // synchronously rather than returning a child. `resolveSpawnTarget` reroutes
+  // that one case through `cmd.exe` with its own quoting; everything else passes
+  // through unchanged. See `windowsSpawn.ts` for why not `shell: true`.
+  const target = resolveSpawnTarget(options.binary, options.args);
+
+  const child = spawn(target.command, target.args, {
     cwd: options.cwd,
+    ...(target.windowsVerbatimArguments === undefined
+      ? {}
+      : { windowsVerbatimArguments: target.windowsVerbatimArguments }),
     // NFR-1: the child inherits our environment but is anchored to the run's
     // workspace as its working directory, so a relative path a tool writes
     // cannot land in the user's own repos.
