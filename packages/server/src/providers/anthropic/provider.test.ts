@@ -203,7 +203,16 @@ describe('AnthropicProvider — a plain text turn', () => {
       const text = events.filter((e) => e.t === 'text');
       const usage = events.filter((e) => e.t === 'usage');
       expect(text.map((e) => (e.t === 'text' ? e.chunk : ''))).toEqual(['Hello', ' world']);
-      expect(usage).toEqual([{ t: 'usage', assignmentId: 'a1', inputTokens: 50, outputTokens: 12 }]);
+      expect(usage).toEqual([
+        {
+          t: 'usage',
+          assignmentId: 'a1',
+          inputTokens: 50,
+          outputTokens: 12,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      ]);
       expect(events.every((e) => e.assignmentId === 'a1')).toBe(true);
       expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
 

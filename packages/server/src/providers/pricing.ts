@@ -1,4 +1,4 @@
-import { DEFAULT_PRICING, type Usage } from '@agent-office/shared';
+import { costForUsage, DEFAULT_PRICING, type Usage } from '@agent-office/shared';
 
 /**
  * Joins a concrete HTTP-adapter model id to `wire.ts`'s tier-keyed pricing
@@ -79,8 +79,11 @@ export function priceFor(model: string): ModelPrice | undefined {
 export function estimateRunCostUsd(usage: Usage, model: string): number | undefined {
   const price = priceFor(model);
   if (price === undefined) return undefined;
-  return (
-    (usage.inputTokens / 1_000_000) * price.inputPerMTok +
-    (usage.outputTokens / 1_000_000) * price.outputPerMTok
-  );
+  // `costForUsage` rather than the arithmetic repeated inline, which is what
+  // used to be here. The two implementations were identical when both were
+  // three lines of multiplication, and would have diverged the moment one of
+  // them learned that a cache read is not a fresh input token — which is
+  // exactly what happened. They now differ only in how a model resolves to a
+  // price, which is the one thing they genuinely disagree about.
+  return costForUsage(usage, price);
 }

@@ -472,6 +472,10 @@ export class AnthropicProvider implements AgentProvider {
     const pendingToolUses: PendingToolUse[] = [];
     let inputTokens = 0;
     let outputTokens = 0;
+    // Components of `inputTokens`, kept so `pricing.ts` can charge a cache
+    // read at its own rate instead of the fresh-input rate.
+    let cacheReadTokens = 0;
+    let cacheWriteTokens = 0;
     let sawUsage = false;
     let sawMessageStop = false;
     let sawText = false;
@@ -496,6 +500,8 @@ export class AnthropicProvider implements AgentProvider {
         if (usage !== undefined) {
           inputTokens = totalInputTokens(usage);
           outputTokens = totalOutputTokens(usage);
+          cacheReadTokens = usage.cache_read_input_tokens ?? 0;
+          cacheWriteTokens = usage.cache_creation_input_tokens ?? 0;
           sawUsage = true;
         }
         continue;
@@ -618,7 +624,14 @@ export class AnthropicProvider implements AgentProvider {
     }
 
     if (sawUsage) {
-      yield { assignmentId: request.assignmentId, t: 'usage', inputTokens, outputTokens };
+      yield {
+        assignmentId: request.assignmentId,
+        t: 'usage',
+        inputTokens,
+        outputTokens,
+        cacheReadTokens,
+        cacheWriteTokens,
+      };
     }
 
     const assistantContent: RequestContentBlock[] = [];

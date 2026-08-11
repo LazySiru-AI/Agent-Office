@@ -15,13 +15,76 @@ import { AssignmentStatusSchema, RunStatusSchema, isRunTerminal } from './status
  */
 
 export const UsageSchema = z.object({
+  /**
+   * Every input token the model processed, cached or not.
+   *
+   * This is a TOTAL, and the two counters below are a decomposition of it —
+   * not additions to it. `inputTokens - cacheReadTokens - cacheWriteTokens` is
+   * the fresh remainder. Keeping the total here rather than splitting it into
+   * three peers is what makes the change back-compatible: a `run.json` written
+   * before the counters existed still reports the same token figure and, with
+   * both counters absent, still prices exactly as it did.
+   */
   inputTokens: z.number().int().nonnegative(),
   outputTokens: z.number().int().nonnegative(),
+  /**
+   * The part of `inputTokens` served from the prompt cache, priced at roughly
+   * **0.1x** the fresh input rate.
+   *
+   * Optional, and the optionality is load-bearing rather than defensive: every
+   * run recorded before this field existed parses without it, and absent has
+   * to keep meaning "this adapter did not report a split" rather than "nothing
+   * was cached" — the two are different claims and only the first is true of
+   * an old log.
+   */
+  cacheReadTokens: z.number().int().nonnegative().optional(),
+  /**
+   * The part of `inputTokens` written INTO the cache, priced at roughly
+   * **1.25x** the fresh input rate (the 5-minute TTL; a 1-hour TTL is 2x, and
+   * nothing in this repo requests one — see `pricing.ts`).
+   */
+  cacheWriteTokens: z.number().int().nonnegative().optional(),
 });
 
 export type Usage = z.infer<typeof UsageSchema>;
 
 export const EMPTY_USAGE: Usage = { inputTokens: 0, outputTokens: 0 };
+
+/**
+ * Add two usage figures.
+ *
+ * Exists because five separate places were summing usage by hand — the
+ * dispatcher's per-assignment accumulator, the runner's Manager accumulator,
+ * `totalUsage`, `runTotalUsage`, and replay's fold — each spelling out
+ * `inputTokens + inputTokens, outputTokens + outputTokens`. That was fine
+ * while `Usage` had exactly two fields and became a liability the moment it
+ * had four: adding the cache counters to four of the five and missing the
+ * fifth would silently zero them on one path, and the resulting cost error
+ * would look like a pricing bug rather than a dropped field.
+ *
+ * **Absence is preserved.** When neither side reports a cache split the result
+ * has neither key, so folding a log written before those counters existed
+ * yields a `Usage` shaped exactly as it was then — and therefore priced
+ * exactly as it was then (NFR-7). A single reported split is enough to make
+ * the result carry one, because the alternative is discarding a number the
+ * adapter actually measured.
+ */
+export function addUsage(a: Usage, b: Usage): Usage {
+  const cacheRead = sumOptional(a.cacheReadTokens, b.cacheReadTokens);
+  const cacheWrite = sumOptional(a.cacheWriteTokens, b.cacheWriteTokens);
+  return {
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    ...(cacheRead === undefined ? {} : { cacheReadTokens: cacheRead }),
+    ...(cacheWrite === undefined ? {} : { cacheWriteTokens: cacheWrite }),
+  };
+}
+
+/** `undefined` only when BOTH sides are absent — one reported counter survives. */
+function sumOptional(a: number | undefined, b: number | undefined): number | undefined {
+  if (a === undefined && b === undefined) return undefined;
+  return (a ?? 0) + (b ?? 0);
+}
 
 export const AssignmentStateSchema = z.object({
   id: z.string().min(1),
@@ -134,12 +197,7 @@ export type RunState = z.infer<typeof RunStateSchema>;
  * the budget during dispatch, not a gap this function could close.
  */
 export function runTotalUsage(run: RunState): Usage {
-  const assignments = totalUsage(run);
-  const manager = run.managerUsage ?? EMPTY_USAGE;
-  return {
-    inputTokens: assignments.inputTokens + manager.inputTokens,
-    outputTokens: assignments.outputTokens + manager.outputTokens,
-  };
+  return addUsage(totalUsage(run), run.managerUsage ?? EMPTY_USAGE);
 }
 
 /**
@@ -154,10 +212,7 @@ export function runTotalUsage(run: RunState): Usage {
  */
 export function totalUsage(run: RunState): Usage {
   return run.assignments.reduce<Usage>(
-    (acc, assignment) => ({
-      inputTokens: acc.inputTokens + assignment.usage.inputTokens,
-      outputTokens: acc.outputTokens + assignment.usage.outputTokens,
-    }),
+    (acc, assignment) => addUsage(acc, assignment.usage),
     { ...EMPTY_USAGE },
   );
 }

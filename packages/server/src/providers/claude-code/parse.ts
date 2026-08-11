@@ -485,6 +485,15 @@ function eventsForResult(frame: ResultFrame, assignmentId: string): AgentEvent[]
       assignmentId,
       inputTokens: totalInputTokens(usage),
       outputTokens: totalOutputTokens(usage),
+      // The cached split, forwarded rather than folded away. `totalInputTokens`
+      // sums all three counters into one number, which is the right figure to
+      // DISPLAY and the wrong one to price: on the capture this adapter was
+      // built against, 44,878 of 67,635 input tokens were cache reads, and
+      // charging those at the fresh-input rate overstates the bill roughly
+      // tenfold. Carrying the components alongside the total lets `pricing.ts`
+      // charge each at its own rate without anyone re-deriving the total.
+      cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+      cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
     });
   }
 

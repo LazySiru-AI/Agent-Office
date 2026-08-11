@@ -1,5 +1,6 @@
 import {
   EMPTY_USAGE,
+  addUsage,
   assignmentsInPhase,
   canTransitionAssignment,
   dependenciesUnreachable,
@@ -10,6 +11,7 @@ import {
   type AssignmentStatus,
   type RunPlan,
   type RunState,
+  type Usage,
 } from '@agent-office/shared';
 import type { Registry } from '../registry/index.js';
 import type { AgentProvider } from '../providers/types.js';
@@ -338,7 +340,7 @@ async function executeAssignment(
   // which sums the `usage` events on disk, reported the true total. The two
   // disagreeing is what made it visible; the undercount is what made it matter
   // (NFR-5). `attempts` is already incremented for exactly this case.
-  const usage = { ...assignment.usage };
+  let usage: Usage = { ...assignment.usage };
 
   // Resolved per assignment, not hoisted: a run may legitimately field two
   // providers, and caching one here would silently apply the first
@@ -365,8 +367,20 @@ async function executeAssignment(
 
       if (event.t === 'text') text += event.chunk;
       else if (event.t === 'usage') {
-        usage.inputTokens += event.inputTokens;
-        usage.outputTokens += event.outputTokens;
+        // Reassigned through `addUsage` rather than mutated field by field:
+        // `Usage` carries the cache split now, and `+=` on two of four fields
+        // would drop it — understating nothing and OVERstating the bill, since
+        // an unreported cache read is priced as fresh input.
+        usage = addUsage(usage, {
+          inputTokens: event.inputTokens,
+          outputTokens: event.outputTokens,
+          ...(event.cacheReadTokens === undefined
+            ? {}
+            : { cacheReadTokens: event.cacheReadTokens }),
+          ...(event.cacheWriteTokens === undefined
+            ? {}
+            : { cacheWriteTokens: event.cacheWriteTokens }),
+        });
       } else if (event.t === 'error' && event.fatal) fatalError = event.message;
     }
   } catch (error) {

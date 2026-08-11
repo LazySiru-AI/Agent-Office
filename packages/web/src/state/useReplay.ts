@@ -3,6 +3,7 @@ import {
   canTransitionAssignment,
   isAssignmentTerminal,
   EMPTY_USAGE,
+  addUsage,
   type AssignmentState,
   type LoggedAgentEvent,
   type RunState,
@@ -317,10 +318,19 @@ function applyEvent(
       break;
     }
     case 'usage': {
-      assignment.usage = {
-        inputTokens: assignment.usage.inputTokens + event.inputTokens,
-        outputTokens: assignment.usage.outputTokens + event.outputTokens,
-      };
+      // `addUsage`, not an inline two-field sum: the event carries the cache
+      // split as well, and a hand-written add here would drop it — costing a
+      // replayed run differently from the live one it reconstructs, which is
+      // exactly the disagreement the field-for-field replay test exists to
+      // catch.
+      assignment.usage = addUsage(assignment.usage, {
+        inputTokens: event.inputTokens,
+        outputTokens: event.outputTokens,
+        ...(event.cacheReadTokens === undefined ? {} : { cacheReadTokens: event.cacheReadTokens }),
+        ...(event.cacheWriteTokens === undefined
+          ? {}
+          : { cacheWriteTokens: event.cacheWriteTokens }),
+      });
       break;
     }
     case 'error': {

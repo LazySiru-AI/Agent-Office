@@ -90,6 +90,18 @@ export const AgentEventSchema = z.discriminatedUnion('t', [
     t: z.literal('usage'),
     inputTokens: z.number().int().nonnegative(),
     outputTokens: z.number().int().nonnegative(),
+    /**
+     * The cached portions of `inputTokens`, when the adapter reports them.
+     * A decomposition of that total, not additions to it — see `run.ts`'s
+     * `UsageSchema`, which these mirror so a folded event and a persisted
+     * `AssignmentState.usage` describe the same thing the same way.
+     *
+     * Optional for the usual NFR-7 reason: `.jsonl` lines written before this
+     * existed parse without them, and must keep replaying — and costing —
+     * exactly as they did.
+     */
+    cacheReadTokens: z.number().int().nonnegative().optional(),
+    cacheWriteTokens: z.number().int().nonnegative().optional(),
   }),
   z.object({
     ...base,

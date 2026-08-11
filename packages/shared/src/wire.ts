@@ -317,14 +317,65 @@ export const DEFAULT_PRICING: Record<string, { inputPerMTok: number; outputPerMT
 /** The scripted provider calls nothing, so its runs must read as free. */
 export const FREE_MODELS = new Set(['scripted', 'none']);
 
+/**
+ * Cache multipliers, relative to the fresh input rate.
+ *
+ * A cache read is roughly a tenth of fresh input; a cache write is a premium
+ * over it. Anthropic publishes 1.25x for the default 5-minute TTL and 2x for
+ * the 1-hour TTL — this repo requests neither TTL explicitly (the Claude Code
+ * CLI does its own caching and reports the counters back), so the 5-minute
+ * figure is the right one and the 1-hour case is named here rather than
+ * silently assumed away.
+ *
+ * Approximate, exactly like `DEFAULT_PRICING` itself. The point is not to
+ * reproduce an invoice — it is that pricing a cache read as if it were fresh
+ * input is wrong by an order of magnitude, which is a different kind of wrong
+ * from being a few percent stale.
+ */
+export const CACHE_READ_MULTIPLIER = 0.1;
+export const CACHE_WRITE_MULTIPLIER = 1.25;
+
+/**
+ * The one place a `Usage` becomes money.
+ *
+ * Both `estimateCostUsd` (tier words, for the UI) and `pricing.ts`'s
+ * `estimateRunCostUsd` (concrete API ids, for the spend cap) call this, so the
+ * two cannot disagree about what a token costs — they differ only in how they
+ * resolve a model to a price. They previously carried the same arithmetic
+ * twice, which is how they would have drifted the moment one of them learned
+ * about cache rates and the other did not.
+ *
+ * The three input buckets are a partition of `usage.inputTokens`:
+ *
+ *   fresh = inputTokens - cacheReadTokens - cacheWriteTokens
+ *
+ * Clamped at zero. A negative remainder means the counters disagree with the
+ * total — corrupt or hand-edited state, not something to propagate into a
+ * dollar figure as a negative charge.
+ */
+export function costForUsage(
+  usage: Usage,
+  price: { inputPerMTok: number; outputPerMTok: number },
+): number {
+  const cacheRead = usage.cacheReadTokens ?? 0;
+  const cacheWrite = usage.cacheWriteTokens ?? 0;
+  // An old log carries neither counter, so `fresh` collapses to `inputTokens`
+  // and this reduces exactly to the flat arithmetic it replaces.
+  const fresh = Math.max(0, usage.inputTokens - cacheRead - cacheWrite);
+
+  const inputCost =
+    (fresh / 1_000_000) * price.inputPerMTok +
+    (cacheRead / 1_000_000) * price.inputPerMTok * CACHE_READ_MULTIPLIER +
+    (cacheWrite / 1_000_000) * price.inputPerMTok * CACHE_WRITE_MULTIPLIER;
+
+  return inputCost + (usage.outputTokens / 1_000_000) * price.outputPerMTok;
+}
+
 export function estimateCostUsd(usage: Usage, model?: string): number | undefined {
   if (model !== undefined && FREE_MODELS.has(model)) return 0;
   const price = model === undefined ? undefined : DEFAULT_PRICING[model];
   if (price === undefined) return undefined;
-  return (
-    (usage.inputTokens / 1_000_000) * price.inputPerMTok +
-    (usage.outputTokens / 1_000_000) * price.outputPerMTok
-  );
+  return costForUsage(usage, price);
 }
 
 /** `$0.0123` / `$1.23`, or `—` when the model carries no price. */

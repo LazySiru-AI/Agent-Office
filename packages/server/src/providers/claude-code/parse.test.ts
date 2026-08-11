@@ -431,7 +431,18 @@ describe('normaliseFrame: result frames', () => {
     );
     const result = normaliseFrame(frame, 'a1');
     expect(result).toEqual({
-      events: [{ t: 'usage', assignmentId: 'a1', inputTokens: 1575, outputTokens: 480 }],
+      events: [
+        {
+          t: 'usage',
+          assignmentId: 'a1',
+          inputTokens: 1575,
+          outputTokens: 480,
+          // Reported as zero rather than omitted: the frame carried a usage
+          // object, so "no cache activity" is a measurement, not an absence.
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+        },
+      ],
       recognised: true,
     });
   });
@@ -442,7 +453,17 @@ describe('normaliseFrame: result frames', () => {
     );
     const result = normaliseFrame(frame, 'a1');
     expect(result.events).toEqual([
-      { t: 'usage', assignmentId: 'a1', inputTokens: 900 + 4000, outputTokens: 12 },
+      {
+        t: 'usage',
+        assignmentId: 'a1',
+        inputTokens: 900 + 4000,
+        outputTokens: 12,
+        // `inputTokens` is the TOTAL and `cacheReadTokens` is the part of it
+        // that came from cache — 4,000 of the 4,900, priced at a tenth of the
+        // fresh rate rather than as if it were all fresh.
+        cacheReadTokens: 4000,
+        cacheWriteTokens: 0,
+      },
       { t: 'error', assignmentId: 'a1', message: 'the model call failed', fatal: true },
     ]);
   });
@@ -571,7 +592,14 @@ describe('fixture: synthetic-success.jsonl (derived)', () => {
     // the measurements that forced that, and `eventsForAssistant` for why.
     const usageEvents = events.filter((e): e is Extract<AgentEvent, { t: 'usage' }> => e.t === 'usage');
     expect(usageEvents).toEqual([
-      { t: 'usage', assignmentId: 'a1', inputTokens: 1575 + 54400, outputTokens: 480 },
+      {
+        t: 'usage',
+        assignmentId: 'a1',
+        inputTokens: 1575 + 54400,
+        outputTokens: 480,
+        cacheReadTokens: 54400,
+        cacheWriteTokens: 0,
+      },
     ]);
   });
 });
@@ -607,7 +635,17 @@ describe('fixture: real-success.jsonl (real capture, authenticated)', () => {
 
     // The CLI's own final accounting for this run.
     expect(usageEvents).toEqual([
-      { t: 'usage', assignmentId: 'a1', inputTokens: 26 + 44878 + 22731, outputTokens: 579 },
+      {
+        t: 'usage',
+        assignmentId: 'a1',
+        inputTokens: 26 + 44878 + 22731,
+        outputTokens: 579,
+        // The split that makes the total priceable. Only 26 of these 67,635
+        // input tokens were fresh; charging the other 67,609 at the fresh
+        // rate is what produced this repo's inflated cost display.
+        cacheReadTokens: 44878,
+        cacheWriteTokens: 22731,
+      },
     ]);
 
     // Regression guard with teeth. Summing `message.usage` off the assistant
