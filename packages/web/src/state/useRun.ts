@@ -6,8 +6,9 @@ import {
   type RunState,
   type RunSummary,
   type ServerMessage,
+  type TeamOperation,
 } from '@agent-office/shared';
-import { cancelRun, createRun, fetchRuns } from '../api.js';
+import { cancelRun, createRun, fetchRuns, submitTeamDecision } from '../api.js';
 import { RunSocket, type SocketStatus } from './socket.js';
 
 /**
@@ -178,6 +179,18 @@ export interface UseAgentOfficeResult {
   selectRun: (runId: string) => void;
   startRun: (req: CreateRunRequest) => Promise<string>;
   cancelSelectedRun: () => Promise<void>;
+  /**
+   * FR-M11: submit the user's verdict on the proposed team for the currently
+   * selected run — an empty array approves it unchanged. Scoped to
+   * `selectedRunId` rather than taking a `runId` parameter, matching
+   * `cancelSelectedRun` immediately above: `TeamReview.tsx` only ever acts on
+   * whichever run is on screen, and it is already `awaiting_approval` (the
+   * only status this panel renders for) by the time this can be called, so
+   * there is exactly one run it could mean. The resulting `state` transition
+   * (to `dispatching`) arrives over the socket like every other one — this
+   * function does not update `run` itself.
+   */
+  submitTeam: (operations: TeamOperation[]) => Promise<void>;
 }
 
 export function useAgentOffice(): UseAgentOfficeResult {
@@ -252,6 +265,11 @@ export function useAgentOffice(): UseAgentOfficeResult {
     await cancelRun(selectedRunId);
   }, [selectedRunId]);
 
+  const submitTeam = useCallback(async (operations: TeamOperation[]): Promise<void> => {
+    if (selectedRunId === undefined) return;
+    await submitTeamDecision(selectedRunId, { operations });
+  }, [selectedRunId]);
+
   // Read off the run itself, so it is correct for any run — including ones
   // this tab never started and ones from a previous browser session.
   const selectedRunProvider = session.run?.provider;
@@ -271,6 +289,7 @@ export function useAgentOffice(): UseAgentOfficeResult {
     selectRun,
     startRun,
     cancelSelectedRun,
+    submitTeam,
   };
 }
 

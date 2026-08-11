@@ -143,6 +143,11 @@ type AgentEvent =
 **Run:** `queued → planning → dispatching → running → synthesizing → designing →
 report_ready → done` with `failed` and `cancelled` reachable from any state.
 
+FR-M11 adds one optional stop: a run created with `reviewTeam` goes
+`planning → awaiting_approval → dispatching` instead, parking until the user
+signs off the proposed team. Both edges out of `planning` are legal, so a run
+that does not ask for the review is unaffected.
+
 **Assignment:** `pending → briefing → working → reporting → done`, plus `blocked`
 (waiting on a dependency), `failed`, and `skipped`.
 
@@ -265,7 +270,7 @@ the style.
 | FR-M8 | M | Per-assignment timeout (default 10 min) and per-run token budget, both configurable; exceeding either fails cleanly with partial results preserved. |
 | FR-M9 | S | User can cancel a run; in-flight child processes are killed and the run persists as `cancelled` with partial reports intact. |
 | FR-M10 | S | Review loop: a reviewer assignment may return `revisions_requested`, re-dispatching the original assignment once with the critique attached. |
-| FR-M11 | C | User can override the Manager's team before dispatch — add, drop or swap agents in the proposed plan. |
+| FR-M11 | C | User can override the Manager's team before dispatch — add, drop or swap agents in the proposed plan. *(Built in Phase 11. Opt-in per run via `reviewTeam`, so a run that does not ask for it still goes `planning -> dispatching` unchanged.)* |
 
 ### 2.3 Office simulation (FR-S)
 
@@ -836,6 +841,73 @@ against the opaque panel it now prints on; and no colour in `sim/` is a hex
 literal (FR-U2 still holds — the repaint moved values, it did not scatter them).
 
 ---
+
+### Phase 11 — Override the team before dispatch (FR-M11)
+
+The Manager picks the team and the run starts. That is the right default and the
+wrong only option: the plan is a model's judgement about which of 156 specialists
+a task needs, it is visible in the UI a second before dispatch, and until now
+there was nothing to do about it but cancel the run and re-word the task.
+
+#### 11.1 A status, not a boolean
+
+`awaiting_approval` sits between `planning` and `dispatching`, and **both edges
+out of `planning` are legal**: a run that asked to review its team pauses, a run
+that did not carries on exactly as before. Making the pause mandatory would have
+turned an opt-in into a breaking change for the CLI, every fixture and every
+existing test.
+
+It is a status rather than a flag hung off `planning` because everything
+downstream — the office, the run list, the badge, the cancel path — reads run
+status to decide what to show. A run described as `planning` while actually
+waiting on a human would have every one of those reporting it busy when it is
+idle and waiting for you. The badge is amber, the "waiting on something
+external" colour, not the violet of thinking, for the same reason.
+
+#### 11.2 Operations, not a replacement plan
+
+The approval route takes three narrow verbs — `drop`, `swap`, `add` — rather
+than an edited `RunPlan`.
+
+A client that PUT a whole plan could rewrite objectives, dependency edges, phase
+ordering and deliverable paths in one request, and the server would have to
+re-verify everything the planner already guarantees. `deliverable` in particular
+is a **filesystem path**, and NFR-1's containment check exists precisely to keep
+untrusted input out of it — so `add` has no `deliverable` field at all and the
+server derives it exactly as the planner does. Putting a path traversal on the
+approval route, the one route a user reaches while feeling in control, would be
+a poor place to find one.
+
+What the verbs cannot express stays as the planner left it, which is the point.
+
+`swap` keeps the objective, the dependency edges and the deliverable and changes
+only who does the work — that is what makes it a swap rather than a drop plus an
+add, and it means nothing downstream needs rewiring. `drop` is **refused** when
+another assignment still depends on the target, naming the dependents, rather
+than cascading: quietly deleting work the user did not ask to delete is worse
+than an error they can act on. The UI disables the control for the same reason,
+and says why (WCAG 3.3.1).
+
+#### 11.3 The parking mechanism
+
+`executeRun` takes an optional `awaitTeamApproval` dependency. Absent, nothing
+changes — that is the path every existing test takes. Present, the run parks,
+persists `awaiting_approval` so the proposed plan reaches the client through the
+websocket push it already receives, and waits.
+
+Waiting indefinitely on a human is a new shape for this codebase, so the failure
+modes are the interesting part: the wait must abort cleanly on cancel (FR-M9),
+`shutdown()` must not hang on a parked run, a second approval must not resolve
+one promise twice, and the pending entry must be cleaned up on every exit path —
+approved, cancelled, failed or shut down. A leak here is keyed by run id, and a
+later run reusing that id would inherit it.
+
+**Exit criteria.** A run created with `reviewTeam` parks after planning with its
+proposed team visible; the user can drop, swap and add before releasing it;
+illegal edits are refused with a reason rather than silently applied; a run
+without the flag is byte-for-byte unchanged in behaviour; the approval route
+inherits the same-origin refusal every other state-changing POST has (NFR-6);
+and cancelling a parked run leaves nothing dispatched and nothing pending.
 ---
 
 ## 4. Risks

@@ -9,6 +9,7 @@ import {
   RunEventsResponseSchema,
   RunListResponseSchema,
   RunStateSchema,
+  TeamDecisionSchema,
   type AgentSummary,
   type CreateRunRequest,
   type ProviderInfo,
@@ -16,6 +17,7 @@ import {
   type RunEventsResponse,
   type RunState,
   type RunSummary,
+  type TeamDecision,
 } from '@agent-office/shared';
 
 /**
@@ -111,6 +113,32 @@ export async function cancelRun(runId: string): Promise<void> {
   const res = await fetch(API.cancelRun(runId), { method: 'POST' });
   if (!res.ok) {
     throw new Error(`cancel run failed (${res.status}): ${await readErrorMessage(res)}`);
+  }
+}
+
+/**
+ * `POST /api/runs/:id/team` (FR-M11) — the user's verdict on the Manager's
+ * proposed team, built by `panels/TeamReview.tsx`'s `buildTeamReviewModel`.
+ *
+ * Follows `cancelRun` above rather than `postJson`: the response carries
+ * nothing the client needs back (the new `RunState` arrives over the socket
+ * as a `state` push, same as every other transition — see `useRun.ts`'s
+ * `applyServerMessage`), so there is no response schema to parse, only a
+ * status code to check. The *request* body is still validated against
+ * `TeamDecisionSchema` before it leaves the browser, for the same reason
+ * `createRun` validates against `CreateRunRequestSchema`: a locally-built
+ * object should fail loudly here if it drifted from the wire contract,
+ * rather than arrive at the server already wrong.
+ */
+export async function submitTeamDecision(runId: string, decision: TeamDecision): Promise<void> {
+  const body = TeamDecisionSchema.parse(decision);
+  const res = await fetch(API.runTeam(runId), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    throw new Error(`submit team decision failed (${res.status}): ${await readErrorMessage(res)}`);
   }
 }
 

@@ -9,6 +9,7 @@ import {
   type RunState,
   type RunSummary as WireRunSummary,
   type ServerMessage,
+  type TeamOperation,
 } from '@agent-office/shared';
 import type { Registry } from '../registry/index.js';
 import type { DispatchOptions } from '../orchestrator/dispatcher.js';
@@ -177,6 +178,43 @@ interface RunEntry {
   live: boolean;
 }
 
+/**
+ * The shape of `ExecuteRunDeps.awaitTeamApproval` (FR-M11), spelled out here
+ * rather than imported from `runner.ts`.
+ *
+ * This is deliberate, not an oversight: the field is being added to
+ * `runner.ts` by a separate change landing in parallel with this one, and the
+ * contract for it — this exact signature — was fixed before either side
+ * started, precisely so the two do not have to be sequenced. Declaring the
+ * type locally means this file compiles against the agreed shape regardless
+ * of which change lands first; spreading a value of this type into the object
+ * literal passed to `executeRun` (`startRun` below) is what actually lets it
+ * through even before `ExecuteRunDeps` declares the property, because
+ * TypeScript's excess-property check does not run on properties contributed
+ * by `...spread` the way it does on properties written directly into a
+ * literal. Once `runner.ts` adds the field with this same signature, nothing
+ * here needs to change.
+ */
+type AwaitTeamApproval = (context: {
+  run: RunState;
+  signal: AbortSignal;
+}) => Promise<readonly TeamOperation[]>;
+
+/**
+ * One run parked at `awaiting_approval`, waiting on a verdict this process
+ * has not received yet.
+ *
+ * `resolve` is the only member because it already closes over its matching
+ * `reject` (see {@link RunSupervisor.awaitTeamApproval}) — the HTTP route
+ * only ever has an approval to deliver, never a reason to fail one, so a
+ * second function here would have no caller. It reports whether it actually
+ * settled anything, which is what lets `submitTeamDecision` and the route
+ * built on it tell "resolved" apart from "there was nothing left to resolve".
+ */
+interface PendingTeamApproval {
+  resolve: (operations: readonly TeamOperation[]) => boolean;
+}
+
 export class RunSupervisor {
   // `stepDelayMs` is excluded because it is consumed at construction — folded
   // into the default `makeProvider` closure — and never read again.
@@ -203,6 +241,20 @@ export class RunSupervisor {
    * be constructed holding its own promise.
    */
   private readonly inFlight = new Set<Promise<void>>();
+
+  /**
+   * Runs currently parked at `awaiting_approval` (FR-M11), keyed by run id.
+   *
+   * A run only ever appears here between the moment `executeRun` calls the
+   * `awaitTeamApproval` closure built in `startRun` and the moment that
+   * promise settles — approved via `submitTeamDecision`, or torn down by an
+   * abort (see {@link awaitTeamApproval}). Entries are removed on every one of
+   * those exits, never left for a later run to inherit: this map is keyed by
+   * run id exactly like `entries` is, and a stale entry here would let a
+   * decision meant for a finished run resolve a promise a brand-new run
+   * reusing that id is waiting on.
+   */
+  private readonly pendingTeamApprovals = new Map<string, PendingTeamApproval>();
 
   private readonly knownAgentNames: ReadonlySet<string>;
 
@@ -305,6 +357,100 @@ export class RunSupervisor {
   }
 
   /**
+   * Build the `awaitTeamApproval` closure `executeRun` calls once a run's plan
+   * exists and `reviewTeam` asked for a pause (FR-M11).
+   *
+   * The promise it returns is parked in `pendingTeamApprovals` and settled
+   * from exactly two places:
+   *
+   * - **`submitTeamDecision`**, when the user posts a verdict. This is the
+   *   only path that resolves rather than rejects, and it is the only path
+   *   `executeRun` is meant to see as "approved" — the operations array it
+   *   returns (possibly empty) is what the runner applies to the plan before
+   *   moving on to `dispatching`.
+   * - **The abort listener below**, when a cancel (or `shutdown`, which is
+   *   just cancelling everything) lands while the run is parked here. There is
+   *   nothing else in flight to interrupt at this point — no assignment
+   *   running, no provider call to abort — so without this listener the
+   *   controller firing would do nothing observable: `submitTeamDecision`
+   *   would still be sitting there later for a run whose page the user has
+   *   already closed, and the background task in `startRun` would never reach
+   *   its `finally` block, leaking both the `RunEntry` (kept alive forever as
+   *   "live") and this map entry. Rejecting lets the rejection propagate out
+   *   of `executeRun`'s `await deps.awaitTeamApproval(...)`, into the same
+   *   catch block every other cancellation-mid-flight already goes through,
+   *   which reads `signal.aborted` and calls `setStatus('cancelled')` —
+   *   `awaiting_approval -> cancelled` is legal because `canTransitionRun`
+   *   special-cases `cancelled` as reachable from any non-terminal status.
+   *
+   * Exactly-once is `PendingTeamApproval.resolve`'s job, not this method's:
+   * both exits above go through it, and it is built with a `settled` flag so
+   * whichever of "a decision arrived" or "the signal fired" happens first is
+   * the only one that can settle the promise or run the cleanup (removing the
+   * map entry and detaching the listener). Without that guard, a decision and
+   * a cancel racing in the same tick could call `resolve` after `reject` (or
+   * vice versa) — a no-op on an already-settled native promise, but the
+   * cleanup itself is not naturally idempotent, and running it twice is
+   * exactly the kind of bug that only shows up under real concurrency.
+   */
+  private awaitTeamApproval(run: RunState, signal: AbortSignal): Promise<readonly TeamOperation[]> {
+    return new Promise<readonly TeamOperation[]>((resolvePromise, rejectPromise) => {
+      let settled = false;
+
+      const cleanup = (): void => {
+        this.pendingTeamApprovals.delete(run.id);
+        signal.removeEventListener('abort', onAbort);
+      };
+
+      const resolve = (operations: readonly TeamOperation[]): boolean => {
+        if (settled) return false;
+        settled = true;
+        cleanup();
+        resolvePromise(operations);
+        return true;
+      };
+
+      const onAbort = (): void => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        rejectPromise(new Error(`run "${run.id}" was cancelled while awaiting team approval`));
+      };
+
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+
+      signal.addEventListener('abort', onAbort);
+      this.pendingTeamApprovals.set(run.id, { resolve });
+    });
+  }
+
+  /**
+   * The user's verdict on a parked run's proposed team (FR-M11): releases
+   * whatever is waiting in `pendingTeamApprovals` for `runId`, handing
+   * `operations` back to `executeRun` as the array to apply before dispatch.
+   * An empty array is a legitimate decision — "the Manager's team is right,
+   * go" — not the absence of one; `CreateRunRequestSchema`'s doc comment on
+   * `TeamDecisionSchema` makes the same point about the wire shape this
+   * mirrors.
+   *
+   * @returns false when there is nothing to resolve: an unknown run, a run
+   * that never asked to pause, one already dispatching, or a decision that
+   * lost a race with a cancel or a previous decision for the same run. The
+   * HTTP route (`POST /api/runs/:id/team`) turns that into a 404 or 409
+   * depending on which of those it actually was — this method does not have
+   * enough information to tell them apart on its own, only whether it had
+   * something to settle.
+   */
+  submitTeamDecision(runId: string, operations: readonly TeamOperation[]): boolean {
+    const pending = this.pendingTeamApprovals.get(runId);
+    if (pending === undefined) return false;
+    return pending.resolve(operations);
+  }
+
+  /**
    * Start a run and return its id as soon as one exists.
    *
    * The provider is built and preflighted *before* returning, so an unusable
@@ -391,6 +537,23 @@ export class RunSupervisor {
           ...(this.deps.produceDeliverable === undefined
             ? {}
             : { produceDeliverable: this.deps.produceDeliverable }),
+          // FR-M11: only present when the request opted in. `executeRun` (once
+          // `runner.ts` carries the matching half of this contract) reads the
+          // key's mere presence to decide whether to pause at all — an absent
+          // `awaitTeamApproval` is what keeps a plain `POST /api/runs` going
+          // straight from `planning` to `dispatching` exactly as before, which
+          // is the whole reason `reviewTeam` is opt-in rather than a new
+          // mandatory step. `run` here is `entry.state`'s live object at the
+          // moment planning finished, not a snapshot — the same object
+          // `onStateChange` above clones from on every later transition, so
+          // its `.plan` field is already the proposed plan a client asking for
+          // this run's current state would see.
+          ...(request.reviewTeam
+            ? {
+                awaitTeamApproval: ((context) =>
+                  this.awaitTeamApproval(context.run, context.signal)) satisfies AwaitTeamApproval,
+              }
+            : {}),
         });
 
         if (entry !== undefined) {
@@ -534,6 +697,21 @@ export class RunSupervisor {
    * Waiting matters: aborting and exiting immediately would kill the process
    * mid-`saveRun`, which is the one thing the store's atomic writes cannot
    * protect against because the rename would never happen.
+   *
+   * A run parked at `awaiting_approval` (FR-M11) needs no special case here,
+   * and that is worth stating because it is not obvious from this loop alone:
+   * `entry.live` stays true for the whole time a run is parked — from the
+   * supervisor's point of view it is still executing, just waiting on a human
+   * instead of a provider — so `entry.controller.abort()` fires for it exactly
+   * like it does for a run mid-assignment. What is different is what is
+   * listening: `awaitTeamApproval` (see its own doc comment) registered an
+   * abort listener on this same signal when it parked the run, and that
+   * listener is what turns the abort into a rejected promise `executeRun`'s
+   * `await` on it can actually observe. Without that listener this loop would
+   * still call `abort()`, but nothing downstream would ever notice — the
+   * background task would sit forever on an unsettled promise, `inFlight`
+   * would never drain, and `Promise.allSettled` below would hang until the
+   * process was killed out from under it.
    */
   async shutdown(): Promise<void> {
     for (const entry of this.entries.values()) {

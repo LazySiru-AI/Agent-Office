@@ -11,6 +11,23 @@ import { z } from 'zod';
 export const RUN_STATUSES = [
   'queued',
   'planning',
+  /**
+   * FR-M11: the plan exists and the user is being asked to sign off the team
+   * before a single agent is dispatched.
+   *
+   * Only reached when the run asked for it (`CreateRunRequest.reviewTeam`).
+   * Without that flag `planning` still goes straight to `dispatching`, which is
+   * why both edges are legal below — this is an opt-in pause, not a new
+   * mandatory step, and a run that never opts in must behave exactly as it did
+   * before this status existed.
+   *
+   * It is deliberately its own status rather than a boolean hung off
+   * `planning`. Everything downstream — the office, the run list, the status
+   * badge, the cancel path — reads run status to decide what to show, and
+   * "planning" while actually waiting on a human would make every one of those
+   * describe the run as busy when it is idle and waiting for you.
+   */
+  'awaiting_approval',
   'dispatching',
   'running',
   'synthesizing',
@@ -84,7 +101,13 @@ export function isAssignmentTerminal(s: AssignmentStatus): boolean {
  */
 const RUN_TRANSITIONS: Record<RunStatus, readonly RunStatus[]> = {
   queued: ['planning'],
-  planning: ['dispatching'],
+  // Both edges are legal, and that is the whole shape of FR-M11: a run that
+  // asked to review its team pauses at `awaiting_approval`, and a run that did
+  // not goes straight on exactly as it always has. Making the pause mandatory
+  // here would have turned an opt-in feature into a breaking change for every
+  // existing caller, including the CLI and every test fixture.
+  planning: ['awaiting_approval', 'dispatching'],
+  awaiting_approval: ['dispatching'],
   dispatching: ['running'],
   running: ['synthesizing'],
   synthesizing: ['designing'],

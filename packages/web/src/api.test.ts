@@ -6,6 +6,7 @@ import {
   fetchProviders,
   fetchRun,
   fetchRuns,
+  submitTeamDecision,
 } from './api.js';
 
 /**
@@ -149,5 +150,38 @@ describe('cancelRun — a fire-and-forget POST with no body to parse', () => {
   it('surfaces a non-2xx response as a readable error naming the run', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(409, { error: 'run already finished' })));
     await expect(cancelRun('run-1')).rejects.toThrow(/run already finished/);
+  });
+});
+
+describe('submitTeamDecision (FR-M11) — POSTs the operations, no response body to parse', () => {
+  it('sends the decision as JSON to the run-specific team route', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, {}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await submitTeamDecision('run-1', { operations: [{ op: 'drop', assignmentId: 'a1' }] });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('/api/runs/run-1/team');
+    expect(init.method).toBe('POST');
+    expect(JSON.parse(init.body as string)).toEqual({ operations: [{ op: 'drop', assignmentId: 'a1' }] });
+  });
+
+  it('an empty operations array — "the team is right, go" — is a valid request, not rejected client-side', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, {}));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(submitTeamDecision('run-1', { operations: [] })).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('surfaces a non-2xx response as a readable error, e.g. the server refusing an illegal drop', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(jsonResponse(400, { error: 'assignment "a1" is still depended on' })),
+    );
+
+    await expect(
+      submitTeamDecision('run-1', { operations: [{ op: 'drop', assignmentId: 'a1' }] }),
+    ).rejects.toThrow(/still depended on/);
   });
 });

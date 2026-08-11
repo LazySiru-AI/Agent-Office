@@ -51,6 +51,23 @@ describe('buildCreateRunRequest — the regression this fixes: budgets reaching 
   });
 });
 
+describe('buildCreateRunRequest — reviewTeam (FR-M11 opt-in)', () => {
+  it('includes reviewTeam: true on the request when the setting is opted in', () => {
+    const req = buildCreateRunRequest('t', { ...BASE_SETTINGS, reviewTeam: true });
+    expect(req.reviewTeam).toBe(true);
+  });
+
+  it('omits reviewTeam entirely when the setting is absent, matching "opt-in, absent means no"', () => {
+    const req = buildCreateRunRequest('t', BASE_SETTINGS);
+    expect('reviewTeam' in req).toBe(false);
+  });
+
+  it('a stored reviewTeam of false also produces an absent key, not reviewTeam: false', () => {
+    const req = buildCreateRunRequest('t', { ...BASE_SETTINGS, reviewTeam: false });
+    expect('reviewTeam' in req).toBe(false);
+  });
+});
+
 describe('buildCreateRunRequest — absent budgets stay absent keys, not `undefined` values', () => {
   it('omits tokenBudget entirely when runTokenBudget is undefined', () => {
     const req = buildCreateRunRequest('t', BASE_SETTINGS);

@@ -414,6 +414,252 @@ describe('POST /api/runs/:runId/cancel (FR-M9)', () => {
   });
 });
 
+describe('POST /api/runs/:runId/team (FR-M11)', () => {
+  /** Start a `reviewTeam` run and wait for it to reach the pause. */
+  async function startParkedRun(app: FastifyInstance, supervisor: RunSupervisor): Promise<string> {
+    const created = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.', reviewTeam: true },
+    });
+    const { runId } = JSON.parse(created.body) as { runId: string };
+    await waitFor(
+      async () => (await supervisor.getRunState(runId)).status === 'awaiting_approval',
+      'the run to park for team approval',
+    );
+    return runId;
+  }
+
+  it('exposes the parked run and its proposed plan through the run-state route the client already polls', async () => {
+    // FR-M11 adds no new read path. The "review the team" screen has to be
+    // able to render off the exact same `GET /api/runs/:id` (and the `state`
+    // messages the socket already pushes) that every other view of a run
+    // uses — a plan visible only through some route built specifically for
+    // this feature would be a second source of truth for something the
+    // client already has one of.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const response = await app.inject({ method: 'GET', url: API.run(runId) });
+
+    expect(response.statusCode).toBe(200);
+    const run = JSON.parse(response.body) as { status: string; plan?: { phases: unknown[] } };
+    expect(run.status).toBe('awaiting_approval');
+    expect(run.plan?.phases.length).toBeGreaterThan(0);
+  });
+
+  it('refuses an unapplicable decision with a 400 and leaves the run parked for a corrected one', async () => {
+    // Found by driving the assembled feature against a live server, not by a
+    // test — which is the point of writing this one.
+    //
+    // Dropping an assignment that others depend on returned **200**, and the
+    // run then went to `failed`. Both halves were behaving reasonably alone:
+    // `applyTeamOperations` refused an edit that would strand a dependency,
+    // and the runner refused to dispatch a plan the user had not approved
+    // rather than silently reverting to the Manager's original. The defect
+    // lived in the seam — the only layer that could still recover had already
+    // answered "OK" and let go.
+    //
+    // A run destroyed by a typo is a bad outcome for a feature whose whole
+    // purpose is giving the user control before anything is spent, and worse
+    // than having no control at all, because the 200 claims it worked. So the
+    // refusal has to happen here, while the run can still be corrected.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const before = JSON.parse(
+      (await app.inject({ method: 'GET', url: API.run(runId) })).body,
+    ) as { assignments: { id: string; dependsOn: string[] }[] };
+    // Whatever the scripted planner produced, pick a target something depends on.
+    const depended = before.assignments.find((a) =>
+      before.assignments.some((other) => other.dependsOn.includes(a.id)),
+    );
+    if (depended === undefined) throw new Error('expected the scripted plan to have a dependency');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [{ op: 'drop', assignmentId: depended.id }] },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(expectApiError(response.body)).toMatch(/rejected/i);
+
+    // The run is still parked — not failed, not dispatched — so the user can
+    // simply post a decision that works.
+    const after = JSON.parse((await app.inject({ method: 'GET', url: API.run(runId) })).body) as {
+      status: string;
+    };
+    expect(after.status).toBe('awaiting_approval');
+
+    const retry = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [] },
+    });
+    expect(retry.statusCode).toBe(200);
+    await waitForTerminal(supervisor, runId);
+  }, SLOW_RUN_TIMEOUT_MS);
+
+  it('releases a parked run on an empty decision and lets it run to done', async () => {
+    // The empty array is the "the Manager's team is right, go" case
+    // `TeamDecisionSchema`'s doc comment calls out — approval is the act of
+    // posting at all, not a separate flag that could disagree with the ops.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [] },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const run = await waitForTerminal(supervisor, runId);
+    expect(run.status).toBe('done');
+  }, SLOW_RUN_TIMEOUT_MS);
+
+  it('returns 409 for a live run that is not awaiting team approval, rather than silently doing nothing', async () => {
+    // A run that never asked to pause (no `reviewTeam`) has nothing parked to
+    // resolve. The hang keeps it non-terminal and past the pause point (in
+    // `running`) so this exercises the "wrong status, but not finished"
+    // branch specifically — a terminal run gets the differently-worded
+    // "already finished" refusal, covered by the cancel-then-approve test
+    // below, and conflating the two messages would leave a caller unable to
+    // tell "too early to retry" from "this is over" from the response alone.
+    const { app, supervisor } = await setup({ lead: { hang: true } });
+
+    const created = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.' },
+    });
+    const { runId } = JSON.parse(created.body) as { runId: string };
+    await waitFor(() => supervisor.isLive(runId), 'the run to be live');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [] },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(expectApiError(response.body)).toMatch(/not awaiting team approval/);
+
+    // Clean up the deliberately-hung run.
+    await app.inject({ method: 'POST', url: API.cancelRun(runId) });
+    await waitForTerminal(supervisor, runId);
+  });
+
+  it('returns 404 for an unknown run', async () => {
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam('20260101-000000-zzzz'),
+      payload: { operations: [] },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expectApiError(response.body);
+  });
+
+  it('returns 400 for a body the contract does not accept', async () => {
+    // `operations` is required, and each entry is a three-way discriminated
+    // union (`drop`/`swap`/`add`) — anything else must fail here rather than
+    // reach `applyTeamOperations` with a shape it was never validated against.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [{ op: 'rename', assignmentId: 'lead' }] },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(expectApiError(response.body)).toMatch(/invalid request body/);
+
+    // The run is still parked — clean it up so teardown is not left draining
+    // a supervisor waiting on a decision that will never arrive.
+    await app.inject({ method: 'POST', url: API.cancelRun(runId) });
+    await waitForTerminal(supervisor, runId);
+  });
+
+  it('refuses a foreign origin, the same protection every other state-changing POST gets', async () => {
+    // The same shape as "refuses a forged cancel outright" below, with a body
+    // attached: `Host: 127.0.0.1:5179` is a genuine loopback host, so only
+    // `Origin` gives the request away, and the `onRequest` hook is what has
+    // to catch it — nothing route-specific was added for this route, so this
+    // is the test that proves it actually inherited the hook rather than the
+    // hook only having ever run ahead of `/cancel`.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      headers: { host: '127.0.0.1:5179', origin: 'http://evil.example' },
+      payload: { operations: [] },
+    });
+
+    expect(response.statusCode).toBe(403);
+    // The assertion that matters: the side effect did not happen either. A
+    // 403 that still released the run would be worse than useless — it would
+    // look safe while quietly not being.
+    expect((await supervisor.getRunState(runId)).status).toBe('awaiting_approval');
+
+    await app.inject({ method: 'POST', url: API.cancelRun(runId) });
+    await waitForTerminal(supervisor, runId);
+  });
+
+  it('lets a cancel release a parked run, and a later approval cannot revive it', async () => {
+    // Cancel and approve are the two ways a pause ends. Once cancel has won,
+    // an approval that was already in flight (or simply arrives late) must
+    // not resurrect the run into dispatch — it has to see the same "already
+    // finished" refusal any other post-terminal action gets.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const cancelled = await app.inject({ method: 'POST', url: API.cancelRun(runId) });
+    expect(cancelled.statusCode).toBe(200);
+    const run = await waitForTerminal(supervisor, runId);
+    expect(run.status).toBe('cancelled');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [] },
+    });
+
+    expect(response.statusCode).toBe(409);
+    expect(expectApiError(response.body)).toMatch(/already finished/);
+  });
+
+  it('refuses a second approval once the first has already released the run', async () => {
+    // Exactly-once from the outside: a double-click or a retried request must
+    // not be able to resolve the same parked decision twice.
+    const { app, supervisor } = await setup();
+    const runId = await startParkedRun(app, supervisor);
+
+    const first = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [] },
+    });
+    expect(first.statusCode).toBe(200);
+
+    const second = await app.inject({
+      method: 'POST',
+      url: API.runTeam(runId),
+      payload: { operations: [] },
+    });
+    expect(second.statusCode).toBe(409);
+
+    await waitForTerminal(supervisor, runId);
+  }, SLOW_RUN_TIMEOUT_MS);
+});
+
 describe('report routes (NFR-1)', () => {
   it('serves the synthesis once the run has written one', async () => {
     const { app, supervisor } = await setup();

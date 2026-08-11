@@ -1107,3 +1107,206 @@ button[aria-pressed='true'] {
   font-size: 0.8rem;
   color: var(--ao-ink-mute);
 }
+
+/* --- Team review (FR-M11) ---
+ *
+ * The one panel this app shows exclusively for `awaiting_approval`, so it
+ * gets its own visual weight rather than blending into the other `section`s
+ * in `main` — `--ao-status-waiting` is the same amber `theme/status.ts`
+ * already assigns that status's badge (`statusWaiting`), reused here as the
+ * panel's left edge so the "this is waiting on you" signal is visible before
+ * a single word is read, not just encoded in a small chip up in the header.
+ * Every colour below is one of the existing `var(--ao-*)` tokens (FR-U2) —
+ * this file adds no new hex literal for the feature. */
+
+.team-review {
+  border: 1px solid var(--ao-line-firm);
+  border-left: 3px solid var(--ao-status-waiting);
+  background: var(--ao-surface-raised);
+  padding: 0.9rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.9rem;
+}
+
+.team-review-intro {
+  margin: 0;
+  color: var(--ao-ink-soft);
+  font-size: 0.9rem;
+}
+
+.team-review-phase {
+  border-top: 1px solid var(--ao-line);
+  padding-top: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.team-review-phase h3 {
+  margin: 0;
+  font-size: 0.95rem;
+  color: var(--ao-ink);
+}
+
+.team-review-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.team-review-row {
+  border: 1px solid var(--ao-line);
+  background: var(--ao-surface);
+  padding: 0.5rem 0.65rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+}
+
+/* Struck through and dimmed, matching `.status-tone-stopped`'s "withdrawn,
+ * not a result" register (`theme/status.ts`) — a dropped row is a choice the
+ * user made, not a failure, and must not read like one. */
+.team-review-row-dropped {
+  opacity: 0.6;
+}
+
+.team-review-row-dropped .team-review-row-id,
+.team-review-row-dropped .team-review-objective {
+  text-decoration: line-through;
+}
+
+.team-review-row-added {
+  border-color: var(--ao-accent-dim);
+}
+
+.team-review-row-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.team-review-row-id {
+  font-family: var(--ao-font-mono);
+  color: var(--ao-ink-mute);
+}
+
+.team-review-row-main label {
+  color: var(--ao-ink-mute);
+  font-size: 0.8rem;
+}
+
+.team-review-row-model {
+  font-family: var(--ao-font-mono);
+  font-size: 0.78rem;
+}
+
+.team-review-objective {
+  margin: 0;
+  color: var(--ao-ink-soft);
+  font-size: 0.85rem;
+}
+
+.team-review-row-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* The disabled-drop reason (WCAG 3.3.1): styled like `.settings-error` in
+ * tone-of-voice but not colour — it is not wrong input, it is a rule, so it
+ * stays in the muted ink rather than the failure red `settings-error` uses. */
+.team-review-reason {
+  margin: 0;
+  font-size: 0.8rem;
+  color: var(--ao-ink-mute);
+}
+
+.team-review-add-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+}
+
+.team-review-add-form label {
+  color: var(--ao-ink-mute);
+  font-size: 0.8rem;
+}
+
+.team-review-add-form textarea {
+  font-family: inherit;
+  resize: vertical;
+}
+
+.team-review-depends-on {
+  border: 1px solid var(--ao-line);
+  padding: 0.4rem 0.6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.team-review-depends-on legend {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ao-ink-mute);
+}
+
+.team-review-depends-on div {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.82rem;
+}
+
+.team-review-edits {
+  border-top: 1px solid var(--ao-line);
+  padding-top: 0.75rem;
+}
+
+.team-review-edits h3 {
+  margin: 0 0 0.35rem;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ao-ink-mute);
+}
+
+.team-review-edits ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+}
+
+.team-review-edits li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.6rem;
+  font-size: 0.85rem;
+  color: var(--ao-ink-soft);
+}
+
+.team-review-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.settings-field-checkbox {
+  grid-template-columns: 1fr auto;
+}
+
+.settings-field-checkbox input {
+  width: auto;
+  accent-color: var(--ao-accent);
+}

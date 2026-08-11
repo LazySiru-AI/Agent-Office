@@ -64,7 +64,12 @@ export interface SettingsPanelProps {
  * `<input type="number">`s with an associated `<label>`, `aria-invalid` when
  * their value fails validation, and `aria-describedby` pointing at the
  * error message so a screen reader announces *why* alongside the field
- * itself rather than leaving the user to find a floating paragraph.
+ * itself rather than leaving the user to find a floating paragraph. The
+ * FR-M11 opt-in below is a real `<input type="checkbox">` with its own
+ * `<label>` for the same reason the numeric fields are real inputs rather
+ * than styled `<div>`s: the platform control already has the semantics a
+ * screen reader needs, and there is nothing this file could add on top of
+ * `aria-pressed`-on-a-button that isn't already free here.
  */
 export function SettingsPanel({ settings, errors, providers, onChange, onReset }: SettingsPanelProps): JSX.Element {
   return (
@@ -195,6 +200,39 @@ export function SettingsPanel({ settings, errors, providers, onChange, onReset }
             Applies separately to each assignment. An N-assignment run can spend up to N times this value.
           </p>
         </div>
+      </div>
+
+      {/*
+       * FR-M11's opt-in. A checkbox, not a toggle-button pair like Provider
+       * above: this is a single yes/no choice with an obvious default (off),
+       * exactly what `<input type="checkbox">` is for, and native checkbox
+       * semantics give a screen reader "checked"/"not checked" for free —
+       * reusing the `aria-pressed` button pattern here would have meant
+       * re-deriving what the platform control already announces.
+       *
+       * The hint paragraph beneath is wired through `aria-describedby` the
+       * same way `settings-cost-budget-hint` is just above: this is not an
+       * error, so it does not use `settings-error`, but a checkbox with no
+       * visible consequence until a run is *already* underway needs its
+       * effect stated somewhere a screen reader reaches without guessing.
+       */}
+      <div className="settings-group">
+        <span className="settings-label">Team review (FR-M11)</span>
+        <div className="settings-field settings-field-checkbox">
+          <label htmlFor="settings-review-team">Review the proposed team before dispatch</label>
+          <input
+            id="settings-review-team"
+            type="checkbox"
+            checked={settings.reviewTeam === true}
+            aria-describedby="settings-review-team-hint"
+            onChange={(e) => onChange('reviewTeam', e.target.checked ? true : undefined)}
+          />
+        </div>
+        <p className="settings-provider-reason" id="settings-review-team-hint">
+          When checked, the run pauses after planning — as <code>awaiting_approval</code> — so you can add, drop or
+          swap agents before any of them starts working. Off by default: a run that doesn&apos;t ask for this goes
+          straight from planning to dispatch, exactly as it always has.
+        </p>
       </div>
 
       <div className="settings-group">

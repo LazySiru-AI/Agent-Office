@@ -51,6 +51,19 @@ export interface RunSettings {
   assignmentTimeoutMs: number;
   runTokenBudget?: number;
   maxCostUsd?: number;
+  /**
+   * FR-M11 opt-in: pause after planning so the proposed team can be
+   * reviewed — add, drop or swap agents — before anything is dispatched.
+   *
+   * Optional and modelled exactly like the two budgets above rather than as
+   * a required `boolean` defaulting to `false`, for the same reason: the
+   * wire's own `CreateRunRequestSchema.reviewTeam` is "opt-in, and absent
+   * means no" (see its doc comment in `wire.ts`), and a required field here
+   * would mean `TaskForm.tsx`'s `buildCreateRunRequest` has to invent a
+   * decision about whether `false` is worth sending at all. Absent already
+   * *is* that decision, made once, here.
+   */
+  reviewTeam?: boolean;
 }
 
 const STORAGE_KEY = 'agent-office.settings';
@@ -127,6 +140,18 @@ function fallbackOptionalNumber(value: unknown, isValid: (n: number) => boolean)
 }
 
 /**
+ * For `reviewTeam`: the only meaningful stored value is a literal `true`.
+ * There is no "invalid but recoverable" case the way a corrupted budget has
+ * one — a stored `false`, or anything else that isn't `true`, means exactly
+ * what an absent key means ("not opted in"), so both collapse to the same
+ * `undefined` result rather than the field distinguishing three states for a
+ * choice that only ever has two.
+ */
+function fallbackOptionalBoolean(value: unknown): boolean | undefined {
+  return value === true ? true : undefined;
+}
+
+/**
  * Stored raw string -> a fully-populated, individually-validated
  * `RunSettings`. Never throws: unparseable JSON, a non-object payload, or any
  * single corrupted field all degrade to that field's default rather than
@@ -157,6 +182,7 @@ export function parseStoredSettings(raw: string | undefined): RunSettings {
   );
   const runTokenBudget = fallbackOptionalNumber(parsed['runTokenBudget'], (n) => Number.isInteger(n) && n > 0);
   const maxCostUsd = fallbackOptionalNumber(parsed['maxCostUsd'], (n) => n > 0);
+  const reviewTeam = fallbackOptionalBoolean(parsed['reviewTeam']);
 
   return {
     provider,
@@ -167,6 +193,7 @@ export function parseStoredSettings(raw: string | undefined): RunSettings {
     // explicitly set to `undefined`.
     ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
     ...(maxCostUsd === undefined ? {} : { maxCostUsd }),
+    ...(reviewTeam === undefined ? {} : { reviewTeam }),
   };
 }
 
@@ -246,6 +273,8 @@ function withSetting<K extends keyof RunSettings>(settings: RunSettings, key: K,
       return withOptionalNumber(settings, 'runTokenBudget', value as RunSettings['runTokenBudget']);
     case 'maxCostUsd':
       return withOptionalNumber(settings, 'maxCostUsd', value as RunSettings['maxCostUsd']);
+    case 'reviewTeam':
+      return withOptionalBoolean(settings, value as RunSettings['reviewTeam']);
     default: {
       const exhaustive: never = key;
       throw new Error(`unhandled RunSettings key: ${JSON.stringify(exhaustive)}`);
@@ -276,6 +305,22 @@ function withOptionalNumber(
   const next = { ...settings };
   delete next[key];
   if (value !== undefined) next[key] = value;
+  return next;
+}
+
+/**
+ * Same `delete`-then-set discipline as `withOptionalNumber`, for the one
+ * boolean field. Unlike the budgets, there is no distinct "unset" input a
+ * checkbox can produce the way an emptied number field produces `undefined`
+ * — the control below sends either `true` (checked) or `undefined`
+ * (unchecked), never a literal `false`, so `reviewTeam` never carries a
+ * `false` value to begin with and this only ever has one non-absent branch
+ * to set.
+ */
+function withOptionalBoolean(settings: RunSettings, value: boolean | undefined): RunSettings {
+  const next = { ...settings };
+  delete next.reviewTeam;
+  if (value === true) next.reviewTeam = true;
   return next;
 }
 

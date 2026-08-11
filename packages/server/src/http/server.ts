@@ -5,12 +5,14 @@ import {
   API,
   ClientMessageSchema,
   CreateRunRequestSchema,
+  TeamDecisionSchema,
   isRunTerminal,
   type AgentDef,
   type AgentSummary,
   type RunState,
   type ServerMessage,
 } from '@agent-office/shared';
+import { applyTeamOperations } from '../orchestrator/team.js';
 import type { Registry } from '../registry/index.js';
 import { UnknownProviderError, probeProviders } from '../providers/factory.js';
 import { ProviderUnavailableError } from '../providers/types.js';
@@ -72,6 +74,7 @@ const ROUTES = {
   runs: API.runs(),
   run: toPattern(API.run(RUN_ID_PLACEHOLDER)),
   cancelRun: toPattern(API.cancelRun(RUN_ID_PLACEHOLDER)),
+  runTeam: toPattern(API.runTeam(RUN_ID_PLACEHOLDER)),
   runReport: toPattern(API.runReport(RUN_ID_PLACEHOLDER)),
   assignmentReport: toPattern(API.assignmentReport(RUN_ID_PLACEHOLDER, 'x')),
   runEvents: toPattern(API.runEvents(RUN_ID_PLACEHOLDER)),
@@ -334,6 +337,90 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       isRunTerminal(run.status)
         ? `run "${runId}" has already finished (${run.status})`
         : `run "${runId}" is not executing in this server process`,
+    );
+  });
+
+  /**
+   * Approve (and optionally edit) the proposed team (FR-M11).
+   *
+   * This is a state-changing POST with a body, exactly the shape the long
+   * comment on `onRequest` above is about: the `Host`/`Origin` checks it
+   * describes run unconditionally for every route registered on `app`, this
+   * one included, so a foreign page cannot release a parked run any more than
+   * it can cancel one. Nothing route-specific has to be added for that here —
+   * only getting the route registered the normal way is required, and the
+   * cross-origin test alongside `cancel`'s covers that it actually inherited
+   * the hook rather than the hook having been bypassed by accident.
+   *
+   * The 409 branch is deliberately one message covering several causes — run
+   * never asked to pause, already dispatching, already decided, or cancelled
+   * out from under the pause — because `supervisor.submitTeamDecision`
+   * reports only whether it had something to resolve, not why it did not
+   * (see its own doc comment for that trade-off). A caller does not need the
+   * distinction: every one of those means "this is not the moment to approve
+   * a team", which is exactly what FR-M11 asks the route to refuse. Modelled
+   * on `cancelRun` immediately above, right down to fetching `run` before the
+   * verb that might change it, so the body returned on success reflects what
+   * the client asked about, not a state the resolve may not have reached yet.
+   */
+  app.post(ROUTES.runTeam, async (request) => {
+    const runId = parseRunId(request.params);
+    const parsed = TeamDecisionSchema.safeParse(request.body);
+    if (!parsed.success) {
+      throw new HttpError(400, `invalid request body: ${formatIssues(parsed.error)}`);
+    }
+
+    const run = await loadRun(deps, runId);
+
+    /**
+     * Validate the edits HERE, while the run is still parked, rather than
+     * letting `executeRun` discover the problem after the decision is released.
+     *
+     * Found by driving the assembled feature against a live server rather than
+     * by a test: posting a `drop` of an assignment two others depended on
+     * returned **200**, and the run then went to `failed`. Both halves were
+     * behaving reasonably on their own — `applyTeamOperations` correctly
+     * refused an edit that would strand a dependency, and the runner correctly
+     * refused to dispatch a plan the user had not approved rather than silently
+     * falling back to the Manager's original. The defect was in the seam: the
+     * only place that could still *recover* was this route, and it had already
+     * answered "OK" and let go.
+     *
+     * A run destroyed by a typo is a bad outcome for a feature whose entire
+     * purpose is to give the user control before anything is spent, and it is
+     * worse than the control being absent, because the 200 says it worked.
+     * So the trust boundary does the validating, exactly as it already does for
+     * a malformed body two statements above: an unacceptable decision is a 400
+     * naming what is wrong, and the run stays parked for a corrected one.
+     *
+     * This is a dry run, deliberately — the authoritative application still
+     * happens in `executeRun` against the plan it holds. Two evaluations of the
+     * same pure function over the same inputs cannot disagree, and keeping the
+     * runner's check means the guarantee "nothing unapproved is ever
+     * dispatched" does not depend on every future caller of
+     * `submitTeamDecision` remembering to pre-validate.
+     */
+    if (parsed.data.operations.length > 0) {
+      if (run.plan === undefined) {
+        throw new HttpError(409, `run "${runId}" has no plan to edit yet (status: ${run.status})`);
+      }
+      const dryRun = applyTeamOperations(
+        run.plan,
+        parsed.data.operations,
+        new Set(deps.registry.byName.keys()),
+      );
+      if ('error' in dryRun) {
+        throw new HttpError(400, `team decision rejected: ${dryRun.error}`);
+      }
+    }
+
+    if (deps.supervisor.submitTeamDecision(runId, parsed.data.operations)) return run;
+
+    throw new HttpError(
+      409,
+      isRunTerminal(run.status)
+        ? `run "${runId}" has already finished (${run.status})`
+        : `run "${runId}" is not awaiting team approval (status: ${run.status})`,
     );
   });
 

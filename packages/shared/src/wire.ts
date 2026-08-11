@@ -44,6 +44,11 @@ export const API = {
   runs: () => '/api/runs',
   run: (runId: string) => `/api/runs/${encodeURIComponent(runId)}`,
   cancelRun: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/cancel`,
+  /**
+   * Approve (and optionally edit) the proposed team, releasing a run parked in
+   * `awaiting_approval` (FR-M11). A run in any other status rejects it.
+   */
+  runTeam: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/team`,
   /** The Manager's synthesis (`report.md`). */
   runReport: (runId: string) => `/api/runs/${encodeURIComponent(runId)}/report`,
   /**
@@ -92,9 +97,86 @@ export const CreateRunRequestSchema = z.object({
    * request body.
    */
   maxCostUsd: z.number().positive().finite().optional(),
+  /**
+   * FR-M11: pause after planning and let the user sign off the team before any
+   * agent is dispatched.
+   *
+   * Opt-in, and absent means "no". A run that does not ask for it goes
+   * `planning -> dispatching` exactly as it always has, which is what keeps
+   * this from being a breaking change for the CLI, every fixture and every
+   * existing caller. It is a request flag rather than a server setting because
+   * whether you want to vet the team is a property of the task, not of the
+   * installation: you review the plan for the expensive unfamiliar job and let
+   * the routine one run.
+   */
+  reviewTeam: z.boolean().optional(),
 });
 
 export type CreateRunRequest = z.infer<typeof CreateRunRequestSchema>;
+
+/**
+ * One edit to the Manager's proposed team (FR-M11).
+ *
+ * Operations rather than a wholesale replacement plan, and the reason is
+ * validation. A client that PUT an entire `RunPlan` could rewrite objectives,
+ * dependency edges, phase ordering and deliverable paths in one request, and
+ * the server would have to re-verify all of it against everything the planner
+ * already guarantees — while `deliverable` in particular is a filesystem path
+ * that NFR-1 exists to keep untrusted input out of. Three narrow verbs say
+ * exactly what the requirement asks for ("add, drop or swap agents") and
+ * nothing else, so everything they cannot express stays as the planner left it.
+ */
+export const TeamOperationSchema = z.discriminatedUnion('op', [
+  /** Remove an assignment. Refused if anything still depends on it. */
+  z.object({
+    op: z.literal('drop'),
+    assignmentId: z.string().min(1),
+  }),
+  /**
+   * Replace the agent doing an assignment, keeping its objective, its
+   * dependency edges and its deliverable. That is what makes it a *swap*
+   * rather than a drop plus an add: the work does not move, only who does it,
+   * so nothing downstream has to be rewired.
+   */
+  z.object({
+    op: z.literal('swap'),
+    assignmentId: z.string().min(1),
+    agentName: z.string().min(1),
+  }),
+  /**
+   * Add an agent to an existing phase.
+   *
+   * There is deliberately no `deliverable` field. The report path is derived
+   * server-side from the phase and agent, exactly as the planner derives it,
+   * because a client-supplied path is precisely the untrusted input NFR-1's
+   * containment check exists to stop — and letting one in here would put a
+   * path traversal on the *approval* route, the one route a user reaches while
+   * feeling in control.
+   */
+  z.object({
+    op: z.literal('add'),
+    phaseId: z.string().min(1),
+    agentName: z.string().min(1),
+    objective: z.string().min(1).max(2_000),
+    /** Assignment ids from earlier phases. Validated against the plan. */
+    dependsOn: z.array(z.string().min(1)).max(32).optional(),
+  }),
+]);
+
+export type TeamOperation = z.infer<typeof TeamOperationSchema>;
+
+/**
+ * `POST /api/runs/:id/team` — the user's verdict on the proposed team.
+ *
+ * An empty `operations` array is a meaningful, and expected, request: it means
+ * "the Manager's team is right, go". Approval is the act of posting at all, so
+ * there is no separate `approve` boolean that could disagree with the ops.
+ */
+export const TeamDecisionSchema = z.object({
+  operations: z.array(TeamOperationSchema).max(64),
+});
+
+export type TeamDecision = z.infer<typeof TeamDecisionSchema>;
 
 /** `POST /api/runs` response. The run is already executing when this returns. */
 export const CreateRunResponseSchema = z.object({

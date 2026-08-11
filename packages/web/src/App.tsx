@@ -14,6 +14,7 @@ import { RunHeader } from './panels/RunHeader.js';
 import { RunList } from './panels/RunList.js';
 import { SettingsPanel } from './panels/SettingsPanel.js';
 import { TaskForm } from './panels/TaskForm.js';
+import { TeamReview } from './panels/TeamReview.js';
 import { OfficeCanvas } from './sim/OfficeCanvas.js';
 import { latestToolByAssignment } from './sim/model.js';
 import { useReplay } from './state/useReplay.js';
@@ -151,6 +152,9 @@ export function App(): JSX.Element {
           {...(settings.settings.maxCostUsd === undefined
             ? {}
             : { maxCostUsd: settings.settings.maxCostUsd })}
+          {...(settings.settings.reviewTeam === undefined
+            ? {}
+            : { reviewTeam: settings.settings.reviewTeam })}
           settingsInvalid={Object.keys(settings.errors).length > 0 || providerUnavailable}
           {...(providerUnavailable
             ? { blockedReason: selectedProvider?.reason ?? `${settings.settings.provider} is unavailable` }
@@ -202,6 +206,31 @@ export function App(): JSX.Element {
             });
           }}
         />
+
+        {/* FR-M11: the one screen a run in `awaiting_approval` needs. Placed
+            immediately after the header and ahead of everything else in
+            `main` — including the office/table toggle below — because this
+            status means the run is not "busy", it is idle and waiting on a
+            decision only a person can make, and burying that behind the
+            usual view would leave a user scrolling past a static office
+            floor wondering why nothing is moving.
+
+            Deliberately keyed off `office.run` — the live state — rather
+            than `shownRun`, which becomes the *replayed* reconstruction the
+            moment `replaying` is on. A finished run that happened to pass
+            through `awaiting_approval` on its way to completion would
+            replay that frame like any other, and this panel is a form whose
+            submit calls `office.submitTeam` against the real, current
+            `selectedRunId`: rendering it from replayed history would offer
+            an "approve" button for a decision that was already made and
+            acted on, against a run that has since moved past it entirely
+            (the server rejects a `/team` POST on any status other than
+            `awaiting_approval` — see `wire.ts`'s `API.runTeam` — so the
+            failure mode is a confusing rejected submit, not silent data
+            loss, but there is no reason to invite it). */}
+        {office.run !== undefined && office.run.status === 'awaiting_approval' && (
+          <TeamReview plan={office.run.plan} agents={agents} onSubmit={office.submitTeam} />
+        )}
 
         {shownRun !== undefined && (
           <>

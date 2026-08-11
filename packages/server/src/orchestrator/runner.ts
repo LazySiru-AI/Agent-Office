@@ -6,6 +6,7 @@ import {
   type AgentEvent,
   type RunState,
   type RunStatus,
+  type TeamOperation,
 } from '@agent-office/shared';
 import type { Registry } from '../registry/index.js';
 import type { AgentProvider } from '../providers/types.js';
@@ -23,6 +24,7 @@ import {
   synthesiseReport,
   type AssignmentReport,
 } from './manager.js';
+import { applyTeamOperations } from './team.js';
 import { produceDeliverable } from '../reports/deliverable.js';
 
 /**
@@ -80,6 +82,28 @@ export interface ExecuteRunDeps {
    * only tests substitute.
    */
   produceDeliverable?: typeof produceDeliverable;
+  /**
+   * FR-M11. When present, the run parks in `awaiting_approval` after planning
+   * and waits for the user's verdict before dispatching.
+   *
+   * Absent — the default — means the run goes `planning -> dispatching`
+   * exactly as it did before this feature existed, which is what
+   * `RUN_TRANSITIONS` in `shared/src/status.ts` calls out as the reason both
+   * edges out of `planning` are legal: this is an opt-in pause, and every
+   * caller that never passes this function (every existing test fixture, the
+   * CLI, and any HTTP run created without `reviewTeam`) must be unable to
+   * tell the difference from before FR-M11 was written.
+   *
+   * A function rather than a plain awaited value because the run has to
+   * reach `awaiting_approval` and be persisted (so a client reconnecting
+   * mid-pause sees it) *before* anything can be waited on — there is no
+   * value to hand over at the point `ExecuteRunDeps` is constructed, only a
+   * promise that resolves once a human somewhere else decides.
+   */
+  awaitTeamApproval?: (context: {
+    run: RunState;
+    signal: AbortSignal;
+  }) => Promise<readonly TeamOperation[]>;
 }
 
 export interface ExecuteRunResult {
@@ -184,7 +208,7 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
     await setStatus('planning');
     log(`[${run.id}] planning`);
 
-    const plan = await planRun({
+    let plan = await planRun({
       registry: deps.registry,
       provider: deps.provider,
       task: deps.task,
@@ -199,11 +223,61 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
 
     run.plan = plan;
     run.assignments = materialiseAssignments(plan);
-    await setStatus('dispatching');
     log(
       `[${run.id}] plan: ${plan.phases.length} phase(s), ` +
         `${run.assignments.length} assignment(s), domain "${plan.domain}"`,
     );
+
+    // --- Team review pause (FR-M11) ---
+    //
+    // `run.plan`/`run.assignments` are stamped and persisted (via the
+    // `awaiting_approval` `setStatus` call below) BEFORE anything is
+    // awaited, so a client that subscribes or reconnects while the run is
+    // parked sees the proposed team, not an empty plan — that persisted
+    // snapshot is the whole reason `awaiting_approval` exists as a status a
+    // client can render against, per its doc comment in
+    // `shared/src/status.ts`.
+    if (deps.awaitTeamApproval !== undefined) {
+      await setStatus('awaiting_approval');
+      log(`[${run.id}] awaiting team approval`);
+
+      const verdict = await raceApprovalAgainstAbort(deps.awaitTeamApproval, run, signal);
+
+      // Checked defensively in addition to the sentinel `raceApprovalAgainstAbort`
+      // returns: a cancel that lands in the same tick the approval promise
+      // settles could resolve `verdict` with real operations while `signal`
+      // is already aborted, and FR-M9 says a cancelled run dispatches
+      // nothing — applying the edits and proceeding to `dispatching` here
+      // would race a genuine cancellation against a genuine approval and let
+      // approval sometimes win.
+      if (verdict === 'aborted' || signal.aborted) {
+        await setStatus('cancelled');
+        return { run };
+      }
+
+      const knownAgentNames = new Set(deps.registry.byName.keys());
+      const applied = applyTeamOperations(plan, verdict, knownAgentNames);
+      if ('error' in applied) {
+        // Failed cleanly rather than dispatching a half-edited plan: the
+        // alternative — falling back to the Manager's original proposal and
+        // silently ignoring a rejected edit — would dispatch work the user
+        // never approved, which is the exact failure mode FR-M11 exists to
+        // prevent.
+        run.error = `team approval could not be applied: ${applied.error}`;
+        await setStatus('failed');
+        return { run };
+      }
+
+      plan = applied.plan;
+      run.plan = plan;
+      run.assignments = materialiseAssignments(plan);
+      log(
+        `[${run.id}] team approved: ${verdict.length} edit(s), ` +
+          `${run.assignments.length} assignment(s) now`,
+      );
+    }
+
+    await setStatus('dispatching');
 
     // --- Dispatch (FR-M4 through FR-M6) ---
     await setStatus('running');
@@ -313,6 +387,59 @@ export async function executeRun(deps: ExecuteRunDeps): Promise<ExecuteRunResult
     log(`[${run.id}] ${run.status}: ${run.error}`);
     return { run, ...(dispatchResult === undefined ? {} : { dispatch: dispatchResult }) };
   }
+}
+
+/**
+ * Wait for the user's team verdict (FR-M11), but never wait past a
+ * cancellation (FR-M9).
+ *
+ * `awaitTeamApproval` is supplied by a caller this file does not control — in
+ * production, the HTTP layer resolves it when a `POST .../team` request
+ * lands; in tests, a hand-written stub. Nothing here assumes that caller
+ * remembers to watch `signal` itself and settle promptly. Racing its promise
+ * against the abort signal is the same defensive posture `dispatcher.ts`
+ * already takes with its own `haltController`/`anySignal` machinery:
+ * cancellation must keep working even against a dependency that does not
+ * cooperate, not merely one that does — a run parked here "may sit
+ * indefinitely" by design, so this is the one await in the whole file that
+ * most needs an escape hatch that does not depend on the other side.
+ *
+ * Returns the literal string `'aborted'` rather than throwing, so the cancel
+ * path in `executeRun` reads as an ordinary branch — `setStatus('cancelled')`
+ * — instead of a caught exception standing in for something that is not
+ * really exceptional: a user cancelling a run they are looking at is the
+ * expected outcome of the Cancel button, not a failure.
+ *
+ * A genuine rejection from `awaitTeamApproval` (a bug in whatever supplied
+ * it, not a cancellation) is deliberately left to propagate. Swallowing it
+ * here would need a second error channel just for this one await, which is
+ * exactly what `dispatcher.ts`'s per-assignment catch (see its comment on
+ * "Defensive containment, not a substitute...") warns against inventing;
+ * `executeRun`'s existing top-level try/catch already turns any such throw
+ * into a clean run failure.
+ */
+function raceApprovalAgainstAbort(
+  awaitTeamApproval: NonNullable<ExecuteRunDeps['awaitTeamApproval']>,
+  run: RunState,
+  signal: AbortSignal,
+): Promise<readonly TeamOperation[] | 'aborted'> {
+  if (signal.aborted) return Promise.resolve('aborted');
+
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => resolve('aborted');
+    signal.addEventListener('abort', onAbort, { once: true });
+
+    awaitTeamApproval({ run, signal }).then(
+      (operations) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(operations);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**

@@ -50,6 +50,15 @@ export interface TaskFormProps {
    * an N-assignment run can spend up to N times this value.
    */
   maxCostUsd?: number;
+  /**
+   * FR-M11 opt-in, mirrored from `RunSettings.reviewTeam` (`useSettings.ts`)
+   * the same way the two budgets above are: a prop rather than the whole
+   * settings object, so this component stays testable/renderable without
+   * `useSettings` itself. Absent — not `false` — means "don't ask to
+   * review the team", matching `CreateRunRequestSchema.reviewTeam`'s own
+   * "opt-in, absent means no".
+   */
+  reviewTeam?: boolean;
   /** True when the current settings are unusable; blocks the submit. */
   settingsInvalid: boolean;
   /**
@@ -75,7 +84,7 @@ export interface TaskFormProps {
  */
 type RunSettingsSlice = Pick<
   TaskFormProps,
-  'provider' | 'concurrency' | 'assignmentTimeoutMs' | 'runTokenBudget' | 'maxCostUsd'
+  'provider' | 'concurrency' | 'assignmentTimeoutMs' | 'runTokenBudget' | 'maxCostUsd' | 'reviewTeam'
 >;
 
 /**
@@ -102,6 +111,11 @@ export function buildCreateRunRequest(task: string, settings: RunSettingsSlice):
     // time rather than round-trip to the server to discover.
     ...(settings.runTokenBudget === undefined ? {} : { tokenBudget: settings.runTokenBudget }),
     ...(settings.maxCostUsd === undefined ? {} : { maxCostUsd: settings.maxCostUsd }),
+    // Only forwarded when actually `true` — an absent or `false` setting
+    // must produce an absent key, not `reviewTeam: false`, for the same
+    // `exactOptionalPropertyTypes` reason the two budgets above are spread
+    // conditionally rather than assigned directly.
+    ...(settings.reviewTeam === true ? { reviewTeam: true } : {}),
   };
 }
 
@@ -112,6 +126,7 @@ export function TaskForm({
   assignmentTimeoutMs,
   runTokenBudget,
   maxCostUsd,
+  reviewTeam,
   settingsInvalid,
   blockedReason,
   busy,
@@ -143,6 +158,7 @@ export function TaskForm({
         assignmentTimeoutMs,
         ...(runTokenBudget === undefined ? {} : { runTokenBudget }),
         ...(maxCostUsd === undefined ? {} : { maxCostUsd }),
+        ...(reviewTeam === undefined ? {} : { reviewTeam }),
       }),
     )
       .then(() => setTask(''))

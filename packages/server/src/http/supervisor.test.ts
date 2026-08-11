@@ -379,6 +379,145 @@ describe('RunSupervisor cancellation (FR-M9)', () => {
   });
 });
 
+describe('RunSupervisor team approval (FR-M11)', () => {
+  it('parks a reviewTeam run at awaiting_approval with the proposed plan already visible, and releases it on an empty decision', async () => {
+    // This is the whole point of the pause: a client that reconnects or
+    // subscribes while the run is parked has to be able to render the
+    // Manager's proposed team, not an empty plan waiting for one to appear.
+    // `run.plan`/`run.assignments` are stamped by `runner.ts` and persisted
+    // via the `awaiting_approval` transition itself, before anything is
+    // awaited, so they must already be on the state this test reads.
+    const { supervisor } = makeSupervisor();
+
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.', reviewTeam: true });
+    await waitFor(async () => (await supervisor.getRunState(runId)).status === 'awaiting_approval', 'the run to park for team approval');
+
+    const parked = await supervisor.getRunState(runId);
+    expect(parked.plan).toBeDefined();
+    expect(parked.plan?.phases.length).toBeGreaterThan(0);
+    expect(parked.assignments).toHaveLength(3);
+    // Still "live" from the supervisor's point of view: nothing here has
+    // finished, it is only waiting on a human rather than a provider — the
+    // same fact `cancelRun`/`shutdown` below lean on to abort a parked run.
+    expect(supervisor.isLive(runId)).toBe(true);
+
+    // An empty array is a meaningful decision, not a no-op skipped by the
+    // route or the runner — see `TeamDecisionSchema`'s own doc comment.
+    expect(supervisor.submitTeamDecision(runId, [])).toBe(true);
+
+    const finished = await waitForTerminal(supervisor, runId);
+    expect(finished.status).toBe('done');
+    expect(finished.assignments).toHaveLength(3);
+  });
+
+  it('applies an approved edit to the team before dispatch, so a drop actually removes the work', async () => {
+    // Proves the wiring end to end, not just that the promise unblocks:
+    // `submitTeamDecision`'s operations have to reach `applyTeamOperations`
+    // inside `runner.ts` and change what gets materialised into assignments,
+    // or FR-M11 would let a user "approve" edits that are silently discarded.
+    const { supervisor } = makeSupervisor();
+
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.', reviewTeam: true });
+    await waitFor(async () => (await supervisor.getRunState(runId)).status === 'awaiting_approval', 'the run to park for team approval');
+
+    expect(supervisor.submitTeamDecision(runId, [{ op: 'drop', assignmentId: 'review-2' }])).toBe(true);
+
+    const finished = await waitForTerminal(supervisor, runId);
+    expect(finished.status).toBe('done');
+    expect(finished.assignments.map((assignment) => assignment.id)).not.toContain('review-2');
+    expect(finished.assignments).toHaveLength(2);
+  });
+
+  it('never pauses when the request did not ask for a review, so every pre-FR-M11 caller is unaffected', async () => {
+    // `reviewTeam` is opt-in (see `CreateRunRequestSchema`'s doc comment); a
+    // run that omits it must never be observed at `awaiting_approval`, or
+    // every existing caller — the CLI, every other fixture in this file —
+    // would have quietly grown an extra pause it never asked for.
+    const { supervisor } = makeSupervisor();
+    const statuses: string[] = [];
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.' });
+    supervisor.subscribe(runId, (message) => {
+      if (message.t === 'state') statuses.push(message.run.status);
+    });
+
+    await waitForTerminal(supervisor, runId);
+
+    expect(statuses).not.toContain('awaiting_approval');
+  });
+
+  it('reports false for a decision on a run that never asked to pause', async () => {
+    const { supervisor } = makeSupervisor();
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.' });
+    await waitForTerminal(supervisor, runId);
+
+    // The HTTP route turns this into a 409: the run exists, it simply has
+    // nothing parked to resolve, and approving it must not silently do
+    // nothing while implying success.
+    expect(supervisor.submitTeamDecision(runId, [])).toBe(false);
+  });
+
+  it('reports false for a decision on a run id that does not exist at all', () => {
+    // The route's 404 case: `submitTeamDecision` cannot tell "unknown run"
+    // apart from "known but not parked" on its own (see its doc comment) — it
+    // is the caller's job to have already loaded the run — but either way it
+    // must refuse rather than throw.
+    const { supervisor } = makeSupervisor();
+    expect(supervisor.submitTeamDecision('20260101-000000-zzzz', [])).toBe(false);
+  });
+
+  it('refuses a second decision for the same run, rather than resolving or crashing twice', async () => {
+    // Exactly-once. A client double-clicking Approve, or a retry after a
+    // dropped response, must not be able to resolve the same parked promise
+    // twice — `PendingTeamApproval.resolve`'s `settled` guard is what this
+    // pins down from the outside.
+    const { supervisor } = makeSupervisor();
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.', reviewTeam: true });
+    await waitFor(async () => (await supervisor.getRunState(runId)).status === 'awaiting_approval', 'the run to park for team approval');
+
+    expect(supervisor.submitTeamDecision(runId, [])).toBe(true);
+    expect(supervisor.submitTeamDecision(runId, [])).toBe(false);
+
+    await waitForTerminal(supervisor, runId);
+  });
+
+  it('cancels a parked run cleanly and leaves nothing pending for a later decision to resolve', async () => {
+    // DEFECT THIS PREVENTS: without an abort listener inside
+    // `awaitTeamApproval`, cancelling a run parked here would call
+    // `entry.controller.abort()` and nothing downstream would ever notice —
+    // the promise `executeRun` is awaiting would sit unsettled forever, the
+    // background task would never reach its `finally`, and `pendingTeamApprovals`
+    // would keep an entry alive for a run that no longer exists as far as the
+    // rest of the supervisor is concerned.
+    const { supervisor } = makeSupervisor();
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.', reviewTeam: true });
+    await waitFor(async () => (await supervisor.getRunState(runId)).status === 'awaiting_approval', 'the run to park for team approval');
+
+    expect(supervisor.cancelRun(runId)).toBe(true);
+
+    const finished = await waitForTerminal(supervisor, runId);
+    expect(finished.status).toBe('cancelled');
+    // Nothing left to resolve: the abort already tore the pending entry down,
+    // so a decision arriving late (a slow client, an in-flight request that
+    // lost the race) is refused instead of reviving a run that is over.
+    expect(supervisor.submitTeamDecision(runId, [])).toBe(false);
+  });
+
+  it('does not hang shutdown when a run is parked awaiting approval', async () => {
+    // `shutdown()` awaits every in-flight background task. Before the abort
+    // listener existed, a parked run's task would never settle, and this
+    // `await supervisor.shutdown()` would hang for the lifetime of the test
+    // process rather than failing fast with a useful message.
+    const { supervisor } = makeSupervisor();
+    const runId = await supervisor.startRun({ task: 'Analyse the thing.', reviewTeam: true });
+    await waitFor(async () => (await supervisor.getRunState(runId)).status === 'awaiting_approval', 'the run to park for team approval');
+
+    await supervisor.shutdown();
+
+    expect(supervisor.liveRunIds()).toEqual([]);
+    expect((await supervisor.getRunState(runId)).status).toBe('cancelled');
+  });
+});
+
 describe('RunSupervisor.reconcileCrashedRuns (NFR-2, server restart)', () => {
   it('marks a run left non-terminal by a crash as failed, instead of leaving it running forever', async () => {
     const store = new MemoryRunStore();

@@ -61,6 +61,13 @@ export const STATUS_TOKEN: Record<AnyStatus, StatusToken> = {
   // universal "not moving, not broken either" colour.
   dispatching: 'statusWaiting',
   blocked: 'statusWaiting',
+  // FR-M11, and the clearest case this bucket has: the run is parked because it
+  // is waiting on *you*. Amber rather than the violet of `planning`, because the
+  // difference the user has to read at a glance is "the Manager is thinking"
+  // versus "the Manager is done thinking and nothing will happen until you
+  // look" — and a run that sat in the thinking colour while actually blocked on
+  // a human would be the badge lying about who is holding the run up.
+  awaiting_approval: 'statusWaiting',
 
   // Doing the work — the accent hue, because this is the state the whole
   // office exists to show.
