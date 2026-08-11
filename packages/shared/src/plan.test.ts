@@ -123,6 +123,50 @@ describe('RunPlanSchema', () => {
 
     expect(RunPlanSchema.safeParse(plan).success).toBe(false);
   });
+
+  // --- Defect (SEC-08): the schema validated assignment id uniqueness and
+  // dependency direction but never checked whether two assignments target
+  // the same `deliverable`. The dispatcher writes each assignment's report
+  // with `store.writeReport(deliverable, ...)`, so two assignments sharing
+  // a path is last-writer-wins: one assignment's findings are silently
+  // overwritten on disk and the merged report presents the survivor's
+  // content under the *other* assignment's name and objective — a false
+  // attribution with no error anywhere to reveal it happened.
+
+  it('rejects two assignments in different phases that share a deliverable path', () => {
+    const plan = validPlan();
+    // Both assignments now write "reports/01-security-auditor.md" — the
+    // second phase's write silently clobbers the first's on disk.
+    plan.phases[1]!.assignments[0]!.deliverable = 'reports/01-security-auditor.md';
+
+    const result = RunPlanSchema.safeParse(plan);
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).toContain('already claimed by assignment');
+    expect(JSON.stringify(result)).toContain('audit');
+  });
+
+  it('rejects two assignments in the same phase that share a deliverable path', () => {
+    const plan = validPlan();
+    plan.phases[0]!.assignments.push({
+      id: 'second-audit',
+      agentName: 'qa-expert',
+      objective: 'Also check tests.',
+      // Collides with the phase's existing "audit" assignment.
+      deliverable: 'reports/01-security-auditor.md',
+      dependsOn: [],
+    });
+
+    const result = RunPlanSchema.safeParse(plan);
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).toContain('already claimed by assignment');
+    expect(JSON.stringify(result)).toContain('audit');
+  });
+
+  it('accepts a plan where every assignment has a distinct deliverable', () => {
+    // Pins that the new check does not false-positive on the ordinary case
+    // — the existing `validPlan()` fixture already has two distinct paths.
+    expect(RunPlanSchema.safeParse(validPlan()).success).toBe(true);
+  });
 });
 
 describe('plan helpers', () => {

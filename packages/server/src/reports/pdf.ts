@@ -544,14 +544,68 @@ async function raceExit(
  *   server host that may have neither a display nor a usable GPU driver.
  * - `--no-sandbox` — required to get a working `--print-to-pdf` on this
  *   machine (see the module doc comment's captured command); without it the
- *   run failed outright in the verifying experiment. This does trade away
- *   Chromium's OS-level process sandbox, which is a real cost worth naming
- *   rather than hiding in a flag list — but the only page this process ever
- *   navigates to is HTML this same server just generated from the run's own
- *   synthesis and appendices (never a third-party or user-supplied URL), so
- *   the thing the sandbox would protect against — hostile page content — is
- *   not the threat model here. `--user-data-dir` below still isolates the
- *   process from the user's real browser profile regardless.
+ *   run failed outright in the verifying experiment, so this flag cannot
+ *   simply be dropped without breaking PDF export for everyone (AO-7).
+ *
+ *   The justification that used to live here — that the only page this
+ *   process navigates to is "server-generated and therefore not hostile" —
+ *   was wrong, and AO-7 is that finding. `document.ts`'s own doc comment
+ *   states the opposite plainly: "everything that reaches this file is
+ *   untrusted. The task is user input; agent names, objectives and report
+ *   bodies are model output." The escaping layer in `document.ts`
+ *   (`escapeHtml`, applied to every interpolated value; `renderMarkdown`
+ *   escaping raw HTML in report bodies) is real and was verified — no `<a>`,
+ *   no `<img>`, no way for a report to inject markup into the document's own
+ *   structure — but that is a defense in the *content*, not a property of
+ *   *how it got here*. It defends against the page containing attacker HTML;
+ *   it says nothing about a bug in Chromium's own HTML/CSS/font parser being
+ *   tripped by adversarial-but-still-just-text model output before escaping
+ *   even matters, which is exactly the class of exploit the OS sandbox
+ *   exists to contain. So `--no-sandbox` does trade away a real defense
+ *   against a real, present threat model, not a hypothetical one.
+ *
+ *   Given that removing the flag outright is not available (it breaks
+ *   rendering) and rebuilding sandbox support was out of scope for this fix,
+ *   the mitigation applied instead is to remove everywhere a compromised,
+ *   sandbox-less renderer could usefully go: `--host-resolver-rules`,
+ *   `--disable-extensions` and `--disable-remote-fonts` below. None of these
+ *   restore the process-level sandbox; they shrink what a renderer that
+ *   somehow got arbitrary behaviour out of a parser bug could do with it, on
+ *   a page that never legitimately needs the network at all (FR-P3: "fully
+ *   offline — inlined CSS and fonts, no CDN requests").
+ * - `--host-resolver-rules="MAP * ~NOTFOUND"` — forces every DNS lookup this
+ *   Chromium process makes to fail, unconditionally. A `file://` report has
+ *   no legitimate reason to resolve any hostname; this removes the network
+ *   as a destination for exfiltration or callback even if page content were
+ *   able to trigger a request some other way (a bug in the renderer, a
+ *   future regression in the escaping layer, a resource reference the
+ *   escaping did not anticipate). It does not need a matching allow-rule for
+ *   anything, because the input is `file:///...`, not a URL that itself
+ *   needs resolving.
+ * - `--disable-extensions` — a fresh `--user-data-dir` (below) has no
+ *   extensions installed regardless, so this is not covering a gap the
+ *   profile isolation leaves open; it is here because "no extension APIs are
+ *   reachable" should not depend on "no extension happens to be present in
+ *   this profile" remaining true forever as this code or its defaults
+ *   change.
+ * - `--disable-remote-fonts` — FR-P3 requires the report to be fully offline
+ *   with inlined fonts already, so a remote `@font-face` should never appear;
+ *   this makes that a hard rule Chromium enforces rather than an assumption
+ *   about what `document.ts` currently emits, closing off `@font-face` as
+ *   another network-request avenue on top of the DNS block above.
+ *
+ *   Follow-up, deliberately not done here: re-testing whether Chromium's
+ *   sandbox can run at all under `--headless=new` on a current Chrome build
+ *   (the captured experiment predates that mode, and headless-mode sandbox
+ *   support has shifted across Chrome versions) is separate work from this
+ *   fix. It needs its own experiment on this machine — the same way the
+ *   original `--no-sandbox` requirement was established by running the
+ *   command directly rather than by reasoning about it — and mixing that
+ *   experiment into a security patch would risk shipping an unverified
+ *   rendering regression alongside the isolation flags above, which are
+ *   low-risk (network denial cannot itself break a `file://`, offline,
+ *   font-inlined render) and independently justified regardless of what that
+ *   follow-up finds.
  * - `--no-pdf-header-footer` — Chromium's default print header/footer stamps
  *   the page URL and a timestamp into the margins; for a `file:///...` input
  *   that URL is a local temp path, which has no business appearing in a
@@ -613,6 +667,13 @@ export async function renderPdf(
       '--headless',
       '--disable-gpu',
       '--no-sandbox',
+      // AO-7 network isolation — see the doc comment above for the full
+      // justification. These do not restore the OS sandbox `--no-sandbox`
+      // trades away; they remove the network as a destination reachable
+      // from the page these flags render, which never legitimately needs it.
+      '--host-resolver-rules=MAP * ~NOTFOUND',
+      '--disable-extensions',
+      '--disable-remote-fonts',
       '--no-pdf-header-footer',
       '--run-all-compositor-stages-before-draw',
       `--virtual-time-budget=${VIRTUAL_TIME_BUDGET_MS}`,

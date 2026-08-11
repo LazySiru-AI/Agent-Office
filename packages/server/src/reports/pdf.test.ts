@@ -449,6 +449,47 @@ describe('renderPdf — fake browser', () => {
     ).rejects.toThrow(new RegExp(CHROME_BIN_ENV_VAR));
   });
 
+  it('launches with the AO-7 network-isolation flags on every render, in addition to (not instead of) --no-sandbox', async () => {
+    // Regression guard for AO-7: `--no-sandbox` is kept — see the doc comment
+    // on `renderPdf` for why it cannot simply be removed — but a compromised,
+    // sandbox-less renderer processing untrusted model output (`document.ts`:
+    // "everything that reaches this file is untrusted") should still have
+    // nowhere to go. If any of these three flags silently dropped out of the
+    // launch args in a future edit, this is the test that would catch it.
+    let capturedArgs: string[] = [];
+    const outputPath = path.join(tmpRoot, 'flags', 'report.pdf');
+
+    await renderPdf(
+      { kind: 'html', html: '<html><body>hello</body></html>' },
+      outputPath,
+      {
+        deps: {
+          spawn: (spawnOptions) => {
+            capturedArgs = spawnOptions.args;
+            return fakeBrowserSpawn('write-pdf')(spawnOptions);
+          },
+          resolveBrowser: async () => fakeBrowser,
+        },
+      },
+    );
+
+    // DNS denied outright — a `file://` report never legitimately needs to
+    // resolve a hostname, so this removes the network as an exfiltration or
+    // callback destination even if page content somehow triggered a request.
+    expect(capturedArgs).toContain('--host-resolver-rules=MAP * ~NOTFOUND');
+    // No extension APIs reachable, independent of whether the fresh
+    // `--user-data-dir` profile happens to have any installed.
+    expect(capturedArgs).toContain('--disable-extensions');
+    // FR-P3 requires fonts to already be inlined; this turns "no remote
+    // @font-face should appear" into a rule Chromium enforces rather than an
+    // assumption about what `document.ts` currently emits.
+    expect(capturedArgs).toContain('--disable-remote-fonts');
+    // Still present: removing it breaks `--print-to-pdf` outright on this
+    // machine (the module doc comment's captured experiment) — these three
+    // are an addition to the launch args, not a replacement for it.
+    expect(capturedArgs).toContain('--no-sandbox');
+  });
+
   it('rejects a missing input file before ever spawning a browser', async () => {
     const missingInput = path.join(tmpRoot, 'does-not-exist.html');
     const outputPath = path.join(tmpRoot, 'from-missing.pdf');

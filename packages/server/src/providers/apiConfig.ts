@@ -83,13 +83,21 @@ export interface ResolveConfigOptions {
  *
  *   <PROVIDER>_API_KEY     the key. No default; absent means unavailable.
  *   <PROVIDER>_BASE_URL    endpoint override, for proxies and for the fake
- *                          server the tests run against.
+ *                          server the tests run against. Validated by
+ *                          {@link validateBaseUrl} (AO-9) before use: this
+ *                          becomes the origin a request carrying `apiKey`
+ *                          is sent to, so an unchecked value here is a key
+ *                          exfiltration path, not just a routing knob.
  *   <PROVIDER>_MODEL       model override.
  *   AGENT_OFFICE_MAX_OUTPUT_TOKENS   applies to every provider.
  *
  * Returns `undefined` for the key when it is absent rather than throwing:
  * `isAvailable()` is the place that turns a missing key into a message a user
  * can act on, and throwing here would make a preflight check into a crash.
+ * The base URL is held to a stricter standard than the key: an absent key is
+ * an ordinary, expected state (not every provider is configured), but a base
+ * URL that resolves to something dangerous is a misconfiguration that should
+ * fail immediately rather than quietly send credentials somewhere unintended.
  */
 export function resolveApiConfig(
   id: ApiProviderId,
@@ -108,11 +116,17 @@ export function resolveApiConfig(
   const overriddenModel = options.overrides?.model;
   const envModel = env[`${prefix}_MODEL`];
 
+  const rawBaseUrl = options.overrides?.baseUrl ?? env[`${prefix}_BASE_URL`] ?? defaults.baseUrl;
+  const envVarName = `${prefix}_BASE_URL`;
+  // Overrides come from the settings UI, not the environment, so a bad value
+  // there is validated the same way — see `validateBaseUrl`'s doc comment for
+  // why "which var name to name in the error" still matters even though an
+  // override did not literally come from `env[envVarName]`.
+  const baseUrl = stripTrailingSlash(validateBaseUrl(rawBaseUrl, envVarName));
+
   return {
     apiKey: options.overrides?.apiKey ?? env[defaults.keyVar] ?? '',
-    baseUrl: stripTrailingSlash(
-      options.overrides?.baseUrl ?? env[`${prefix}_BASE_URL`] ?? defaults.baseUrl,
-    ),
+    baseUrl,
     model: overriddenModel ?? envModel ?? defaults.model,
     modelSource:
       overriddenModel !== undefined ? 'override' : envModel !== undefined ? 'environment' : 'default',
@@ -257,4 +271,106 @@ export function describeConfig(config: ApiProviderConfig): string {
 
 function stripTrailingSlash(url: string): string {
   return url.endsWith('/') ? url.slice(0, -1) : url;
+}
+
+/** Loopback hostnames a local model server (Ollama, LM Studio, …) is reachable on. */
+const LOOPBACK_HOSTNAMES = new Set(['127.0.0.1', '::1', 'localhost']);
+
+/**
+ * Validate a `<PROVIDER>_BASE_URL` value before it is ever used as the origin
+ * for a request that carries `x-api-key` / `Bearer` credentials (AO-9).
+ *
+ * `resolveApiConfig` used to pass this value through `stripTrailingSlash` and
+ * nowhere else — an operator (or, per the AO-1 finding, anything that can
+ * write `.env`) could point a provider's requests at any host at all, and the
+ * key would go with them. `https://` is accepted for any host: TLS means
+ * neither the key nor the response can be read in transit even if the host
+ * turns out to be the wrong one. `http://` is accepted only for loopback
+ * (`127.0.0.1`, `::1`, `localhost`) — local model servers such as Ollama and
+ * LM Studio are a real, common setup that only ever speaks plain HTTP on the
+ * machine's own loopback interface, and rejecting them would break a
+ * legitimate workflow in order to close a threat loopback traffic does not
+ * present: it never reaches a network link, so there is nothing on the wire
+ * to intercept and nowhere for a key to be exfiltrated to. `http://` to any
+ * other host is rejected outright — it would hand the key and the request
+ * body to whatever is listening at that address in the clear, and to
+ * whatever a DNS answer resolves the hostname to, which the person setting
+ * the variable does not control.
+ *
+ * Three more things a URL can smuggle, each rejected explicitly rather than
+ * left to accident:
+ *   - a scheme other than `http:`/`https:` (`file:`, `javascript:`, `data:`,
+ *     an unrecognised custom scheme, …) — this value is only ever used as a
+ *     `fetch` request origin, so anything else is either inert or a sign the
+ *     variable does not hold what its name says it does.
+ *   - a URL that parses but names no host — there is nothing to send a
+ *     request to, and silently falling back to the provider default would
+ *     hide a real misconfiguration rather than report it. In practice the
+ *     WHATWG `URL` parser already refuses to produce an empty host for
+ *     `http:`/`https:` (it throws instead, landing in the catch above), so
+ *     this check is defence-in-depth against that guarantee changing or
+ *     being relied on incorrectly, not a path exercised by any input found
+ *     during this fix.
+ *   - userinfo embedded in the URL (`https://user:pass@host`) — the host a
+ *     reader *sees* is not reliably the host a request actually reaches
+ *     (`https://api.anthropic.com@attacker.example` sends the request to
+ *     `attacker.example`), which is the classic URL-phishing trick, and it
+ *     has no legitimate use here: a proxy that needs credentials takes them
+ *     in a header, not embedded in the origin.
+ *
+ * Throws rather than returning a sentinel or silently falling back to the
+ * default: a misconfigured base URL should fail loudly at config-resolution
+ * time with a message naming the exact variable, not surface later as "why
+ * did my key end up at attacker.example" with nothing pointing at the cause.
+ */
+export function validateBaseUrl(rawValue: string, envVarName: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawValue);
+  } catch {
+    throw new Error(
+      `${envVarName} is set to "${rawValue}", which is not a valid URL. Set it to a full origin such as ` +
+        '"https://api.example.com" or, for a local model server, "http://127.0.0.1:PORT".',
+    );
+  }
+
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(
+      `${envVarName} is set to "${rawValue}", which uses the "${parsed.protocol}" scheme. Only https:// ` +
+        '(any host) and http:// (loopback only) are accepted.',
+    );
+  }
+
+  if (parsed.hostname === '') {
+    throw new Error(`${envVarName} is set to "${rawValue}", which names no host to send requests to.`);
+  }
+
+  if (parsed.username !== '' || parsed.password !== '') {
+    throw new Error(
+      `${envVarName} is set to "${rawValue}", which embeds credentials in the URL itself. This is rejected ` +
+        'because the visible host is not reliably the host a request actually reaches; if a proxy needs ' +
+        'credentials, supply them via a header, not the URL.',
+    );
+  }
+
+  if (parsed.protocol === 'https:') {
+    return rawValue;
+  }
+
+  // A bracketed IPv6 literal keeps its brackets in `URL#hostname` (e.g.
+  // "[::1]"), unlike every other host form — stripped here so the loopback
+  // set only has to name the bare address once.
+  const bareHostname =
+    parsed.hostname.startsWith('[') && parsed.hostname.endsWith(']')
+      ? parsed.hostname.slice(1, -1)
+      : parsed.hostname;
+  if (LOOPBACK_HOSTNAMES.has(bareHostname.toLowerCase())) {
+    return rawValue;
+  }
+
+  throw new Error(
+    `${envVarName} is set to "${rawValue}", which uses plain http:// to a non-loopback host. This would send ` +
+      'the API key in the clear to that host. Use https://, or http:// only to 127.0.0.1, ::1, or localhost ' +
+      'for a local model server (e.g. Ollama, LM Studio).',
+  );
 }

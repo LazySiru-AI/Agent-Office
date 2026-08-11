@@ -6,6 +6,7 @@ import {
   isApiProviderId,
   resolveAgentModel,
   resolveApiConfig,
+  validateBaseUrl,
   type ApiProviderConfig,
   type ApiProviderId,
 } from './apiConfig.js';
@@ -93,6 +94,96 @@ describe('resolveApiConfig — environment', () => {
   it('honours a valid output-token cap', () => {
     const config = resolveApiConfig('openai', { env: { AGENT_OFFICE_MAX_OUTPUT_TOKENS: '2048' } });
     expect(config.maxOutputTokens).toBe(2048);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AO-9: `<PROVIDER>_BASE_URL` becomes the origin a request carrying the API
+// key is sent to. Wired through `resolveApiConfig` (below) so this cannot be
+// bypassed by any caller that goes through the normal config path, and
+// exercised directly against `validateBaseUrl` (further below) for the
+// per-case error text, since asserting exact wording through `resolveApiConfig`
+// for every case would just be indirection.
+// ---------------------------------------------------------------------------
+
+describe('resolveApiConfig — base URL validation (AO-9)', () => {
+  it('accepts https:// to any host — prevents a regression that would block ordinary provider/proxy use', () => {
+    const config = resolveApiConfig('openai', { env: { OPENAI_BASE_URL: 'https://my-proxy.example.com' } });
+    expect(config.baseUrl).toBe('https://my-proxy.example.com');
+  });
+
+  it('accepts http:// to loopback — prevents a regression that would break local model servers (Ollama, LM Studio)', () => {
+    for (const host of ['http://127.0.0.1:11434', 'http://localhost:1234', 'http://[::1]:8080']) {
+      const config = resolveApiConfig('openai', { env: { OPENAI_BASE_URL: host } });
+      expect(config.baseUrl).toBe(host);
+    }
+  });
+
+  it('rejects http:// to a non-loopback host — this is the exfiltration path AO-9 exists to close: a plain-http base URL would send the key in the clear to any host an operator (or a compromised .env write) names', () => {
+    expect(() => resolveApiConfig('openai', { env: { OPENAI_BASE_URL: 'http://attacker.example' } })).toThrow(
+      /OPENAI_BASE_URL/,
+    );
+    expect(() => resolveApiConfig('openai', { env: { OPENAI_BASE_URL: 'http://attacker.example' } })).toThrow(
+      /non-loopback/,
+    );
+  });
+
+  it('the error names the specific variable that was misconfigured, not a generic message — prevents a fix from being blocked by "which provider even set this"', () => {
+    expect(() => resolveApiConfig('deepseek', { env: { DEEPSEEK_BASE_URL: 'http://evil.test' } })).toThrow(
+      /DEEPSEEK_BASE_URL/,
+    );
+    expect(() => resolveApiConfig('anthropic', { env: { ANTHROPIC_BASE_URL: 'http://evil.test' } })).toThrow(
+      /ANTHROPIC_BASE_URL/,
+    );
+  });
+
+  it('validates an explicit override the same way as an environment value — the settings UI is not a bypass', () => {
+    expect(() =>
+      resolveApiConfig('anthropic', { env: NO_ENV, overrides: { baseUrl: 'http://attacker.example' } }),
+    ).toThrow(/ANTHROPIC_BASE_URL/);
+  });
+});
+
+describe('validateBaseUrl', () => {
+  const VAR = 'ANTHROPIC_BASE_URL';
+
+  it('accepts https:// regardless of host', () => {
+    expect(validateBaseUrl('https://api.anthropic.com', VAR)).toBe('https://api.anthropic.com');
+    expect(validateBaseUrl('https://some-proxy.internal:8443', VAR)).toBe('https://some-proxy.internal:8443');
+  });
+
+  it('accepts http:// to exactly the three loopback forms named in the fix, case-insensitively for the hostname', () => {
+    expect(validateBaseUrl('http://127.0.0.1:9999', VAR)).toBe('http://127.0.0.1:9999');
+    expect(validateBaseUrl('http://[::1]:9999', VAR)).toBe('http://[::1]:9999');
+    expect(validateBaseUrl('http://localhost:9999', VAR)).toBe('http://localhost:9999');
+    expect(validateBaseUrl('http://LOCALHOST:9999', VAR)).toBe('http://LOCALHOST:9999');
+  });
+
+  it('rejects http:// to a public host — this is the exact exploit AO-9 describes: a key sent in the clear to whatever the hostname resolves to', () => {
+    expect(() => validateBaseUrl('http://example.com', VAR)).toThrow(/non-loopback/);
+    expect(() => validateBaseUrl('http://93.184.216.34', VAR)).toThrow(/non-loopback/);
+  });
+
+  it('rejects a non-http(s) scheme — prevents this value from ever being used to smuggle something other than an HTTP request origin (e.g. `file:` reading local disk, `javascript:` in a context that might eval it)', () => {
+    expect(() => validateBaseUrl('file:///etc/passwd', VAR)).toThrow(/scheme/);
+    expect(() => validateBaseUrl('javascript:alert(1)', VAR)).toThrow(/scheme/);
+    expect(() => validateBaseUrl('ftp://example.com', VAR)).toThrow(/scheme/);
+  });
+
+  it('rejects userinfo embedded in the URL — prevents the classic "https://real-host@attacker.example" trick where the visible host is not the actual destination', () => {
+    expect(() => validateBaseUrl('https://api.anthropic.com@attacker.example', VAR)).toThrow(/credentials/);
+    expect(() => validateBaseUrl('https://user:pass@127.0.0.1:9999', VAR)).toThrow(/credentials/);
+  });
+
+  it('rejects a string that is not a URL at all, with a message pointing at how to fix it — this is also the path an empty-host URL like "http://" takes, since the WHATWG parser itself refuses to produce an empty host for http(s) and throws before validation even runs', () => {
+    expect(() => validateBaseUrl('not a url', VAR)).toThrow(/not a valid URL/);
+    expect(() => validateBaseUrl('http://', VAR)).toThrow(/not a valid URL/);
+  });
+
+  it('every rejection names the offending variable — prevents a misconfiguration report that does not say which setting to change', () => {
+    for (const bad of ['http://attacker.example', 'file:///x', 'https://a@b.example', 'http://', 'nope']) {
+      expect(() => validateBaseUrl(bad, 'DEEPSEEK_BASE_URL')).toThrow(/DEEPSEEK_BASE_URL/);
+    }
   });
 });
 

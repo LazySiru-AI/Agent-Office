@@ -88,6 +88,8 @@ export const RunPlanSchema = z
     const seenAssignmentIds = new Set<string>();
     // Assignment id -> index of the phase it lives in.
     const phaseOfAssignment = new Map<string, number>();
+    // deliverable path -> assignment id that first claimed it (SEC-08).
+    const seenDeliverables = new Map<string, string>();
 
     plan.phases.forEach((phase, phaseIndex) => {
       if (seenPhaseIds.has(phase.id)) {
@@ -109,6 +111,35 @@ export const RunPlanSchema = z
         }
         seenAssignmentIds.add(assignment.id);
         phaseOfAssignment.set(assignment.id, phaseIndex);
+
+        // SEC-08: two assignments targeting the same `reports/*.md` path is
+        // not merely untidy, it is silent data loss with a false
+        // attribution attached. The dispatcher writes each assignment's
+        // report with `store.writeReport(deliverable, ...)`, and two writes
+        // to the same path are last-writer-wins — whichever assignment
+        // finishes second overwrites the first's file on disk with no error
+        // from either side. The synthesis step then reads that one
+        // surviving file and presents it, under the *first* assignment's
+        // name and objective in the merged report, as if it were that
+        // assignment's own findings. The earlier assignment's actual work
+        // is not merely missing, it is invisibly replaced by someone else's
+        // — worse than a hole in the report, because nothing shows a hole
+        // exists. This check is the only backstop for that: it lives on the
+        // schema, not in the planner, because FR-M11's team-override path
+        // (`orchestrator/team.ts`) constructs deliverables of its own
+        // outside the normal planning turn, and a check placed only in the
+        // Manager's plan-generation prompt would never see plans built that
+        // way.
+        const existingOwner = seenDeliverables.get(assignment.deliverable);
+        if (existingOwner !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['phases', phaseIndex, 'assignments', assignmentIndex, 'deliverable'],
+            message: `deliverable "${assignment.deliverable}" is already claimed by assignment "${existingOwner}" — each assignment must write to its own file`,
+          });
+        } else {
+          seenDeliverables.set(assignment.deliverable, assignment.id);
+        }
       });
     });
 

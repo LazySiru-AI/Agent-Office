@@ -9,6 +9,44 @@ import { checkClaudeCodeAvailability, resolveClaudeBinaryCached } from './resolv
 import { resolveClaudeCodeTools, toArgvToken } from './tools.js';
 
 /**
+ * Whether this server may grant delegated agents an OS shell (audit finding
+ * AO-1).
+ *
+ * `tools.ts` denies the shell by default and takes an `allowShell` option to
+ * override it; this is the only thing in the product that sets it. Two
+ * decisions are worth stating, because both could reasonably have gone the
+ * other way.
+ *
+ * **Why the shell is denied at all.** The adapter grants a catalog agent's
+ * `Bash` request as the CLI's real shell built-in under
+ * `--permission-mode acceptEdits`, so shell commands ran without ever pausing
+ * for a human, with `cwd: workspaceDir` as the only containment — and `cwd`
+ * steers relative path resolution, nothing more, since a shell's first command
+ * can be `cd`. Meanwhile `ALWAYS_EXCLUDED_BUILTINS` withholds `EnterWorktree`
+ * precisely because it escapes `runs/<id>/workspace/`, calling that "a direct
+ * NFR-1 violation". Granting a shell, which subsumes that capability and every
+ * other withheld one, made the requirement mean two different things in one
+ * adapter. 114 of the 166 vendored agents request it.
+ *
+ * **Why an environment variable and not a run option.** This deliberately
+ * cannot be set through the HTTP API. NFR-6 relies on loopback as the trust
+ * boundary, and loopback is not a user boundary — any other local account or
+ * process can already `POST /api/runs`. A per-request `allowShell` would let
+ * anything that can reach the port grant itself an auto-approved shell running
+ * as this account, which converts a capability decision into a privilege
+ * escalation. A deployment-level switch is the honest shape for a control whose
+ * whole purpose is to bound what a request may ask for.
+ *
+ * Read per call rather than cached at module load, so a test (and an operator
+ * restarting the server) sees the current value rather than whatever was set
+ * when the module first happened to be imported.
+ */
+export function shellIsAllowed(): boolean {
+  const raw = process.env['AGENT_OFFICE_ALLOW_SHELL'];
+  return raw === '1' || raw?.toLowerCase() === 'true';
+}
+
+/**
  * The Claude Code CLI adapter (PLAN.md Phase 1).
  *
  * One child process per assignment, `--output-format stream-json` parsed as it
@@ -128,7 +166,7 @@ export class ClaudeCodeProvider implements AgentProvider {
       throw new ProviderUnavailableError(this.id, 'the Claude Code CLI could not be resolved');
     }
 
-    const tools = resolveClaudeCodeTools(request.allowedTools);
+    const tools = resolveClaudeCodeTools(request.allowedTools, { allowShell: shellIsAllowed() });
 
     // A dropped tool is a degraded run, not a failed one (NFR-8). The agent was
     // written expecting it, so the user should see that it is missing — but an

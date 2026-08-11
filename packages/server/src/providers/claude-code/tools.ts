@@ -71,19 +71,51 @@
  *
  * ## What gets excluded regardless of what the frontmatter asks for
  *
- * NFR-1 confines a run to `runs/<id>/workspace/`. A handful of the captured
- * built-ins are session-management, cross-session-communication or
- * scheduling primitives whose entire purpose is to reach OUTSIDE one run:
- * messaging other sessions, scheduling future work, switching the git
- * worktree the CLI is even looking at, or spawning further background tasks.
- * Granting any of those to a delegated catalog subagent would let it escape
- * both the workspace sandbox and FR-M5's context isolation (a leaf agent is
- * supposed to talk to the Manager via its report, not sideband). None of the
- * 154 catalog agents currently ask for these by name — the catalog vocabulary
- * predates and is unaware of this CLI's tool names — so this is defence in
- * depth against a future or hand-edited frontmatter, not a change in observed
- * behaviour today. See {@link ALWAYS_EXCLUDED_BUILTINS} for the list and the
- * per-tool reason.
+ * NFR-1 is supposed to confine a run to `runs/<id>/workspace/`. Be precise
+ * about how that confinement actually happens, because it is easy to overstate
+ * it: there is no OS-level jail here. The adapter runs the CLI with
+ * `cwd: workspaceDir` and this module withholds specific built-ins; that is
+ * the entire enforcement mechanism. `cwd` only steers relative-path resolution
+ * — it does not stop a process from opening an absolute path, and it does
+ * nothing at all once a process can execute arbitrary further commands (see
+ * the shell section immediately below, which is the sharpest case of this). A
+ * handful of the captured built-ins are session-management,
+ * cross-session-communication or scheduling primitives whose entire purpose is
+ * to reach OUTSIDE one run: messaging other sessions, scheduling future work,
+ * switching the git worktree the CLI is even looking at, or spawning further
+ * background tasks. Granting any of those to a delegated catalog subagent
+ * would let it escape both the workspace boundary and FR-M5's context
+ * isolation (a leaf agent is supposed to talk to the Manager via its report,
+ * not sideband). None of the 154 catalog agents currently ask for these by
+ * name — the catalog vocabulary predates and is unaware of this CLI's tool
+ * names — so this is defence in depth against a future or hand-edited
+ * frontmatter, not a change in observed behaviour today. See
+ * {@link ALWAYS_EXCLUDED_BUILTINS} for the list and the per-tool reason.
+ *
+ * ## The shell is not on that list, and that is the actual finding here
+ *
+ * A live shell subsumes every capability the tools above are withheld for: it
+ * can invoke the CLI's own cron/message/worktree commands, reach the network,
+ * or read and write anywhere the OS-level user account can reach, `cwd`
+ * notwithstanding — a shell's first command can be `cd`. Excluding
+ * `SendMessage` and `EnterWorktree` by name while handing out an unrestricted
+ * shell is defence in depth against everything except the one tool that makes
+ * the defence moot. Earlier versions of this module granted the shell
+ * (`PowerShell` on win32, the assumed `Bash` name on POSIX — see below)
+ * unconditionally to any agent whose frontmatter asked for `Bash`, which is
+ * 114 of the 154 catalog agents, `backend-developer` among them. That is
+ * withdrawn: the shell is now withheld by the same default-deny posture as
+ * {@link ALWAYS_EXCLUDED_BUILTINS}, unless the caller sets
+ * {@link ToolResolutionOptions.allowShell} to `true`.
+ *
+ * That is a deliberate product trade-off, recorded here so the next reader
+ * finds a decision rather than an oversight: the agents this adapter runs
+ * produce markdown reports (FR-M5's "report to the Manager" contract), not
+ * code changes landed on disk, so a shell is rarely load-bearing for the work
+ * this system actually asks agents to do. Denying it by default costs real
+ * capability for the minority of agents that do need one — and it is exactly
+ * one boolean, `allowShell`, for a caller who has a specific run that needs
+ * it back.
  *
  * ## The empty / all-dropped case
  *
@@ -176,10 +208,19 @@ export type GrantableTool = ClaudeCodeBuiltinTool | typeof ASSUMED_POSIX_SHELL_T
 /**
  * Built-ins that exist in the captured session but must never be handed to a
  * delegated catalog subagent, regardless of what its frontmatter requests.
- * Each reaches outside the single run's sandbox (NFR-1) or outside FR-M5's
+ * Each reaches outside the single run's boundary (NFR-1) or outside FR-M5's
  * "leaf agents report to the Manager, not sideband" isolation. Keyed by name
  * so {@link resolveClaudeCodeTools} can produce a specific reason per tool
  * rather than a generic "excluded".
+ *
+ * The shell tool (`PowerShell` / the assumed POSIX `Bash`) is deliberately
+ * NOT in this map, even though it is at least as capable of violating NFR-1
+ * as anything listed here — see the module doc's "shell is not on that list"
+ * section. It is withheld through the separate {@link ToolResolutionOptions.allowShell}
+ * opt-in instead of this always-on map, because unlike the tools below it has
+ * legitimate uses for some agents and a caller needs a way to ask for it back
+ * without hand-editing this file. Do not fold it into this map — that would
+ * remove the opt-in.
  */
 const ALWAYS_EXCLUDED_BUILTINS: ReadonlyMap<GrantableTool, string> = new Map([
   [
@@ -234,6 +275,15 @@ const ALWAYS_EXCLUDED_BUILTINS: ReadonlyMap<GrantableTool, string> = new Map([
 export type DropReason =
   /** A genuine Claude Code built-in that NFR-1/FR-M5 forbid granting to a subagent. */
   | 'unsafe-for-sandbox'
+  /**
+   * The requested name resolved to this session's shell built-in
+   * (`PowerShell` on win32, the assumed `Bash` on POSIX) and
+   * {@link ToolResolutionOptions.allowShell} was not set. Distinct from
+   * `unsafe-for-sandbox` because it is not an unconditional exclusion like
+   * {@link ALWAYS_EXCLUDED_BUILTINS} — it is a default the caller can
+   * override per resolution, not a standing prohibition.
+   */
+  | 'shell-not-allowed'
   /** Not a recognised built-in on this platform/version at all. */
   | 'not-a-builtin';
 
@@ -262,6 +312,23 @@ export interface ToolResolutionOptions {
    * branches can be asserted without spawning a second OS.
    */
   platform?: NodeJS.Platform;
+  /**
+   * Grants this session's shell built-in (`PowerShell` on win32, the assumed
+   * `Bash` on POSIX) when `true`. Defaults to `false`.
+   *
+   * The default is deny, not because a shell is uniquely dangerous among the
+   * captured built-ins — see the module doc's "shell is not on that list"
+   * section for why it is in fact the MOST capable of them — but because it
+   * is the one exclusion in this module for which some callers have a
+   * legitimate need, so it gets a caller-controlled opt-in instead of a
+   * standing entry in {@link ALWAYS_EXCLUDED_BUILTINS}. Leave this unset (or
+   * `false`) for the common case; set it `true` only for a specific run that
+   * a human or the calling code has decided needs shell access, e.g. because
+   * the requesting agent's job is not satisfiable by markdown-report output
+   * alone. This module does not decide when that is true — it only makes the
+   * decision possible and defaults it to the safer answer.
+   */
+  allowShell?: boolean;
 }
 
 export interface ToolResolution {
@@ -300,6 +367,12 @@ export function resolveClaudeCodeTools(
 ): ToolResolution {
   const platform = options.platform ?? process.platform;
   const shellTool: GrantableTool = platform === 'win32' ? WINDOWS_SHELL_TOOL : ASSUMED_POSIX_SHELL_TOOL;
+  // Deny-by-default: an unset `allowShell` must resolve to `false`, never to
+  // "grant everything", matching the fail-safe direction the empty/all-dropped
+  // case documents above. See ToolResolutionOptions.allowShell for why the
+  // shell gets this caller-controlled opt-in instead of a permanent entry in
+  // ALWAYS_EXCLUDED_BUILTINS.
+  const allowShell = options.allowShell ?? false;
 
   const grantedOrder: GrantableTool[] = [];
   const grantedSet = new Set<GrantableTool>();
@@ -314,6 +387,21 @@ export function resolveClaudeCodeTools(
         requested,
         reason: 'not-a-builtin',
         detail: `"${requested}" is not a Claude Code CLI built-in on this platform/version. Likely an MCP tool, a plugin-supplied tool, or a reference to another catalog agent — none of which this adapter can grant as a CLI --tools entry.`,
+      });
+      continue;
+    }
+
+    // Checked before ALWAYS_EXCLUDED_BUILTINS and independently of it: this
+    // covers BOTH the Bash-on-this-platform alias (`requested` was `Bash`,
+    // `builtin` became `shellTool` via the mapping above) and an agent naming
+    // the platform's real shell tool directly (`requested` was already
+    // `PowerShell` on win32). Either spelling reaches the same built-in, so
+    // either spelling must be denied the same way when `allowShell` is unset.
+    if (builtin === shellTool && !allowShell) {
+      dropped.push({
+        requested,
+        reason: 'shell-not-allowed',
+        detail: `"${requested}" resolves to the built-in "${builtin}", this session's shell tool, which is withheld by default: an unrestricted shell subsumes every capability ALWAYS_EXCLUDED_BUILTINS withholds above (it can reach other sessions, schedule work, switch worktrees, or spawn background tasks by invoking the CLI or OS directly) and is not confined by this run's cwd, since a shell's own first command can "cd" anywhere. Pass { allowShell: true } to resolveClaudeCodeTools for a run that genuinely needs one; the default is deny because this adapter's agents are expected to produce markdown reports, not run commands, so a shell is rarely load-bearing here.`,
       });
       continue;
     }

@@ -21,9 +21,16 @@ const REPO_ROOT = path.resolve(HERE, '..', '..', '..', '..', '..');
 
 describe('resolveClaudeCodeTools: real catalog tool strings', () => {
   // categories/04-quality-security/code-reviewer.md
+  //
+  // allowShell: true throughout this describe block because these tests are
+  // about the Bash<->PowerShell NAME mapping, which is orthogonal to whether
+  // the shell is granted at all — the allowShell gate has its own dedicated
+  // describe block below. Without opting in here, Bash would be dropped
+  // (reason: 'shell-not-allowed') rather than remapped, which is a different
+  // fact than the one these particular tests exist to pin down.
   it('resolves code-reviewer\'s tools, remapping Bash to PowerShell on win32', () => {
     const requested = ['Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep'];
-    const result = resolveClaudeCodeTools(requested, { platform: 'win32' });
+    const result = resolveClaudeCodeTools(requested, { platform: 'win32', allowShell: true });
 
     expect(result.resolved).toEqual(['Read', 'Write', 'Edit', 'PowerShell', 'Glob', 'Grep']);
     expect(result.dropped).toEqual([]);
@@ -33,7 +40,7 @@ describe('resolveClaudeCodeTools: real catalog tool strings', () => {
   });
 
   it('leaves Bash as Bash on a non-Windows platform (assumed, not verified)', () => {
-    const result = resolveClaudeCodeTools(['Read', 'Bash'], { platform: 'linux' });
+    const result = resolveClaudeCodeTools(['Read', 'Bash'], { platform: 'linux', allowShell: true });
 
     expect(result.resolved).toEqual(['Read', 'Bash']);
     const bashGrant = result.granted.find((g) => g.requested === 'Bash');
@@ -63,7 +70,9 @@ describe('resolveClaudeCodeTools: real catalog tool strings', () => {
       'chrome-mcp',
       'computer-use',
     ];
-    const result = resolveClaudeCodeTools(requested, { platform: 'win32' });
+    // allowShell: true — this test is about the two unknown-tool drops, not
+    // about the shell gate; without it Bash would add a third, unrelated drop.
+    const result = resolveClaudeCodeTools(requested, { platform: 'win32', allowShell: true });
 
     expect(result.resolved).toEqual(['Read', 'Write', 'Edit', 'PowerShell', 'Glob', 'Grep', 'WebSearch']);
     expect(result.dropped).toHaveLength(2);
@@ -76,7 +85,8 @@ describe('resolveClaudeCodeTools: real catalog tool strings', () => {
   // categories/06-developer-experience/visual-asset-generator.md
   it('resolves visual-asset-generator\'s tools, dropping the mcp__ tool without throwing', () => {
     const requested = ['Read', 'Write', 'Bash', 'mcp__prompt-to-asset'];
-    const result = resolveClaudeCodeTools(requested, { platform: 'win32' });
+    // allowShell: true — this test is about the mcp__ drop, not the shell gate.
+    const result = resolveClaudeCodeTools(requested, { platform: 'win32', allowShell: true });
 
     expect(result.resolved).toEqual(['Read', 'Write', 'PowerShell']);
     expect(result.dropped).toEqual([
@@ -116,7 +126,9 @@ describe('resolveClaudeCodeTools: real catalog tool strings', () => {
       'subagent-catalog:search',
       'subagent-catalog:fetch',
     ];
-    const result = resolveClaudeCodeTools(requested, { platform: 'win32' });
+    // allowShell: true — this test is about the six unknown-name drops, not
+    // the shell gate.
+    const result = resolveClaudeCodeTools(requested, { platform: 'win32', allowShell: true });
 
     expect(result.resolved).toEqual([
       'Read',
@@ -200,6 +212,122 @@ describe('resolveClaudeCodeTools: sandbox-unsafe built-ins are excluded regardle
   });
 });
 
+describe('resolveClaudeCodeTools: the shell (PowerShell/Bash) is opt-in via allowShell', () => {
+  it('denies PowerShell by default on win32, even naming it directly rather than via the Bash alias', () => {
+    // Prevents a regression to the pre-allowShell behaviour where PowerShell —
+    // a real entry in CLAUDE_CODE_BUILTIN_TOOLS that was never in
+    // ALWAYS_EXCLUDED_BUILTINS — was granted to anything that asked for it by
+    // name, not just to agents that went through the Bash alias.
+    const result = resolveClaudeCodeTools(['Read', 'PowerShell'], { platform: 'win32' });
+
+    expect(result.resolved).toEqual(['Read']);
+    expect(result.dropped).toHaveLength(1);
+    expect(result.dropped[0]).toMatchObject({ requested: 'PowerShell', reason: 'shell-not-allowed' });
+  });
+
+  it('denies the Bash alias by default on win32, so the remap no longer implies a grant', () => {
+    // Prevents the specific defect AO-1 was filed against: Bash used to be
+    // remapped to PowerShell AND granted unconditionally, which is how 114 of
+    // 154 catalog agents got an uncontained, auto-approved shell. Confirms the
+    // alias resolution still runs (the drop names the resolved builtin as
+    // "PowerShell", not "Bash") but the grant itself is now withheld.
+    const result = resolveClaudeCodeTools(['Read', 'Bash'], { platform: 'win32' });
+
+    expect(result.resolved).toEqual(['Read']);
+    const drop = result.dropped.find((d) => d.requested === 'Bash');
+    expect(drop).toMatchObject({ requested: 'Bash', reason: 'shell-not-allowed' });
+    expect(drop?.detail).toContain('PowerShell');
+  });
+
+  it('denies the assumed POSIX Bash shell tool by default too', () => {
+    // Prevents the deny-by-default gate from being wired to only the win32
+    // branch: the previous two tests exercise the alias remap, this one
+    // exercises the POSIX identity mapping (Bash stays Bash) landing on the
+    // same deny path rather than slipping through unchecked.
+    const result = resolveClaudeCodeTools(['Read', 'Bash'], { platform: 'linux' });
+
+    expect(result.resolved).toEqual(['Read']);
+    const drop = result.dropped.find((d) => d.requested === 'Bash');
+    expect(drop).toMatchObject({ requested: 'Bash', reason: 'shell-not-allowed' });
+  });
+
+  it('grants PowerShell on win32 when allowShell is set, whether requested via the Bash alias or by name', () => {
+    // Prevents allowShell from being hooked into only one of the two ways an
+    // agent can reach the shell built-in (resolveOneName's alias branch vs its
+    // direct BUILTIN_LOOKUP branch) — both must honour the same opt-in.
+    const viaAlias = resolveClaudeCodeTools(['Bash'], { platform: 'win32', allowShell: true });
+    expect(viaAlias.resolved).toEqual(['PowerShell']);
+    expect(viaAlias.dropped).toEqual([]);
+
+    const viaLiteralName = resolveClaudeCodeTools(['PowerShell'], { platform: 'win32', allowShell: true });
+    expect(viaLiteralName.resolved).toEqual(['PowerShell']);
+    expect(viaLiteralName.dropped).toEqual([]);
+  });
+
+  it('grants the assumed Bash shell tool on a POSIX platform when allowShell is set', () => {
+    // Prevents the opt-in from being accidentally scoped to win32 only, the
+    // POSIX-side mirror of the previous test.
+    const result = resolveClaudeCodeTools(['Read', 'Bash'], { platform: 'linux', allowShell: true });
+
+    expect(result.resolved).toEqual(['Read', 'Bash']);
+    expect(result.dropped).toEqual([]);
+  });
+
+  it('reports the shell denial through the same dropped channel as every other withheld tool, with a reason', () => {
+    // Prevents a silent drop: provider.ts turns every entry in `dropped` into
+    // a non-fatal error event for free, which is the whole reason this needed
+    // no UI work. A test that checked only `resolved` would keep passing even
+    // if this stopped populating `dropped`, hiding a real behavioural change
+    // from every caller that relies on that channel.
+    const result = resolveClaudeCodeTools(['Bash'], { platform: 'win32' });
+
+    expect(result.dropped).toHaveLength(1);
+    expect(result.dropped[0]?.reason).toBe('shell-not-allowed');
+    expect(result.dropped[0]?.detail).toContain('allowShell');
+  });
+
+  it('an agent whose only requested tool is the shell resolves to the explicit-empty form, not an omitted flag', () => {
+    // Prevents the highest-risk regression in this change. Denying the shell
+    // must still leave resolved === [] (so toArgvToken(resolved) === ''),
+    // which the caller passes explicitly as --tools "". If a shell-only
+    // request ever produced anything that led a caller to OMIT --tools
+    // instead, the CLI would fall back to its "default" built-in set — a
+    // silent grant-everything outcome, the exact opposite of the fail-safe
+    // direction the module doc's empty/all-dropped section requires.
+    const result = resolveClaudeCodeTools(['Bash'], { platform: 'win32' });
+
+    expect(result.resolved).toEqual([]);
+    expect(result.granted).toEqual([]);
+    expect(toArgvToken(result.resolved)).toBe('');
+  });
+
+  it('leaves the always-excluded built-ins excluded regardless of allowShell', () => {
+    // Prevents allowShell from being implemented as a general "trust this run
+    // more" switch that loosens ALWAYS_EXCLUDED_BUILTINS along with it — the
+    // two gates are independent, and this is the test that would fail if they
+    // were accidentally collapsed into one.
+    const result = resolveClaudeCodeTools(['SendMessage', 'Bash'], { platform: 'win32', allowShell: true });
+
+    expect(result.resolved).toEqual(['PowerShell']);
+    expect(result.dropped).toEqual([
+      {
+        requested: 'SendMessage',
+        reason: 'unsafe-for-sandbox',
+        detail: expect.stringContaining('SendMessage'),
+      },
+    ]);
+  });
+
+  it('defaults allowShell to false when options is entirely omitted', () => {
+    // Prevents the default from only working when an options object is passed
+    // with allowShell left out — resolveClaudeCodeTools must also deny the
+    // shell when called with no second argument at all (the common call shape
+    // in provider.ts today, which passes only `request.allowedTools`).
+    const result = resolveClaudeCodeTools(['Bash']);
+    expect(result.dropped[0]?.reason).toBe('shell-not-allowed');
+  });
+});
+
 describe('resolveClaudeCodeTools: empty and all-dropped cases', () => {
   it('an empty request resolves to an empty set with no drops', () => {
     const result = resolveClaudeCodeTools([]);
@@ -272,18 +400,24 @@ describe('resolveClaudeCodeTools: against the real 154-agent registry', () => {
     let totalResolved = 0;
     let totalDroppedUnknown = 0;
     let totalDroppedUnsafe = 0;
+    let totalDroppedShell = 0;
     let agentsWithAtLeastOneTool = 0;
     let agentsWithZeroResolvedTools = 0;
     const bashAgents: string[] = [];
 
     for (const agent of registry.agents) {
       // Must never throw, for any of the 154 real frontmatter tool strings.
+      // Deliberately NOT passing allowShell here: this loop measures the
+      // catalog's real-world behaviour under the module's actual default, so
+      // it doubles as a whole-catalog regression check for the deny-by-default
+      // posture, not just the hand-picked cases in the block above.
       const result = resolveClaudeCodeTools(agent.tools, { platform: 'win32' });
 
       totalRequested += agent.tools.length;
       totalResolved += result.resolved.length;
       totalDroppedUnknown += result.dropped.filter((d) => d.reason === 'not-a-builtin').length;
       totalDroppedUnsafe += result.dropped.filter((d) => d.reason === 'unsafe-for-sandbox').length;
+      totalDroppedShell += result.dropped.filter((d) => d.reason === 'shell-not-allowed').length;
 
       if (result.resolved.length > 0) agentsWithAtLeastOneTool += 1;
       else agentsWithZeroResolvedTools += 1;
@@ -309,16 +443,26 @@ describe('resolveClaudeCodeTools: against the real 154-agent registry', () => {
     expect(totalDroppedUnknown).toBeGreaterThan(0);
     // No catalog agent currently spells a sandbox-unsafe built-in by name.
     expect(totalDroppedUnsafe).toBe(0);
+    // Every Bash-requesting agent (114 of them) is denied the shell under the
+    // module's real default — allowShell is never set anywhere in this loop.
+    // This is the whole-catalog version of the dedicated allowShell tests
+    // above: if the deny-by-default gate ever stopped firing, this is the
+    // assertion that would catch it even if the smaller hand-picked tests
+    // were individually patched to compensate.
+    expect(totalDroppedShell).toBe(114);
     // Every agent resolves at least Read (156 of 156 request it), so nobody
-    // should land on the empty/all-dropped case in the current catalog.
+    // should land on the empty/all-dropped case in the current catalog even
+    // with the shell denied.
     expect(agentsWithZeroResolvedTools).toBe(0);
     expect(agentsWithAtLeastOneTool).toBe(156);
 
-    // Every Bash request on win32 resolves to PowerShell, never left as Bash
-    // and never dropped.
+    // Every Bash request on win32 remaps to PowerShell (never left as Bash)
+    // and is granted, not dropped, once the caller opts in with allowShell —
+    // this is the same alias-resolution fact the earlier default-deny
+    // assertion was checking the ABSENCE of; here it is checked present.
     for (const agent of registry.agents) {
       if (!agent.tools.includes('Bash')) continue;
-      const result = resolveClaudeCodeTools(agent.tools, { platform: 'win32' });
+      const result = resolveClaudeCodeTools(agent.tools, { platform: 'win32', allowShell: true });
       expect(result.resolved).toContain('PowerShell');
       expect(result.resolved).not.toContain('Bash');
     }
