@@ -7,7 +7,7 @@ import { API, ServerMessageSchema, type ServerMessage } from '@agent-office/shar
 import { FileRunStore } from '../store/fileStore.js';
 import { MemoryRunStore } from '../store/memoryStore.js';
 import type { RunStore } from '../store/types.js';
-import { buildServer } from './server.js';
+import { buildServer, isLoopbackHost } from './server.js';
 import { RunSupervisor } from './supervisor.js';
 import {
   SLOW_RUN_TIMEOUT_MS,
@@ -581,6 +581,223 @@ describe('cross-origin access', () => {
   });
 });
 
+describe('Host header allowlist (DNS rebinding)', () => {
+  // `.inject()` sets `Host: localhost:80` by default when no header is given
+  // (see `light-my-request`'s `parseURL`, which resolves a path-only URL
+  // against `http://localhost`), so every other test in this file already
+  // exercises "loopback Host succeeds" without asking for it explicitly. These
+  // tests are the explicit versions plus the rejection cases, which nothing
+  // else here would otherwise cover.
+
+  it('accepts Host: localhost:<port>, the normal browser/dev-server case', async () => {
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { host: 'localhost:5179' },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('accepts Host: 127.0.0.1:<port>', async () => {
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { host: '127.0.0.1:5179' },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('rejects a foreign Host with 403 — the DNS-rebinding regression case', async () => {
+    // A page rebound to resolve `attacker.example` at 127.0.0.1 still sends
+    // `Host: attacker.example`; that name is not one this process answers on
+    // (`serve.ts` binds only `127.0.0.1`), so it must be refused regardless of
+    // which socket the bytes actually arrived on.
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { host: 'attacker.example' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(expectApiError(response.body)).toMatch(/not a loopback address/);
+  });
+
+  it('rejects a foreign Host on the WebSocket upgrade route too', async () => {
+    // `onUpgrade` in `@fastify/websocket` dispatches the raw upgrade request
+    // through `fastify.routing`, which runs the normal hook chain — including
+    // this one — before the socket is ever handed to the ws handler. A
+    // DNS-rebound page must not be able to open a live event stream just
+    // because it targets `/ws` instead of a plain HTTP route.
+    const { app } = await setup();
+
+    await expect(
+      app.injectWS(API.socket(), { headers: { host: 'attacker.example' } }),
+    ).rejects.toThrow(/403/);
+  });
+
+  // ---------------------------------------------------------------------
+  // The other half. These four are the tests whose absence let a wrong claim
+  // sit in `server.ts`'s own doc comment: every case above varies `Host` and
+  // leaves `Origin` alone, so the suite was green while a foreign PAGE — which
+  // sends a perfectly valid loopback `Host` — could read and mutate freely.
+  // ---------------------------------------------------------------------
+
+  it('rejects a foreign Origin even when the Host is a real loopback address', async () => {
+    // The realistic cross-origin shape, and the one the Host check cannot
+    // see: `Host` is the URL fetched (loopback, valid), `Origin` is the page
+    // that fetched it (foreign). Reproduced against a running server before
+    // the fix — this returned 200 with the full run list.
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.runs(),
+      headers: { host: '127.0.0.1:5179', origin: 'http://evil.example' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(expectApiError(response.body)).toMatch(/not a loopback origin/);
+  });
+
+  it('refuses a forged cancel outright, rather than withholding a CORS header', async () => {
+    // The distinction that matters for a side effect. Denying
+    // `access-control-allow-origin` only stops the attacking page from READING
+    // the reply; the bodyless POST is a CORS "simple request", so the handler
+    // has already run by then and the run is already cancelled. The request
+    // has to be refused before the route, which is why this check lives in
+    // `onRequest`.
+    // `hang: true` so the run is still live to be cancelled — the same shape
+    // the other cancel tests in this file use.
+    const { app, supervisor } = await setup({ lead: { hang: true } });
+
+    const created = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.' },
+    });
+    const { runId } = JSON.parse(created.body) as { runId: string };
+    await waitFor(() => supervisor.isLive(runId), 'the run to be live');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.cancelRun(runId),
+      headers: { host: '127.0.0.1:5179', origin: 'http://evil.example' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    // The assertion that matters: the side effect did not happen. A CORS
+    // header withheld after the fact would leave this false.
+    expect(supervisor.isLive(runId)).toBe(true);
+
+    // Clean up the deliberately-hung run so the suite's teardown is not
+    // draining a supervisor that will never finish on its own.
+    await app.inject({ method: 'POST', url: API.cancelRun(runId) });
+    await waitForTerminal(supervisor, runId);
+  });
+
+  it('rejects a foreign Origin on the WebSocket upgrade — the stream has no same-origin policy', async () => {
+    // The worst of the three, because no browser protection applies at all:
+    // `WebSocket` is exempt from the same-origin policy, so any open tab could
+    // connect and receive run state, log lines and deliverable content. The
+    // server refusing the upgrade is the only thing standing in the way.
+    const { app } = await setup();
+
+    await expect(
+      app.injectWS(API.socket(), { headers: { host: 'localhost', origin: 'http://evil.example' } }),
+    ).rejects.toThrow(/403/);
+  });
+
+  it('still accepts a request with no Origin at all — curl, the CLI, tests', async () => {
+    // Absence must stay allowed. A non-browser client sends no Origin, and
+    // that is the ordinary local case NFR-6 is built around; the DNS-rebinding
+    // shape that also omits Origin is what the Host check covers.
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { host: '127.0.0.1:5179' },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('still accepts the dev server, whose loopback origin is cross-origin by port', async () => {
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { host: '127.0.0.1:5179', origin: 'http://localhost:5173' },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers['access-control-allow-origin']).toBe('http://localhost:5173');
+  });
+
+  it('rejects a foreign Host on the CORS preflight route too', async () => {
+    // The preflight route is registered as a wildcard specifically to answer
+    // OPTIONS before the not-found handler would; it has to be behind the same
+    // Host check as everything else, not exempted because it runs earlier.
+    const { app } = await setup();
+
+    const response = await app.inject({
+      method: 'OPTIONS',
+      url: API.runs(),
+      headers: { host: 'attacker.example', origin: 'http://127.0.0.1:5173' },
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
+  it('rejects a cross-site cancel with a foreign Host, and the run is NOT cancelled (CSRF)', async () => {
+    // The CSRF shape: a bodyless `text/plain` POST is a CORS "simple request",
+    // so a foreign page can fire it with no preflight and no Origin header at
+    // all. The Host check is what has to stop this — it must both answer 403
+    // AND leave the run's state untouched, not just report the right status
+    // code while the cancel goes through anyway.
+    const { app, supervisor } = await setup({ lead: { hang: true } });
+
+    const created = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.' },
+    });
+    const { runId } = JSON.parse(created.body) as { runId: string };
+    await waitFor(() => supervisor.isLive(runId), 'the run to be live');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.cancelRun(runId),
+      headers: { host: 'attacker.example' },
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(supervisor.isLive(runId)).toBe(true);
+    const run = await supervisor.getRunState(runId);
+    expect(run.status).not.toBe('cancelled');
+  });
+
+  it('treats a missing Host header the same as a foreign one', () => {
+    // `.inject()` cannot construct a request with no `Host` header at all —
+    // `light-my-request` always synthesizes one (see the comment at the top of
+    // this describe block) — so the "absent" branch of `isLoopbackHost` is
+    // exercised directly rather than through a route. A raw HTTP/1.0 socket
+    // can omit the header for real, and this is the code path that has to
+    // catch it: `undefined` must reject exactly like `attacker.example` does,
+    // never fail open.
+    expect(isLoopbackHost(undefined)).toBe(false);
+  });
+});
+
 describe('unknown routes', () => {
   it('answers with the contract error shape rather than Fastify default', async () => {
     const { app } = await setup();
@@ -612,12 +829,24 @@ interface TestSocket {
  *
  * Messages are parsed through the contract's own schema, so a server message the
  * client could not have handled fails here rather than in the browser.
+ *
+ * The explicit `Host` header is load-bearing, not decorative. `@fastify/websocket`'s
+ * `injectWS` does not go through `light-my-request` the way `app.inject()` does —
+ * it builds its own bare upgrade request by hand (see `injectWS` in
+ * `@fastify/websocket/index.js`) and that request carries no `Host` header
+ * unless one is supplied here. `app.inject()` does not have this gap; it
+ * defaults to `localhost:80` on its own. A real browser's WebSocket handshake
+ * always sends `Host` (it is a mandatory HTTP header), so this line is making
+ * the test send what a real client already sends implicitly — it is not
+ * loosening the server's check, which still rejects an upgrade carrying a
+ * foreign `Host` exactly like any other route (see the "Host header allowlist"
+ * tests above).
  */
 async function openSocket(
   app: FastifyInstance,
 ): Promise<{ socket: TestSocket; messages: ServerMessage[] }> {
   const messages: ServerMessage[] = [];
-  const socket = (await app.injectWS(API.socket(), undefined, {
+  const socket = (await app.injectWS(API.socket(), { headers: { host: 'localhost' } }, {
     onInit: (ws: TestSocket) => {
       ws.on('message', (raw: unknown) => {
         messages.push(ServerMessageSchema.parse(JSON.parse(String(raw))));

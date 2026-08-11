@@ -97,6 +97,65 @@ const ReportQuerySchema = z.object({ path: z.string().min(1) });
  */
 const LOOPBACK_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
+/**
+ * Hosts this server accepts on the `Host` header.
+ *
+ * `LOOPBACK_ORIGIN` above is not a substitute for this, and the gap is not
+ * academic: it is DNS rebinding. A browser's same-origin check is keyed off
+ * the *name* the page was loaded from, not the IP that name resolves to on any
+ * given request. An attacker serves a page from `attacker.example` with a
+ * DNS record on a very short TTL, waits for the browser to cache "same origin
+ * as `attacker.example`" for that page, then re-points the name at
+ * `127.0.0.1`. The page's next `fetch` to `attacker.example` is still
+ * same-origin as far as the browser is concerned — no `Origin` header is even
+ * sent, so `LOOPBACK_ORIGIN` never runs — yet the TCP connection it opens
+ * lands on this loopback server. Every route becomes readable and callable by
+ * a page the user never pointed at this server on purpose, because nothing
+ * here checks that the request actually arrived by the name it claims.
+ *
+ * The `Host` header is the one thing a rebound request cannot launder: it is
+ * set by the browser from the URL the page navigated to, which is still
+ * `attacker.example`, independent of which IP the connection actually went
+ * to. Refusing anything but the loopback names this process answers on
+ * (`serve.ts` hard-codes the bind address to `127.0.0.1` — NFR-6 forbids a
+ * `--host` flag that could point it anywhere else) closes exactly the gap
+ * `LOOPBACK_ORIGIN` cannot.
+ *
+ * **This does NOT on its own close the CSRF hole on
+ * `POST /api/runs/:id/cancel`, and an earlier version of this comment claimed
+ * it did.** The claim is wrong in a way worth recording, because it is the
+ * natural mistake to make about these two headers. `Host` is the URL the
+ * request was sent *to*; a page on `evil.example` fetching
+ * `http://127.0.0.1:5179/...` sends `Host: 127.0.0.1:5179`, which is a
+ * genuinely loopback host and passes this check — the foreign name appears
+ * only in `Origin`. So this regex stops the *rebinding* shape (attacker's name
+ * in `Host`) and nothing else. Reproduced against a running server while the
+ * claim was still in the file: a foreign origin read the full run list and
+ * cancelled a live run, both with a 200.
+ *
+ * The Origin check in `onRequest` is the other half, and neither half is
+ * redundant: `Host` covers the browser case that sends no Origin at all
+ * (rebinding), `Origin` covers the ordinary cross-origin case that sends a
+ * perfectly valid Host.
+ *
+ * `[::1]` is the RFC 3986 form a real browser sends; the bare, bracket-less
+ * `::1` is accepted too because some non-browser loopback callers (curl,
+ * scripts) send it that way, and it is exactly as trustworthy — nothing
+ * outside this machine can claim it.
+ */
+const LOOPBACK_HOST = /^(localhost(:\d+)?|127\.0\.0\.1(:\d+)?|\[::1\](:\d+)?|::1)$/i;
+
+/**
+ * `undefined` covers both "header absent" and the shape TypeScript gives a
+ * header that was never sent — `.inject()` cannot actually construct a
+ * request with no `Host` header (see `server.test.ts`), but a raw socket
+ * talking HTTP/1.0 can, and this must refuse that exactly like it refuses
+ * `attacker.example`.
+ */
+export function isLoopbackHost(host: string | undefined): boolean {
+  return typeof host === 'string' && LOOPBACK_HOST.test(host);
+}
+
 export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   const app = Fastify({ logger: deps.logger ?? false });
 
@@ -133,8 +192,65 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   });
 
   app.addHook('onRequest', async (request, reply) => {
+    // Checked first and unconditionally — before the Origin/CORS logic below,
+    // before content-type parsing, before any route runs. See `LOOPBACK_HOST`
+    // above for why an Origin allowlist alone does not stop a DNS-rebound
+    // request, and why this has to be the thing that runs first.
+    const host = request.headers.host;
+    if (!isLoopbackHost(host)) {
+      void reply.status(403).send({
+        error:
+          typeof host === 'string' && host.length > 0
+            ? `Host header "${host}" is not a loopback address`
+            : 'missing Host header',
+      });
+      return;
+    }
+
+    /**
+     * A present-but-foreign `Origin` is REFUSED, not merely denied a CORS
+     * header. This is the half the Host check above cannot cover, and the two
+     * are not interchangeable.
+     *
+     * `Host` reflects the URL the request was sent TO; `Origin` reflects the
+     * page it came FROM. A page on `https://evil.example` fetching
+     * `http://127.0.0.1:5179/api/runs` therefore sends `Host: 127.0.0.1:5179`
+     * — which is a perfectly good loopback host and passes the check above —
+     * alongside `Origin: https://evil.example`. Only the DNS-rebinding shape
+     * (where the *name* is the attacker's) is stopped by `Host`.
+     *
+     * Before this, `Origin` was computed and used only to decide whether to
+     * echo `access-control-allow-origin`, which is a decision about what the
+     * BROWSER will let script read — a rule the browser enforces on behalf of
+     * a well-behaved page, and one that does not apply at all to the two
+     * things that actually matter here:
+     *
+     * - **Side effects.** The wildcard content-type parser above makes a
+     *   bodyless `POST /api/runs/:id/cancel` a CORS "simple request": no
+     *   preflight, and the handler runs before any response header is read.
+     *   Withholding the CORS header afterwards does not un-cancel the run.
+     *   Verified against a running server: a foreign origin cancelled a live
+     *   run and got a 200.
+     * - **WebSockets.** `/ws` is not subject to the same-origin policy at all.
+     *   Any page could open `ws://127.0.0.1:<port>/ws` and receive the whole
+     *   event stream — run state, log lines, deliverable content — with no
+     *   interaction beyond being open in a tab.
+     *
+     * An ABSENT `Origin` still passes, deliberately. Non-browser clients
+     * (curl, the run CLI, a test harness) send none, and a request with no
+     * Origin is not a cross-origin request from a page — it is the ordinary
+     * local case NFR-6 is built around. The `Host` check is what covers the
+     * one browser situation that also omits Origin, which is precisely DNS
+     * rebinding.
+     */
     const origin = request.headers.origin;
-    if (typeof origin === 'string' && LOOPBACK_ORIGIN.test(origin)) {
+    if (typeof origin === 'string' && origin.length > 0) {
+      if (!LOOPBACK_ORIGIN.test(origin)) {
+        void reply
+          .status(403)
+          .send({ error: `Origin "${origin}" is not a loopback origin` });
+        return;
+      }
       void reply.header('access-control-allow-origin', origin);
       void reply.header('vary', 'origin');
     }
