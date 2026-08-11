@@ -39,7 +39,7 @@ installed on the machine, fully offline.
 | Phase | What | Status |
 |---|---|---|
 | 0 | Agent registry + shared contracts | done |
-| 1 | Provider layer + Claude Code adapter | built; needs `claude auth login` |
+| 1 | Provider layer + Claude Code adapter | done — verified against a signed-in CLI |
 | 2 | Orchestrator core (headless) | done |
 | 3 | Web shell + live wiring | done |
 | 4 | Pixel office sim | done |
@@ -50,17 +50,26 @@ installed on the machine, fully offline.
 | — | QA pass: five reviewers, 29 defects, all fixed | done |
 | — | Closing out: spend cap end to end, replay fidelity | done |
 
-**Nothing has called a real model yet.** The Claude Code adapter is written and
-has been driven against the real CLI — real spawn, real argv, real stream-json —
-but the installed CLI is not signed in, so no model has answered. One command
-closes that gap:
+**A real model has now answered.** The Claude Code adapter has been driven end
+to end against a signed-in CLI: real spawn, real argv, real stream-json, real
+tool calls, a real report streamed back. Run one agent yourself with:
+
+```bash
+npm run agent -- "<task>"
+```
+
+That is the first thing in this project that spends money. Pass `--max-cost` to
+cap it.
+
+You need a signed-in CLI first:
 
 ```bash
 claude auth login
 ```
 
-Then `npm run agent -- "<task>"` runs a single agent for real. That is the first
-thing in this project that spends money.
+If `claude` is not on your `PATH`, see [SETUP.md](SETUP.md) — on Windows the
+desktop app installs it inside an MSIX package container, and the obvious path
+does not work from an ordinary terminal.
 
 **The local CLI is the default provider for every agent.** If you would rather
 use a raw API, copy `.env.example` to `.env` and add a key:

@@ -33,36 +33,70 @@ The binary exists:
 
 It reports `2.1.222 (Claude Code)`. But it is **not** reachable as `claude` from
 a shell: no directory under `%APPDATA%\Claude` is on `PATH`, and there is no
-shim anywhere that resolves the bare name.
+shim anywhere that resolves the bare name — not in `WindowsApps`, not in the
+npm global directory, nowhere.
 
-Note the version number in that path. It changes on every update, so **Phase 1
-must not hardcode it.** Resolve the binary at run time instead — read an
-override such as `AGENT_OFFICE_CLAUDE_BIN` first, then fall back to `claude` on
-`PATH`, then to the newest versioned directory under `%APPDATA%\Claude\claude-code`.
-A provider that dies because the user updated Claude Code is not acceptable.
+That path also only exists inside the MSIX package container; see §3 below
+before concluding the file is missing.
 
-## 3. Claude Code CLI — not authenticated (blocks the Phase 1 exit criterion)
+Note the version number too. It changes on every update, so **Phase 1 must not
+hardcode it.** Resolution happens at run time instead, in this order:
+
+1. `AGENT_OFFICE_CLAUDE_BIN`, if set
+2. `claude` on `PATH`
+3. the newest versioned directory under `%APPDATA%\Claude\claude-code`
+4. the newest under `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code`
+
+A provider that dies because the user updated Claude Code is not acceptable, and
+neither is one that only works when launched from inside the desktop app.
+
+## 3. Claude Code CLI — signing in
 
 ```
 claude auth status
-{ "loggedIn": false, "authMethod": "none", "apiProvider": "firstParty" }
+{ "loggedIn": true, "authMethod": "claude.ai", "apiProvider": "firstParty" }
 ```
 
-The binary runs, but every model call fails. A `-p` invocation returns a
-fabricated assistant turn reading `Not logged in · Please run /login`, then a
-`result` frame with `is_error: true`, and exits **1**.
+That is what you want. Until it says so, the binary runs but every model call
+fails: a `-p` invocation returns a fabricated assistant turn reading
+`Not logged in · Please run /login`, then a `result` frame with
+`is_error: true`, and exits **1**. The `claude-code` provider's preflight
+catches this and reports itself unavailable with that reason rather than
+spawning a run that cannot work.
 
-Fix it by signing in, in a normal interactive terminal:
+Sign in from a normal interactive terminal:
 
 ```bash
 claude auth login
 ```
 
 That is deliberately not something this project does for you — it is an account
-credential flow, and it belongs to whoever owns the account. Until it is done,
-the `claude-code` provider reports itself unavailable with that reason, and the
-Phase 1 exit criterion cannot be closed. Everything else in Phase 1 is built and
-tested regardless; see `PROGRESS.md`.
+credential flow, and it belongs to whoever owns the account.
+
+### If `claude` is not a recognised command
+
+It very likely is not, and the reason is not obvious.
+
+Claude Desktop on Windows is an **MSIX-packaged app**. Its `%APPDATA%` is
+virtualised, so `%APPDATA%\Claude\claude-code\<version>\claude.exe` resolves
+only for a process running *inside* the package container. A shell spawned by
+the desktop app finds it there; an ordinary PowerShell window reports the exact
+same path as `CommandNotFoundException`. Nothing is broken — they are two views
+of one file, and the un-virtualised one is what a normal terminal needs:
+
+```powershell
+& "$env:LOCALAPPDATA\Packages\Claude_*\LocalCache\Roaming\Claude\claude-code\<version>\claude.exe" auth login
+```
+
+The `Claude_*` suffix is a per-install publisher hash, and `<version>` changes
+on every update — which is why `resolveBinary.ts` globs the first and sorts the
+second numerically rather than hardcoding either. It searches the virtualised
+path first and the package path second, so the provider resolves the CLI whether
+the server was started from inside the container or from your own terminal.
+
+Adding the versioned directory to your `PATH` works for typing convenience but
+goes stale on the next CLI update. `AGENT_OFFICE_CLAUDE_BIN` overrides
+resolution outright if you need to pin a specific binary.
 
 ---
 

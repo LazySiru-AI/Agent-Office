@@ -21,6 +21,7 @@ function readFixture(name: string): string {
 
 const AUTH_FAILURE = readFixture('auth-failure.jsonl');
 const SYNTHETIC_SUCCESS = readFixture('synthetic-success.jsonl');
+const REAL_SUCCESS = readFixture('real-success.jsonl');
 const MALFORMED = readFixture('malformed.jsonl');
 
 /**
@@ -323,15 +324,16 @@ describe('normaliseFrame: assistant frames', () => {
     expect(result.events.some((e) => e.t === 'artifact')).toBe(false);
   });
 
-  it('emits usage once per assistant frame, folding cache counters into totals', () => {
+  it('emits NO usage event, even when the frame carries a full usage object', () => {
+    // `message.usage` on an assistant frame is not a per-turn increment, and
+    // both consumers sum usage events. The real capture in
+    // `real-success.jsonl` measures what summing these costs: 2x input and
+    // 1.7% of output. The `result` frame is the authority instead.
     const frame = JSON.parse(
       '{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":40,"output_tokens":92,"cache_creation_input_tokens":0,"cache_read_input_tokens":13400}}}',
     );
     const result = normaliseFrame(frame, 'a1');
-    expect(result.events).toEqual([
-      { t: 'text', assignmentId: 'a1', chunk: 'hi' },
-      { t: 'usage', assignmentId: 'a1', inputTokens: 40 + 13400, outputTokens: 92 },
-    ]);
+    expect(result.events).toEqual([{ t: 'text', assignmentId: 'a1', chunk: 'hi' }]);
   });
 
   it('emits no usage event when the frame carries none', () => {
@@ -423,11 +425,30 @@ describe('normaliseFrame: result frames', () => {
     expect(result.events).toEqual([{ t: 'error', assignmentId: 'a1', message: 'error', fatal: true }]);
   });
 
-  it('emits nothing for a successful result frame — no double-counted total usage', () => {
+  it('emits the assignment usage for a successful result frame', () => {
     const frame = JSON.parse(
       '{"type":"result","is_error":false,"subtype":"success","total_cost_usd":0.04,"usage":{"input_tokens":1575,"output_tokens":480}}',
     );
     const result = normaliseFrame(frame, 'a1');
+    expect(result).toEqual({
+      events: [{ t: 'usage', assignmentId: 'a1', inputTokens: 1575, outputTokens: 480 }],
+      recognised: true,
+    });
+  });
+
+  it('still reports usage for a FAILED result frame — a run that died partway still burned tokens', () => {
+    const frame = JSON.parse(
+      '{"type":"result","is_error":true,"subtype":"error","result":"the model call failed","usage":{"input_tokens":900,"output_tokens":12,"cache_read_input_tokens":4000}}',
+    );
+    const result = normaliseFrame(frame, 'a1');
+    expect(result.events).toEqual([
+      { t: 'usage', assignmentId: 'a1', inputTokens: 900 + 4000, outputTokens: 12 },
+      { t: 'error', assignmentId: 'a1', message: 'the model call failed', fatal: true },
+    ]);
+  });
+
+  it('emits no usage event for a result frame that carries none', () => {
+    const result = normaliseFrame(JSON.parse('{"type":"result","is_error":false}'), 'a1');
     expect(result).toEqual({ events: [], recognised: true });
   });
 
@@ -545,21 +566,87 @@ describe('fixture: synthetic-success.jsonl (derived)', () => {
     // No fatal error anywhere in a successful run's frames.
     expect(events.some((e) => e.t === 'error')).toBe(false);
 
-    // Four assistant frames in the fixture each carry usage → four usage
-    // events, including cache-read counters folded into inputTokens.
+    // Exactly one usage event, from the terminal `result` frame. Assistant
+    // frames deliberately contribute none — see `real-success.jsonl` below for
+    // the measurements that forced that, and `eventsForAssistant` for why.
     const usageEvents = events.filter((e): e is Extract<AgentEvent, { t: 'usage' }> => e.t === 'usage');
-    expect(usageEvents).toHaveLength(4);
-    expect(usageEvents[0]).toEqual({ t: 'usage', assignmentId: 'a1', inputTokens: 1420 + 12000, outputTokens: 38 });
-    expect(usageEvents[usageEvents.length - 1]).toEqual({
-      t: 'usage',
-      assignmentId: 'a1',
-      inputTokens: 60 + 14900,
-      outputTokens: 210,
-    });
+    expect(usageEvents).toEqual([
+      { t: 'usage', assignmentId: 'a1', inputTokens: 1575 + 54400, outputTokens: 480 },
+    ]);
+  });
+});
 
-    // The terminal `result` frame (is_error: false) contributes no extra
-    // event of its own — the run's completion is a process-exit concern for
-    // the adapter, not something this normaliser invents.
+describe('fixture: real-success.jsonl (real capture, authenticated)', () => {
+  const lines = REAL_SUCCESS.split('\n').filter((l) => l.trim().length > 0);
+
+  function collect(): AgentEvent[] {
+    const events: AgentEvent[] = [];
+    for (const line of lines) {
+      const parsed = parseFrame(line);
+      if (parsed.kind !== 'frame') continue;
+      events.push(...normaliseFrame(parsed.frame, 'a1').events);
+    }
+    return events;
+  }
+
+  it('recognises every frame type a real authenticated run emits', () => {
+    // The whole point of this fixture. The unauthenticated capture never
+    // produced `rate_limit_event`, `system/thinking_tokens`,
+    // `system/post_turn_summary`, or an `assistant` frame carrying a
+    // `thinking` block, so none of them were covered until this run happened.
+    for (const line of lines) {
+      const parsed = parseFrame(line);
+      expect(parsed.kind).toBe('frame');
+      if (parsed.kind !== 'frame') continue;
+      expect(normaliseFrame(parsed.frame, 'a1').recognised).toBe(true);
+    }
+  });
+
+  it('reports the result frame total as the assignment usage, not the sum of assistant frames', () => {
+    const usageEvents = collect().filter((e): e is Extract<AgentEvent, { t: 'usage' }> => e.t === 'usage');
+
+    // The CLI's own final accounting for this run.
+    expect(usageEvents).toEqual([
+      { t: 'usage', assignmentId: 'a1', inputTokens: 26 + 44878 + 22731, outputTokens: 579 },
+    ]);
+
+    // Regression guard with teeth. Summing `message.usage` off the assistant
+    // frames — what this adapter used to do — gives 135,270 input (exactly 2x,
+    // because the CLI emits one frame per content block and repeats the usage
+    // on each) and 10 output (1.7% of the truth). Both consumers sum usage
+    // events and the token budget halts on that sum, so this is not cosmetic.
+    let assistantInput = 0;
+    let assistantOutput = 0;
+    for (const line of lines) {
+      const frame: unknown = JSON.parse(line);
+      if (typeof frame !== 'object' || frame === null) continue;
+      const message = (frame as { type?: string; message?: { usage?: Record<string, number> } });
+      if (message.type !== 'assistant' || message.message?.usage === undefined) continue;
+      const u = message.message.usage;
+      assistantInput += (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0);
+      assistantOutput += u.output_tokens ?? 0;
+    }
+    expect(assistantInput).toBe(135_270);
+    expect(assistantOutput).toBe(10);
+    expect(usageEvents[0]?.inputTokens).toBe(assistantInput / 2);
+  });
+
+  it('surfaces the agent text and tool calls, and never a thinking block', () => {
+    const events = collect();
+
+    const tools = events.filter((e): e is Extract<AgentEvent, { t: 'tool' }> => e.t === 'tool').map((e) => e.name);
+    expect(tools).toEqual(['Glob', 'Read']);
+
+    const text = events
+      .filter((e): e is Extract<AgentEvent, { t: 'text' }> => e.t === 'text')
+      .map((e) => e.chunk)
+      .join('');
+    expect(text.length).toBeGreaterThan(0);
+
+    // Three assistant frames carry `thinking` blocks. Reasoning is not the
+    // agent's report and must not reach the transcript as agent-authored text.
+    expect(text).not.toMatch(/login\.js.*crash/is);
+    expect(events.some((e) => e.t === 'error')).toBe(false);
   });
 });
 
@@ -589,14 +676,12 @@ describe('fixture: malformed.jsonl (hand-written edge cases)', () => {
     // build understands.
     expect(unrecognisedFrames).toBe(1);
 
-    // The valid text frame survives and produces its event.
+    // The valid text frame survives and produces its event. Its `usage` does
+    // not: assistant-frame usage is never emitted (see the assistant-frame
+    // tests above), so the only usage on this stream would come from a
+    // `result` frame carrying one, and the fixture's terminal result does not.
     expect(events).toContainEqual({ t: 'text', assignmentId: 'a1', chunk: 'partial work survives' });
-    expect(events).toContainEqual({
-      t: 'usage',
-      assignmentId: 'a1',
-      inputTokens: 10,
-      outputTokens: 5,
-    });
+    expect(events.some((e) => e.t === 'usage')).toBe(false);
 
     // The text block missing its `text` field produces no event, no crash.
     // The final result frame (is_error: true) still reports fatal.
@@ -609,7 +694,7 @@ describe('fixture: malformed.jsonl (hand-written edge cases)', () => {
 
     // Nothing beyond what is asserted above: the init frame is a no-op, and
     // the text-missing-its-text-field frame contributes nothing.
-    expect(events).toHaveLength(3);
+    expect(events).toHaveLength(2);
   });
 });
 

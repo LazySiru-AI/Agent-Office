@@ -236,7 +236,21 @@ export interface NormaliseResult {
   readonly recognised: boolean;
 }
 
-const KNOWN_FRAME_TYPES = new Set(['system', 'assistant', 'user', 'result', 'stream_event']);
+const KNOWN_FRAME_TYPES = new Set([
+  'system',
+  'assistant',
+  'user',
+  'result',
+  'stream_event',
+  // Emitted immediately after `system/init` on a real authenticated run,
+  // reporting the account's rate-limit window. Observed on 2.1.222 once the
+  // CLI was signed in — the unauthenticated capture never produced one, which
+  // is why it was absent from the fixtures and reported as unrecognised the
+  // first time the exit criterion ran for real. Carries no agent activity, so
+  // it is ignored like `system`; it is listed here so it stops being counted
+  // as a protocol surprise.
+  'rate_limit_event',
+]);
 
 /** Turn one parsed frame into zero or more normalised events. */
 export function normaliseFrame(frame: StreamJsonFrame, assignmentId: string): NormaliseResult {
@@ -261,10 +275,14 @@ export function normaliseFrame(frame: StreamJsonFrame, assignmentId: string): No
     return { events: parsed.success ? eventsForResult(parsed.data, assignmentId) : [], recognised: true };
   }
 
-  // `system`, `user` and `stream_event` are all recognised, zero-event frames:
+  // `system`, `user`, `stream_event` and `rate_limit_event` are all
+  // recognised, zero-event frames:
   //
   // - `system`: session metadata (init, or otherwise) — nothing an operator
-  //   needs surfaced as agent activity.
+  //   needs surfaced as agent activity. A real run also emits
+  //   `system/thinking_tokens` throughout and one `system/post_turn_summary`
+  //   at the end; both fall here.
+  // - `rate_limit_event`: account rate-limit window, not agent activity.
   // - `stream_event`: only ever emitted with `--include-partial-messages`,
   //   which this adapter does not pass; recognised so a future default
   //   flipping that on degrades to "ignored" rather than "miscounted as
@@ -297,19 +315,30 @@ function eventsForAssistant(frame: AssistantFrame, assignmentId: string): AgentE
     events.push(...eventsForContent(frame.message?.content, assignmentId));
   }
 
-  // Usage is folded in regardless of the error branch above: the real
-  // auth-failure capture carries an all-zero usage object on its synthetic
-  // frame, and emitting a 0/0 usage event is harmless — only the *text*
-  // leaking into the report is the danger this guards against.
-  const usage = frame.message?.usage;
-  if (usage !== undefined) {
-    events.push({
-      t: 'usage',
-      assignmentId,
-      inputTokens: totalInputTokens(usage),
-      outputTokens: totalOutputTokens(usage),
-    });
-  }
+  // NO usage event here. `message.usage` on an assistant frame is not a
+  // per-turn increment, which is what this used to assume, and both consumers
+  // (`dispatcher.ts` and `runner.ts`) *sum* usage events.
+  //
+  // Measured against the first real authenticated capture (2.1.222, three
+  // turns, `result` reporting in=26 out=579 cr=44878 cw=22731):
+  //
+  //   - The CLI emits one assistant frame per *content block*, so a turn with
+  //     a `thinking` block and a `tool_use` block produces two frames carrying
+  //     the identical `message.usage`. Summing them double-counted input to
+  //     exactly 2x the truth — 135,270 against 67,635.
+  //   - `output_tokens` on those frames reads 3, 3, 1, 1, 1, 1. It is not the
+  //     turn's output at all. Summed, it gave 10 against a true 579 — 1.7%.
+  //
+  // Wrong in both directions at once, and the token budget in
+  // `dispatcher.ts` halts on that sum, so it would trip early on input and
+  // never on output. The `result` frame is the CLI's own final accounting and
+  // is the only trustworthy source; `eventsForResult` emits it.
+  //
+  // The cost is that usage now arrives once, at the end of an assignment,
+  // rather than ticking up during it. The in-run spend guard does not rest on
+  // this: `provider.ts` passes `--max-budget-usd`, so the CLI enforces the cap
+  // on its own side while a turn is in flight, and the dispatcher's budget
+  // still halts *subsequent* assignments on accurate totals.
 
   return events;
 }
@@ -444,12 +473,22 @@ function eventsForResult(frame: ResultFrame, assignmentId: string): AgentEvent[]
   // before the `is_error` branch for exactly that reason.
   const events: AgentEvent[] = eventsForPermissionDenials(frame, assignmentId);
 
+  // The authoritative token accounting for the whole assignment, and the only
+  // accurate one on this wire format — see the long note in
+  // `eventsForAssistant` for the measurements that establish that. Emitted on
+  // the failure branch too: a run that died partway still burned tokens, and
+  // omitting them understates a failed run's cost to zero.
+  const usage = frame.usage;
+  if (usage !== undefined) {
+    events.push({
+      t: 'usage',
+      assignmentId,
+      inputTokens: totalInputTokens(usage),
+      outputTokens: totalOutputTokens(usage),
+    });
+  }
+
   if (frame.is_error !== true) {
-    // A successful result frame's `usage`/`total_cost_usd` are cumulative
-    // totals for the whole session, not an increment. Every assistant frame
-    // along the way already emitted its own incremental usage event; turning
-    // the total into a second event here would double it against whatever
-    // sums the stream for NFR-5, so this deliberately produces no usage event.
     return events;
   }
 

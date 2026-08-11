@@ -14,6 +14,13 @@ import type { ProviderAvailability } from '../types.js';
  * PROGRESS.md ("Phase 1 must resolve the `claude` binary at run time") and as
  * the suggested resolution order in SETUP.md. This file is that resolution,
  * generalised beyond Windows so a POSIX install is not a second implementation.
+ *
+ * Two Windows roots, not one. Claude Desktop is MSIX-packaged, so the
+ * `%APPDATA%` path above is virtualised and resolves only inside the package
+ * container; the same file is reachable from anywhere under
+ * `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\...`. Searching only the
+ * first meant the server worked when launched from the desktop app and reported
+ * "not installed" when launched from a terminal. See `knownInstallRoots`.
  */
 
 // ---------------------------------------------------------------------------
@@ -147,9 +154,39 @@ function knownInstallRoots(
   homedir: string,
 ): InstallRoot[] {
   if (platform === 'win32') {
+    const roots: InstallRoot[] = [];
+
     const appData = env.APPDATA;
-    if (appData === undefined || appData === '') return [];
-    return [{ dir: path.join(appData, 'Claude', 'claude-code'), binaryName: 'claude.exe', versioned: true }];
+    if (appData !== undefined && appData !== '') {
+      roots.push({ dir: path.join(appData, 'Claude', 'claude-code'), binaryName: 'claude.exe', versioned: true });
+    }
+
+    // The same install, reached without the MSIX virtualisation layer.
+    //
+    // Claude Desktop is a packaged (MSIX) app, so the `%APPDATA%\Claude` path
+    // above is virtualised: it resolves for a process running *inside* the
+    // package container and does not exist outside it. Observed on this
+    // machine — a shell spawned by the desktop app resolves the binary there,
+    // while an ordinary PowerShell window reports the identical path as
+    // not found. Both are views of one file, whose real location is
+    // `%LOCALAPPDATA%\Packages\Claude_<publisher>\LocalCache\Roaming\...`.
+    //
+    // Without this fallback, running the server from a normal terminal fails
+    // discovery entirely and the provider reports "not installed" — a wrong
+    // and far more confusing diagnosis than the truth, which may simply be
+    // that the CLI is not signed in.
+    const localAppData = env.LOCALAPPDATA;
+    if (localAppData !== undefined && localAppData !== '') {
+      roots.push({
+        // The publisher hash varies per install, so it is globbed rather than
+        // hardcoded — see `expandPackageFamilyGlob`.
+        dir: path.join(localAppData, 'Packages', 'Claude_*', 'LocalCache', 'Roaming', 'Claude', 'claude-code'),
+        binaryName: 'claude.exe',
+        versioned: true,
+      });
+    }
+
+    return roots;
   }
 
   return [
@@ -161,27 +198,74 @@ function knownInstallRoots(
   ];
 }
 
+/**
+ * Expand a single `*` path segment against the filesystem.
+ *
+ * Only needed for the MSIX package root, whose directory name carries a
+ * per-install publisher hash (`Claude_pzs8sxrjxfjjc`). A full glob library is
+ * not warranted for one wildcard in one segment, so this handles exactly that:
+ * one starred segment, matched by prefix and suffix.
+ *
+ * Returns the input unchanged when there is no wildcard, so every other root
+ * takes the same code path. Matches are sorted for determinism — two package
+ * versions installed side by side must not resolve differently run to run.
+ */
+async function expandPackageFamilyGlob(dir: string): Promise<string[]> {
+  const segments = dir.split(path.sep);
+  const starIndex = segments.findIndex((segment) => segment.includes('*'));
+  if (starIndex === -1) return [dir];
+
+  const parent = segments.slice(0, starIndex).join(path.sep);
+  const pattern = segments[starIndex] ?? '';
+  const rest = segments.slice(starIndex + 1);
+
+  const [prefix = '', suffix = ''] = pattern.split('*');
+
+  let entries;
+  try {
+    entries = await readdir(parent, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  return entries
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        entry.name.length >= prefix.length + suffix.length &&
+        entry.name.startsWith(prefix) &&
+        entry.name.endsWith(suffix),
+    )
+    .map((entry) => entry.name)
+    .sort()
+    .map((name) => [parent, name, ...rest].join(path.sep));
+}
+
 async function findInInstallRoots(
   platform: NodeJS.Platform,
   env: NodeJS.ProcessEnv,
   homedir: string,
 ): Promise<ResolvedBinary | undefined> {
-  for (const root of knownInstallRoots(platform, env, homedir)) {
-    if (root.versioned) {
-      const versions = await listVersionDirsDescending(root.dir);
-      for (const version of versions) {
-        const candidate = path.join(root.dir, version, root.binaryName);
-        // Skip a version directory that exists but does not actually contain the
-        // binary (partial install, or a stray directory) rather than stopping —
-        // the next-highest version may still be a real install.
-        if (await fileExists(candidate)) {
-          return { path: candidate, source: 'install-root', version };
+  for (const unexpanded of knownInstallRoots(platform, env, homedir)) {
+    for (const dir of await expandPackageFamilyGlob(unexpanded.dir)) {
+      const root: InstallRoot = { ...unexpanded, dir };
+
+      if (root.versioned) {
+        const versions = await listVersionDirsDescending(root.dir);
+        for (const version of versions) {
+          const candidate = path.join(root.dir, version, root.binaryName);
+          // Skip a version directory that exists but does not actually contain the
+          // binary (partial install, or a stray directory) rather than stopping —
+          // the next-highest version may still be a real install.
+          if (await fileExists(candidate)) {
+            return { path: candidate, source: 'install-root', version };
+          }
         }
-      }
-    } else {
-      const candidate = path.join(root.dir, root.binaryName);
-      if (await fileExists(candidate)) {
-        return { path: candidate, source: 'install-root' };
+      } else {
+        const candidate = path.join(root.dir, root.binaryName);
+        if (await fileExists(candidate)) {
+          return { path: candidate, source: 'install-root' };
+        }
       }
     }
   }

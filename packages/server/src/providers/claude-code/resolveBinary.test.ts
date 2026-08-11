@@ -157,6 +157,114 @@ describe('resolveClaudeBinary', () => {
   });
 });
 
+/**
+ * Claude Desktop is an MSIX-packaged app, so `%APPDATA%\Claude` is virtualised:
+ * it resolves for a process inside the package container and does not exist
+ * outside it. Observed on the development machine — a shell spawned by the
+ * desktop app found the binary at that path while an ordinary PowerShell window
+ * reported the identical path as not found.
+ *
+ * Without the LocalCache fallback, running the server from a normal terminal
+ * failed discovery outright and the provider reported "not installed", which is
+ * both wrong and more confusing than the likelier truth (not signed in).
+ */
+describe('resolveClaudeBinary: the MSIX package install root', () => {
+  function packageRoot(family: string, version: string): string {
+    return path.join(
+      tmpRoot,
+      'localappdata',
+      'Packages',
+      family,
+      'LocalCache',
+      'Roaming',
+      'Claude',
+      'claude-code',
+      version,
+      'claude.exe',
+    );
+  }
+
+  it('resolves through the package LocalCache when %APPDATA% has no install', async () => {
+    const binaryPath = packageRoot('Claude_pzs8sxrjxfjjc', '2.1.222');
+    await makeFakeBinary(binaryPath);
+
+    const result = await resolveClaudeBinary(
+      windowsOptions({
+        env: {
+          APPDATA: path.join(tmpRoot, 'appdata'), // exists as a name, holds nothing
+          LOCALAPPDATA: path.join(tmpRoot, 'localappdata'),
+          PATH: '',
+        },
+      }),
+    );
+
+    expect(result).toEqual({ path: binaryPath, source: 'install-root', version: '2.1.222' });
+  });
+
+  it('globs the publisher hash rather than hardcoding it', async () => {
+    // The suffix differs per install, so a hardcoded one would resolve on
+    // exactly one machine.
+    const binaryPath = packageRoot('Claude_someotherhash9', '3.0.0');
+    await makeFakeBinary(binaryPath);
+
+    const result = await resolveClaudeBinary(
+      windowsOptions({
+        env: { LOCALAPPDATA: path.join(tmpRoot, 'localappdata'), PATH: '' },
+      }),
+    );
+
+    expect(result).toEqual({ path: binaryPath, source: 'install-root', version: '3.0.0' });
+  });
+
+  it('prefers %APPDATA% when both resolve, so in-container behaviour is unchanged', async () => {
+    const appDataBinary = path.join(tmpRoot, 'appdata', 'Claude', 'claude-code', '1.0.0', 'claude.exe');
+    await makeFakeBinary(appDataBinary);
+    await makeFakeBinary(packageRoot('Claude_pzs8sxrjxfjjc', '9.9.9'));
+
+    const result = await resolveClaudeBinary(
+      windowsOptions({
+        env: {
+          APPDATA: path.join(tmpRoot, 'appdata'),
+          LOCALAPPDATA: path.join(tmpRoot, 'localappdata'),
+          PATH: '',
+        },
+      }),
+    );
+
+    // Note this prefers the *lower* version: the two roots are two views of
+    // one install, so root order decides, not version order. Picking the
+    // higher number across roots would be comparing a path against itself.
+    expect(result).toEqual({ path: appDataBinary, source: 'install-root', version: '1.0.0' });
+  });
+
+  it('is deterministic when several package directories match the glob', async () => {
+    await makeFakeBinary(packageRoot('Claude_bbbbbbbbbbbbb', '1.0.0'));
+    const first = packageRoot('Claude_aaaaaaaaaaaaa', '1.0.0');
+    await makeFakeBinary(first);
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await resolveClaudeBinary(
+        windowsOptions({
+          env: { LOCALAPPDATA: path.join(tmpRoot, 'localappdata'), PATH: '' },
+        }),
+      );
+      expect(result?.path).toBe(first);
+    }
+  });
+
+  it('ignores LOCALAPPDATA on POSIX, where no such layout exists', async () => {
+    await makeFakeBinary(packageRoot('Claude_pzs8sxrjxfjjc', '2.1.222'));
+
+    const result = await resolveClaudeBinary({
+      platform: 'linux',
+      env: { LOCALAPPDATA: path.join(tmpRoot, 'localappdata'), PATH: '' },
+      homedir: path.join(tmpRoot, 'home'),
+    });
+
+    expect(result).toBeUndefined();
+  });
+});
+
 describe('compareVersions', () => {
   it('compares numerically, not lexicographically', () => {
     expect(compareVersions('2.1.222', '2.1.99')).toBeGreaterThan(0);

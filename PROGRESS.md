@@ -8,7 +8,7 @@ written, not executed) · **blocked** · **not started**.
 | Phase | Status | Committed |
 |---|---|---|
 | 0 — Foundations (registry + contracts) | **done** | yes |
-| 1 — Provider layer + Claude Code adapter | **built and verified against the real CLI, except the model call** — blocked on `claude auth login` | yes |
+| 1 — Provider layer + Claude Code adapter | **done** — exit criterion closed against a real signed-in CLI | not yet |
 | 2 — Orchestrator core (headless) | **done** | yes |
 | 3 — Web shell + live wiring | **done** | yes |
 | 4 — Pixel office sim | **done** | yes |
@@ -529,21 +529,15 @@ but not authenticated. Run "claude auth login" to sign in, then retry.
 
 368 tests pass; typecheck is clean across all three workspaces.
 
-### Blocker
+### Blocker — since cleared
 
-**`claude auth login` has not been run.** Signing in is an account credential
-action and belongs to whoever owns the account, so it is not something this
-project does on the user's behalf. Until then the Phase 1 exit criterion — one
-agent streaming normalised events from a real model — cannot be closed.
+**`claude auth login` had not been run.** Signing in is an account credential
+action and belongs to whoever owns the account, so it was not something this
+project could do on the user's behalf. It has since been done; see
+"Phase 1, closed" below.
 
 ### Known gaps carried forward
 
-- **The successful-path fixture is derived, not captured.** `synthetic-success.jsonl`
-  reproduces content-block shapes confirmed from local session transcripts inside
-  an envelope the real capture proves, but frames unique to a *successful* run
-  have never been observed on this wire format. Capture a real one immediately
-  after signing in; the exit-criterion script prints unrecognised frames rather
-  than dropping them, so a mismatch surfaces at once.
 - **Per-agent model selection does not reach the adapter.** `AgentRunRequest`
   carries no `model`, so the catalog's `model:` frontmatter — which the Phase 3
   cost display already joins on — cannot be honoured. `--model` is provider-wide
@@ -562,6 +556,86 @@ agent streaming normalised events from a real model — cannot be closed.
   as events, so a denied tool is currently invisible to the UI.
 - Nothing has measured what a real run costs, so FR-M8's budget defaults remain
   guesses.
+
+---
+
+## Phase 1, closed — what a real model call changed
+
+**Status: done.** `claude auth status` reports `loggedIn: true`, and
+`npm run agent -- "..."` ran a `code-reviewer` against a throwaway workspace on
+`haiku`: real spawn, real argv, real stream-json, real tool calls (`Glob`,
+`Read`), a real review streamed back, clean exit. The exit criterion — one agent
+streaming normalised events from a real model — is met.
+
+Three of the gaps listed above are answered below. The rest still stand.
+
+### Reaching the CLI at all was the first defect
+
+`claude auth login` failed from an ordinary PowerShell window with
+`CommandNotFoundException`, on the very path §2 of SETUP.md had verified.
+
+Claude Desktop is an **MSIX-packaged app**, so `%APPDATA%\Claude` is
+virtualised: it resolves for a process running inside the package container and
+does not exist outside it. A shell spawned by the desktop app finds the binary
+there; a normal terminal does not. Both are views of one file, whose real home
+is `%LOCALAPPDATA%\Packages\Claude_<publisher>\LocalCache\Roaming\...`.
+
+`knownInstallRoots` searched only the virtualised path, so **starting the server
+from a normal terminal failed discovery outright and reported "not installed"** —
+wrong, and more confusing than the likelier truth, which is "not signed in". The
+package root is now a second install root, with the publisher hash globbed
+rather than hardcoded (it varies per install) and `%APPDATA%` still tried first,
+so in-container behaviour is unchanged.
+
+### The success wire format was not what the fixtures said
+
+The old fixtures README named this risk precisely — "if 2.1.222 wraps successful
+frames differently from failing ones, the parser is tested against the wrong
+envelope" — and it was right. A real run emits four things the unauthenticated
+capture never did: `rate_limit_event` (a top-level frame type, duly reported as
+unrecognised the first time the script ran), `system/thinking_tokens`,
+`system/post_turn_summary`, and `assistant` frames carrying `thinking` blocks.
+
+**The expensive one was token accounting.** The CLI emits one `assistant` frame
+per *content block* and repeats the whole message's `usage` on each. Both
+`dispatcher.ts` and `runner.ts` sum usage events, and the token budget halts on
+that sum:
+
+| | summed from assistant frames | `result` frame |
+|---|---|---|
+| input | 135,270 | 67,635 |
+| output | 10 | 579 |
+
+Exactly 2x on input, 1.7% on output — wrong in both directions at once, so the
+budget would trip early on input and never on output. `message.usage` is not a
+per-turn increment, which is what the code assumed, in a comment that reasoned
+carefully from a false premise and warned against the fix. Usage now comes from
+the `result` frame alone, and is emitted on the failure branch too, so a run
+that died partway is not costed at zero.
+
+The tradeoff: usage arrives once per assignment instead of ticking up during
+one. The in-run spend guard does not rest on it — `provider.ts` passes
+`--max-budget-usd`, so the CLI enforces the cap on its own side mid-turn, and
+the dispatcher's budget still halts subsequent assignments on accurate totals.
+
+`real-success.jsonl` is that capture, redacted for identifiers and machine
+specifics only. `parse.test.ts` asserts both columns above against it, so a CLI
+that changes shape fails loudly rather than quietly mis-billing.
+
+### What one real run cost
+
+**$0.0534808** for three turns on `haiku` against a 12-line file, with 22,731
+cache-creation tokens dominating a trivial task. FR-M8's defaults are
+better-informed than they were, but one short haiku run says little about a full
+multi-agent office on sonnet, so they remain estimates.
+
+Two things this exposes, both still open: `total_cost_usd` sits on the result
+frame unused, right next to the usage this adapter now trusts — the CLI has
+already done the per-counter arithmetic `pricing.ts` approximates. And of those
+67,635 input tokens, 26 were uncached; pricing them all at the fresh-input rate
+is not a rounding error.
+
+1301 tests pass; typecheck is clean across all three workspaces.
 
 ---
 
@@ -1494,3 +1568,16 @@ instead of quietly certifying a limitation that no longer exists.
   OpenAI's.
 - Requirement-to-test traceability (FR-*/NFR-* to test names) is still unbuilt.
 - No retention or pruning for `runs/`.
+- **A cancelled or timed-out `claude-code` assignment is now costed at exactly
+  zero.** Found reviewing the Phase 1 closure above rather than in the web
+  pass, and it follows from that fix rather than undermining it: usage for this
+  adapter now comes only from the `result` frame, and an aborted run is killed
+  before one arrives, so `executeAssignment`'s accumulator persists `{0, 0}`.
+  The write-up covers the `is_error` result frame — a run that *failed* still
+  reports its spend — but not the case where no result frame exists at all.
+  This is the right trade and not worth reverting: the alternative is the
+  assistant-frame sum that was 2x wrong on input and 1.7% of the truth on
+  output, and there is no accurate source before the result frame. It is worth
+  knowing, because someone who cancels a long run and reads `$0.00` will
+  believe it. The honest fix is upstream — `total_cost_usd` and incremental
+  accounting the CLI does not currently expose mid-turn.
