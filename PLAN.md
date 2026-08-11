@@ -311,7 +311,44 @@ the natural first real dogfooding task for this app.
 | NFR-7 | S | Deterministic replay: a run's event log can be re-played into the UI without re-invoking any provider. Invaluable for debugging the sim. |
 | NFR-8 | S | Graceful provider degradation — a provider becoming unavailable mid-run fails that assignment, not the whole run. |
 
-### 2.6 Explicitly out of scope for v1
+### 2.6 Interface & theming (FR-U)
+
+The app's own look, as distinct from the *report* themes in §2.4. Phase 3 was
+"deliberately ugly" on purpose and Phase 4 added a pixel office on top of it, so
+the interface is currently two visual languages sharing a page: plain browser
+defaults around a dark canvas.
+
+**Direction: a dark neon terminal.** Near-black ground, monospace-forward
+typography, restrained neon accents, and the office rendered as something closer
+to a CRT than a web page. It suits the subject — this is a tool for watching
+processes run — and it resolves the mismatch rather than papering over it, since
+the office canvas is already dark and everything around it is not.
+
+| ID | Pri | Requirement |
+|---|---|---|
+| FR-U1 | M | One dark neon visual identity across the whole app: near-black ground, a small neon accent set, monospace-forward type. Applies to chrome, panels, tables and forms — not only the office. |
+| FR-U2 | M | The palette lives in **one** place as design tokens (CSS custom properties), consumed by both the DOM and the canvas. Two copies of a colour is how the office and the panels come to disagree. |
+| FR-U3 | M | The office sim adopts the palette through the existing FR-S9 sprite manifest and scene colours — a palette swap, not a renderer change. |
+| FR-U4 | M | Status colour must stay legible and semantically distinct on the dark ground, and must never be the *only* carrier of meaning (a badge keeps its text). Body and status text meets WCAG AA contrast. |
+| FR-U5 | S | Glow, scanline and flicker effects honour `prefers-reduced-motion`, and are switchable off independently of it. |
+| FR-U6 | S | No webfont fetched at run time. System monospace stacks, or a font file bundled into the build — the app is local-first and must not degrade with no network (consistent with FR-P3). |
+| FR-U7 | C | A light theme retained as an option, selected by `prefers-color-scheme` with a manual override. |
+
+**Constraint — this does not touch the PDF.** The §2.4 report themes stay
+light-on-white and are explicitly excluded from FR-U1. Dark neon is wrong for
+print in a way that is not a matter of taste: it floods a page with ink, most
+printers render large dark fills as muddy banding, and a document that is
+downloaded and forwarded should not assume a screen. If a terminal *feel* is
+wanted in the deliverable, the honest version is a fifth print theme that is
+monospace-forward and still light — FR-P7 already contemplates a user-selected
+theme.
+
+*Note on the pixel office:* a CRT direction is a good fit for FR-S2's
+deterministic sprites, because the per-agent palette slices can be constrained to
+a neon ramp rather than the current naturalistic skin/hair/clothing sets. That is
+a change to the *palette tables* in `sim/model.ts`, not to sprite generation.
+
+### 2.7 Explicitly out of scope for v1
 
 Multi-user accounts · hosted deployment · agent-to-agent direct chat (all
 communication routes through the Manager, by design) · editing agent `.md` files
@@ -433,6 +470,40 @@ routing errors documented and addressed.
 **Exit:** the same task runs identically through Claude Code and through a raw
 API provider, with only a dropdown changing.
 
+### Phase 8 — Dark neon terminal interface
+
+The app's own visual identity (§2.6). Independent of everything else: it changes
+no orchestrator behaviour, no contract and no provider, which is why it can be
+taken whenever wanted rather than in sequence.
+
+- Design tokens first — one palette, as CSS custom properties, consumed by both
+  the DOM and the canvas (FR-U2). Doing this second, after styling the panels,
+  guarantees two sources of truth.
+- Restyle the shell: task form, run list, run header, assignment table, log pane,
+  inspect panel, replay controls. The log pane is already dark and monospaced and
+  is the closest thing to a reference for the rest.
+- Rework the status palette against the dark ground (FR-U4). This is the fiddly
+  part: eight assignment statuses and ten run statuses currently rely on
+  mid-tone fills that will not survive the change.
+- Swap the office's palette through the sprite manifest and scene colours
+  (FR-U3): a neon ramp for the deterministic per-agent sprites, a CRT tint on the
+  floor, glow on desks that are actively working.
+- Motion: scanlines and glow behind a `prefers-reduced-motion` check and an
+  explicit toggle (FR-U5).
+
+**Deliberately not in scope:** the PDF. Report themes stay light-on-white — see
+the constraint under §2.6.
+
+**Exit:** the whole app reads as one interface rather than a dark canvas dropped
+into a default-styled page; a colour-blind user can still tell `failed` from
+`done`; text meets WCAG AA on the dark ground; and the office palette comes from
+the same tokens as the panels, verified by there being no second copy of a
+colour value in the client.
+
+**Risk:** this is the phase most likely to be judged on taste rather than
+correctness, and the one where "a bit more polish" has no natural end. The exit
+criteria above are deliberately checkable for that reason.
+
 ---
 
 ## 4. Risks
@@ -456,6 +527,13 @@ the last. Phase 4 (sim) and Phase 5 (PDF) are independent of each other and can
 be interleaved. Phase 6 should begin as soon as Phase 2 lands, since domain
 routing problems are cheapest to find headlessly. Phase 7 is deferrable
 indefinitely without blocking anything.
+
+Phase 8 (dark neon interface) is independent of all of them and can be taken at
+any point — it touches only the client. The one argument for taking it *before*
+Phase 6 is that Phase 6's output is judged by reading reports and watching
+routing decisions, and a legible interface makes that work easier. The argument
+for taking it after is that Phase 6 is the one remaining phase that changes what
+the product can *do*.
 
 The one thing worth resisting: building the office before Phase 3 proves the data
 flow. The sim is the fun part and the least informative one — if the orchestrator

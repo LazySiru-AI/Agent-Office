@@ -15,6 +15,7 @@ written, not executed) · **blocked** · **not started**.
 | 5 — Designer step + PDF export | **done** | yes |
 | 6 — Domain breadth | not started | — |
 | 7 — Provider expansion + polish | not started | — |
+| 8 — Dark neon terminal interface | not started | — |
 
 Each phase commit's subject starts with `Phase N:`, so to find one:
 

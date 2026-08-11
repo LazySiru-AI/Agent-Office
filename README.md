@@ -37,6 +37,7 @@ installed on the machine, fully offline.
 | 4 | Pixel office sim | done |
 | 5 | Designer step + PDF export | done |
 | 6–7 | Domain breadth, more providers | not started |
+| 8 | Dark neon terminal interface | not started |
 
 **Nothing has called a real model yet.** The Claude Code adapter is written and
 has been driven against the real CLI — real spawn, real argv, real stream-json —
@@ -122,6 +123,7 @@ upstream when wanted.
 
 ## Documents
 
-- `PLAN.md` — architecture, numbered requirements, all eight phases
-- `SETUP.md` — prerequisites, including the two that are currently missing
+- `PLAN.md` — architecture, numbered requirements, all nine phases
+- `SETUP.md` — prerequisites, and the verified Claude Code CLI flag surface
 - `PROGRESS.md` — per-phase log of what was built, decided, and left open
+- `ASSETS.md` — why the office sprites are generated rather than licensed
