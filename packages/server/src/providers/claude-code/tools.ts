@@ -133,6 +133,8 @@
  * so that decision stays with the caller, informed by `dropped`.
  */
 
+import { MCP_CONFIG_ENV_VAR, mcpServerOf } from './mcpConfig.js';
+
 /**
  * The Claude Code CLI's built-in tool names, as observed in a real
  * `system`/`init` frame on this machine (Claude Code 2.1.222, Windows).
@@ -285,7 +287,17 @@ export type DropReason =
    */
   | 'shell-not-allowed'
   /** Not a recognised built-in on this platform/version at all. */
-  | 'not-a-builtin';
+  | 'not-a-builtin'
+  /**
+   * An `mcp__<server>__<tool>` name whose server this deployment has not registered.
+   *
+   * Distinct from `not-a-builtin` because the two need different fixes and the old shared message
+   * sent readers the wrong way: this one is resolvable by registering the server, whereas
+   * `not-a-builtin` means the name is not a tool this adapter can ever grant. It is also distinct
+   * from `unsafe-for-sandbox` — nothing here says the tool is dangerous, only that the operator has
+   * not opted this deployment into that server.
+   */
+  | 'mcp-server-not-registered';
 
 export interface DroppedTool {
   /** The name exactly as it appeared in the agent's frontmatter. */
@@ -329,6 +341,17 @@ export interface ToolResolutionOptions {
    * decision possible and defaults it to the safer answer.
    */
   allowShell?: boolean;
+  /**
+   * MCP servers this deployment has registered, from
+   * {@link ../mcpConfig.loadMcpRegistry}. An `mcp__<server>__<tool>` request is granted only when
+   * `<server>` is in here.
+   *
+   * Absent or empty means no MCP servers are enabled, and every `mcp__*` request is dropped with
+   * the same clear reason it has always been given. That is the correct default and the reason this
+   * is opt-in per deployment rather than per request: registering a server is granting the ability
+   * to execute whatever command that server entry names.
+   */
+  mcpServers?: ReadonlySet<string>;
 }
 
 export interface ToolResolution {
@@ -337,6 +360,18 @@ export interface ToolResolution {
    * Feed this to {@link toArgvToken} for both `--tools` and `--allowedTools`.
    */
   readonly resolved: readonly GrantableTool[];
+  /**
+   * Granted MCP tool names, verbatim (`mcp__investing__tax_summary`), deduplicated in
+   * first-requested order.
+   *
+   * Kept apart from {@link resolved} because the two go to **different flags**, which is a fact
+   * about the CLI rather than a stylistic choice: `--tools` is documented as selecting "from the
+   * built-in set", so an MCP name there is not merely redundant but wrong. An MCP tool's
+   * availability comes from `--mcp-config`; its permission comes from `--allowedTools`. Folding
+   * these into one list would have put MCP names into `--tools` and produced a confusing CLI-side
+   * failure far from its cause.
+   */
+  readonly mcpTools: readonly string[];
   /** Every requested name that resolved to a grant, and what it became. */
   readonly granted: readonly ResolvedTool[];
   /**
@@ -373,20 +408,46 @@ export function resolveClaudeCodeTools(
   // shell gets this caller-controlled opt-in instead of a permanent entry in
   // ALWAYS_EXCLUDED_BUILTINS.
   const allowShell = options.allowShell ?? false;
+  const mcpServers = options.mcpServers ?? new Set<string>();
 
   const grantedOrder: GrantableTool[] = [];
   const grantedSet = new Set<GrantableTool>();
   const granted: ResolvedTool[] = [];
   const dropped: DroppedTool[] = [];
+  const mcpOrder: string[] = [];
+  const mcpSeen = new Set<string>();
 
   for (const requested of requestedTools) {
+    // Checked before the built-in lookup: `mcp__*` names are not built-ins and never will be, so
+    // resolving them first keeps the two vocabularies from ever having to agree about a name.
+    const mcpServer = mcpServerOf(requested);
+    if (mcpServer !== undefined) {
+      if (!mcpServers.has(mcpServer)) {
+        dropped.push({
+          requested,
+          reason: 'mcp-server-not-registered',
+          detail:
+            `"${requested}" is an MCP tool from server "${mcpServer}", which this deployment has not ` +
+            `registered. Add it to the file named by ${MCP_CONFIG_ENV_VAR} to grant it. Registering a ` +
+            `server grants the ability to execute the command that server entry names, so it is an ` +
+            `operator decision rather than something a run can ask for.`,
+        });
+        continue;
+      }
+      if (!mcpSeen.has(requested)) {
+        mcpSeen.add(requested);
+        mcpOrder.push(requested);
+      }
+      continue;
+    }
+
     const builtin = resolveOneName(requested, shellTool);
 
     if (builtin === undefined) {
       dropped.push({
         requested,
         reason: 'not-a-builtin',
-        detail: `"${requested}" is not a Claude Code CLI built-in on this platform/version. Likely an MCP tool, a plugin-supplied tool, or a reference to another catalog agent — none of which this adapter can grant as a CLI --tools entry.`,
+        detail: `"${requested}" is not a Claude Code CLI built-in on this platform/version. Likely a plugin-supplied tool or a reference to another catalog agent — neither of which this adapter can grant as a CLI --tools entry. (An MCP-style "mcp__server__tool" name is handled separately and is not this case.)`,
       });
       continue;
     }
@@ -423,7 +484,7 @@ export function resolveClaudeCodeTools(
     }
   }
 
-  return { resolved: grantedOrder, granted, dropped };
+  return { resolved: grantedOrder, mcpTools: mcpOrder, granted, dropped };
 }
 
 /**

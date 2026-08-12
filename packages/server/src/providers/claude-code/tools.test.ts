@@ -106,7 +106,25 @@ describe('resolveClaudeCodeTools: real catalog tool strings', () => {
     expect(result.resolved).toEqual(['Read', 'WebFetch', 'WebSearch']);
     expect(result.dropped).toHaveLength(1);
     expect(result.dropped[0]?.requested).toBe('mcp__bgpt__search_papers');
-    expect(result.dropped[0]?.reason).toBe('not-a-builtin');
+    // Reason CHANGED in Stage 2, and the change is the point rather than a re-pin. This used to be
+    // `not-a-builtin` — true but unhelpful, since it lumped "this name can never be granted"
+    // together with "this deployment has not registered that server". The second is fixable by the
+    // operator, and now says so. The tool is still dropped: `bgpt` is not registered here, and
+    // deny-by-default is unchanged.
+    expect(result.dropped[0]?.reason).toBe('mcp-server-not-registered');
+  });
+
+  // Same agent, same catalog line, with the server registered — the case Stage 2 exists to enable.
+  it("grants scientific-literature-researcher's MCP tool once its server is registered", () => {
+    const requested = ['Read', 'WebFetch', 'WebSearch', 'mcp__bgpt__search_papers'];
+    const result = resolveClaudeCodeTools(requested, {
+      platform: 'win32',
+      mcpServers: new Set(['bgpt']),
+    });
+
+    expect(result.resolved).toEqual(['Read', 'WebFetch', 'WebSearch']);
+    expect(result.mcpTools).toEqual(['mcp__bgpt__search_papers']);
+    expect(result.dropped).toHaveLength(0);
   });
 
   // categories/09-meta-orchestration/codebase-orchestrator.md
@@ -478,5 +496,70 @@ describe('resolveClaudeCodeTools: against the real 154-agent registry', () => {
       // the token must be non-empty for the whole catalog today.
       expect(token.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('MCP tool passthrough (Stage 2)', () => {
+  it('grants an mcp__server__tool only when that server is registered', () => {
+    // The whole of the opt-in. An entry in the registry is a command the CLI will execute, so
+    // "which servers exist" is an operator decision and a run can only draw from it.
+    const granted = resolveClaudeCodeTools(['mcp__investing__tax_summary'], {
+      platform: 'win32',
+      mcpServers: new Set(['investing']),
+    });
+    expect(granted.mcpTools).toEqual(['mcp__investing__tax_summary']);
+    expect(granted.dropped).toHaveLength(0);
+    // Never in `resolved`: that list feeds `--tools`, which is built-ins only.
+    expect(granted.resolved).toHaveLength(0);
+  });
+
+  it('drops an MCP tool from an unregistered server, with a reason that names the fix', () => {
+    const dropped = resolveClaudeCodeTools(['mcp__rogue__place_order'], {
+      platform: 'win32',
+      mcpServers: new Set(['investing']),
+    });
+
+    expect(dropped.mcpTools).toHaveLength(0);
+    expect(dropped.dropped[0]?.reason).toBe('mcp-server-not-registered');
+    // Distinct from `not-a-builtin` because the two need different fixes: this one is resolvable
+    // by registering the server, the other means the name can never be granted.
+    expect(dropped.dropped[0]?.detail).toContain('rogue');
+    expect(dropped.dropped[0]?.detail).toContain('AGENT_OFFICE_MCP_CONFIG');
+  });
+
+  it('drops every MCP tool when no registry is configured at all', () => {
+    // Deny by default, matching the shell. A deployment that never opted in behaves exactly as it
+    // did before MCP support existed.
+    const none = resolveClaudeCodeTools(['Read', 'mcp__investing__tax_summary'], {
+      platform: 'win32',
+    });
+
+    expect(none.mcpTools).toHaveLength(0);
+    expect(none.resolved).toEqual(['Read']);
+    expect(none.dropped.map((d) => d.reason)).toEqual(['mcp-server-not-registered']);
+  });
+
+  it('deduplicates repeated MCP requests while preserving first-requested order', () => {
+    const dupes = resolveClaudeCodeTools(
+      ['mcp__investing__macro_snapshot', 'mcp__investing__tax_summary', 'mcp__investing__macro_snapshot'],
+      { platform: 'win32', mcpServers: new Set(['investing']) },
+    );
+
+    expect(dupes.mcpTools).toEqual([
+      'mcp__investing__macro_snapshot',
+      'mcp__investing__tax_summary',
+    ]);
+  });
+
+  it('leaves an agent requesting only MCP tools with the explicit-empty built-in token', () => {
+    // The fail-safe direction this module documents: an empty `--tools` disables built-ins, an
+    // OMITTED `--tools` means "all of them". An agent whose only tools are MCP must land on the
+    // former.
+    const mcpOnly = resolveClaudeCodeTools(['mcp__investing__tax_summary'], {
+      platform: 'win32',
+      mcpServers: new Set(['investing']),
+    });
+
+    expect(toArgvToken(mcpOnly.resolved)).toBe('');
   });
 });

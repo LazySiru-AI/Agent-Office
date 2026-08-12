@@ -241,6 +241,65 @@ describe('describeModelOverride', () => {
   });
 });
 
+describe('buildArgs — MCP (Stage 2)', () => {
+  const withMcp = resolveClaudeCodeTools(['Read', 'mcp__investing__tax_summary'], {
+    platform: 'win32',
+    mcpServers: new Set(['investing']),
+  });
+
+  it('puts MCP tools in --allowedTools and never in --tools', () => {
+    // WHAT THIS PREVENTS: a CLI-side failure far from its cause. `--tools` is documented as
+    // selecting "from the built-in set" (verified against 2.1.222's --help), so an `mcp__*` name
+    // there is wrong rather than merely redundant. Availability comes from --mcp-config;
+    // permission comes from --allowedTools.
+    const args = buildArgs({
+      systemPromptPath: 'sp.md',
+      tools: withMcp,
+      options: {},
+      mcpConfigPath: 'C:/toolset/mcp.json',
+    });
+
+    const toolsValue = args[args.indexOf('--tools') + 1] ?? '';
+    const allowedValue = args[args.indexOf('--allowedTools') + 1] ?? '';
+
+    expect(toolsValue).toContain('Read');
+    expect(toolsValue).not.toContain('mcp__');
+    expect(allowedValue).toContain('mcp__investing__tax_summary');
+    expect(allowedValue).toContain('Read');
+  });
+
+  it('always pairs --mcp-config with --strict-mcp-config', () => {
+    // WHAT THIS PREVENTS: the registry becoming decorative. Without --strict-mcp-config the CLI
+    // ALSO loads the ambient configuration — the operator's own ~/.claude.json and any project
+    // .mcp.json — so a delegated agent would silently inherit every server the human happens to
+    // have enabled, including ones with write or order-placement capability. The allowlist would
+    // then govern only what an agent may *ask* for while the CLI quietly supplied the rest.
+    const args = buildArgs({
+      systemPromptPath: 'sp.md',
+      tools: withMcp,
+      options: {},
+      mcpConfigPath: 'C:/toolset/mcp.json',
+    });
+
+    expect(args).toContain('--mcp-config');
+    expect(args[args.indexOf('--mcp-config') + 1]).toBe('C:/toolset/mcp.json');
+    expect(args).toContain('--strict-mcp-config');
+  });
+
+  it('adds no MCP flags at all when the deployment has not enabled MCP', () => {
+    // The common path. A deployment that never registered a server must produce byte-for-byte the
+    // argv it produced before MCP support existed.
+    const args = buildArgs({
+      systemPromptPath: 'sp.md',
+      tools: resolveClaudeCodeTools(['Read'], { platform: 'win32' }),
+      options: {},
+    });
+
+    expect(args).not.toContain('--mcp-config');
+    expect(args).not.toContain('--strict-mcp-config');
+  });
+});
+
 describe('buildArgs', () => {
   const tools = resolveClaudeCodeTools(['Read', 'Write'], { platform: 'win32' });
 

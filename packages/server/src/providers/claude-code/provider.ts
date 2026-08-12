@@ -6,6 +6,7 @@ import { ProviderUnavailableError, type AgentProvider, type AgentRunRequest, typ
 import { killTree, spawnClaude } from './childProcess.js';
 import { LineSplitter, normaliseFrame, parseFrame } from './parse.js';
 import { checkClaudeCodeAvailability, resolveClaudeBinaryCached } from './resolveBinary.js';
+import { loadMcpRegistry } from './mcpConfig.js';
 import { resolveClaudeCodeTools, toArgvToken } from './tools.js';
 
 /**
@@ -166,7 +167,14 @@ export class ClaudeCodeProvider implements AgentProvider {
       throw new ProviderUnavailableError(this.id, 'the Claude Code CLI could not be resolved');
     }
 
-    const tools = resolveClaudeCodeTools(request.allowedTools, { allowShell: shellIsAllowed() });
+    // Read per run rather than cached at module load, for the same reason `shellIsAllowed` is: an
+    // operator who edits the registry and restarts should see the change, and a test should not
+    // have to defeat a module-level cache to exercise a different configuration.
+    const mcpRegistry = loadMcpRegistry();
+    const tools = resolveClaudeCodeTools(request.allowedTools, {
+      allowShell: shellIsAllowed(),
+      ...(mcpRegistry === undefined ? {} : { mcpServers: mcpRegistry.serverNames }),
+    });
 
     // A dropped tool is a degraded run, not a failed one (NFR-8). The agent was
     // written expecting it, so the user should see that it is missing — but an
@@ -213,6 +221,7 @@ export class ClaudeCodeProvider implements AgentProvider {
         tools,
         options: this.options,
         ...(request.model === undefined ? {} : { requestModel: request.model }),
+        ...(mcpRegistry === undefined ? {} : { mcpConfigPath: mcpRegistry.configPath }),
       });
 
       const spawnProcess = this.options.deps?.spawn ?? spawnClaude;
@@ -357,6 +366,14 @@ interface BuildArgsInput {
    * and is dropped rather than forwarded.
    */
   requestModel?: string;
+  /**
+   * Path to this deployment's MCP config, from {@link loadMcpRegistry}, or absent when MCP is not
+   * enabled here.
+   *
+   * Absent is the common case and must stay cheap: no flag is added, and the CLI behaves exactly as
+   * it did before MCP support existed.
+   */
+  mcpConfigPath?: string;
 }
 
 /**
@@ -419,10 +436,27 @@ export function buildArgs(input: BuildArgsInput): string[] {
     token,
   ];
 
-  if (token.length > 0) {
+  // MCP tools go in the permission allowlist but NOT in `--tools`. The CLI documents `--tools` as
+  // selecting "from the built-in set", so an `mcp__*` name there is wrong rather than merely
+  // redundant; an MCP tool's *availability* comes from `--mcp-config` below, and only its
+  // *permission* comes from `--allowedTools`. Verified against 2.1.222's own `--help`.
+  const allowed = [token, ...tools.mcpTools].filter((entry) => entry.length > 0).join(',');
+  if (allowed.length > 0) {
     // The permission allowlist, distinct from tool availability above: this is
     // what keeps a granted tool from stopping to ask.
-    args.push('--allowedTools', token);
+    args.push('--allowedTools', allowed);
+  }
+
+  if (input.mcpConfigPath !== undefined) {
+    args.push('--mcp-config', input.mcpConfigPath);
+    // Non-negotiable companion to the line above. Without it the CLI *also* loads the ambient MCP
+    // configuration — the user's own `~/.claude.json` and any project `.mcp.json` it finds — so a
+    // delegated agent would silently inherit every server the human running this happens to have
+    // enabled, including ones with write or order-placement capability. That would make the
+    // registry in `mcpConfig.ts` decorative: it would decide what an agent may *ask* for while the
+    // CLI quietly supplied the rest. `--strict-mcp-config` is what makes "registered servers only"
+    // actually true.
+    args.push('--strict-mcp-config');
   }
 
   // An explicit provider-level model wins over the catalog's frontmatter: the
