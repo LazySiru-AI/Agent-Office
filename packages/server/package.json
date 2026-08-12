@@ -16,6 +16,7 @@
     "run": "tsx src/scripts/run.ts",
     "agent": "tsx src/scripts/agent.ts",
     "serve": "tsx src/scripts/serve.ts",
+    "runs:purge": "tsx src/scripts/purge.ts",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
@@ -31,6 +32,6 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "vitest": "^3.2.7"
   }
 }

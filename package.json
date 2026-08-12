@@ -18,11 +18,12 @@
     "web": "npm run dev --workspace @agent-office/web",
     "build:web": "npm run build --workspace @agent-office/web",
     "test": "vitest run",
+    "runs:purge": "npm run runs:purge --workspace @agent-office/server --",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0",
-    "vitest": "^2.1.0"
+    "vitest": "^3.2.7"
   }
 }
