@@ -112,48 +112,42 @@ jobs:
       - run: npm test
 
   # ---------------------------------------------------------------------------
-  # `npm audit`. Two tiers, run separately, because they answer different
-  # questions and this repo has a concrete case showing why conflating them
-  # is the wrong call.
+  # `npm audit`. Both tiers are hard gates.
   #
-  # As of the commit that added this workflow, `npm audit --audit-level=high`
-  # reports FIVE advisories against this lockfile: a high-severity Vite
-  # advisory (GHSA-fx2h-pf6j-xcff, `server.fs.deny` bypass on Windows) and a
-  # CRITICAL vitest advisory (GHSA-5xrq-8626-4rwp, arbitrary file read/execute
-  # via the vitest UI server) that both clear the `--audit-level=high`
-  # threshold, plus three moderate ones that don't. All five resolve via the
-  # same pending `vitest`/`vite` major-version upgrade (vitest -> 4.1.10),
-  # which is being done separately from this security-audit pass — see the
-  # PR/issue tracking that upgrade. Note for whoever is doing that upgrade:
-  # this comment mentions the critical vitest advisory because `npm audit`
-  # surfaced it while writing this workflow, not because it was called out in
-  # the original finding, which named only the Vite one — worth confirming
-  # both are on your radar before you land the fix.
+  # This job was written with the second tier soft (`continue-on-error: true`),
+  # because at that moment the lockfile carried five advisories — the
+  # high-severity Vite `server.fs.deny` bypass on Windows
+  # (GHSA-fx2h-pf6j-xcff), a critical vitest UI-server advisory
+  # (GHSA-5xrq-8626-4rwp), and three moderate — and a check that is red from
+  # the day it merges is a check people learn to ignore.
   #
-  #   1. Production dependencies (`--omit=dev`) are hard-gated and MUST be
-  #      clean at `high`. This is the tree that actually ships and runs
-  #      wherever this server is deployed — it's where `marked` lives, and
-  #      `marked` sitting directly on the untrusted-input path is the
-  #      motivating example in the finding this job closes. Today this tier
-  #      is clean (`vite`/`vitest`/`esbuild` are devDependencies only, in
-  #      every workspace package — none of them ship), so this step is a real
-  #      gate from day one, not a formality.
-  #   2. The full tree (including devDependencies — build and test tooling
-  #      that never ships) is soft-gated: it runs, and its output is always
-  #      printed, but `continue-on-error: true` keeps it from failing the job.
-  #      This is the trade the "useful on day one" instruction is asking for:
-  #      a hard gate on this tier would make the workflow red from the moment
-  #      it merges, over an issue already being fixed elsewhere, which is
-  #      exactly how a CI check earns the reputation of being ignored. Making
-  #      it soft doesn't make it silent — the report still prints in the job
-  #      log and the step still shows its failure in the Actions UI (a
-  #      warning triangle, not a swallowed exit code) — it just doesn't block
-  #      merges while that fix is in flight.
+  # That upgrade has since landed (`vite@6.4.3`, `vitest@3.2.7`), and
+  # `npm audit` now reports **0 vulnerabilities** at every level, so the trade
+  # has stopped being worth making and the exemption is gone.
   #
-  #   Once the vitest/vite upgrade lands, tier 2 should go back to a hard
-  #   gate (drop `--omit=dev` entirely, or drop this job down to a single
-  #   `npm audit --audit-level=high` step with no `continue-on-error`) —
-  #   that's the point where the trade above stops being worth making.
+  # The two tiers are still run separately, because they answer different
+  # questions and the distinction is useful in triage rather than decorative:
+  #
+  #   1. Production dependencies (`--omit=dev`) — the tree that actually ships
+  #      and runs wherever this server is deployed. It is where `marked` lives,
+  #      and `marked` sitting directly on the untrusted-input path is the
+  #      motivating example in the finding this job closes.
+  #   2. The full tree, including build and test tooling that never ships. Dev
+  #      tooling is not exempt from mattering here: the Vite dev server is the
+  #      only way to run this product's UI, which is exactly why that advisory
+  #      was reachable in normal use rather than theoretical.
+  #
+  # Running them in this order means a failure in step 1 says "this is in code
+  # that ships" before step 2 can say "this is somewhere in the tree" — same
+  # verdict, more information, at the cost of one extra `npm audit` invocation
+  # against an already-installed tree.
+  #
+  # A consequence worth stating plainly, since it is the price of a hard gate:
+  # a newly published advisory against an unchanged lockfile will turn this red
+  # with no code change. That is the intended behaviour, not a flaw — the
+  # Dependabot config beside this file is what turns that signal into a bump —
+  # but it does mean a red build here is sometimes a message about the world
+  # rather than about the commit under test.
   # ---------------------------------------------------------------------------
   audit:
     name: npm audit
@@ -165,11 +159,10 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: npm ci
-      - name: Audit production dependencies (hard gate)
+      - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=high
-      - name: Audit full tree, including dev tooling (visible, non-blocking — see job comment)
+      - name: Audit full tree, including dev tooling
         run: npm audit --audit-level=high
-        continue-on-error: true
 
   # ---------------------------------------------------------------------------
   # AO-10: the vendored subagent catalog under `categories/` is loaded
