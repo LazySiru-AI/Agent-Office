@@ -6,7 +6,7 @@ import {
 } from '@agent-office/shared';
 import { MemoryRunStore } from '../store/memoryStore.js';
 import type { RunStore } from '../store/types.js';
-import { RingBuffer, RunSupervisor } from './supervisor.js';
+import { DEFAULT_MAX_CONCURRENT_RUNS, RingBuffer, RunConcurrencyLimitError, RunSupervisor } from './supervisor.js';
 import {
   SLOW_RUN_TIMEOUT_MS,
   stubDeliverable,
@@ -376,6 +376,102 @@ describe('RunSupervisor cancellation (FR-M9)', () => {
     expect(supervisor.liveRunIds()).toEqual([]);
     expect((await supervisor.getRunState(first)).status).toBe('cancelled');
     expect((await supervisor.getRunState(second)).status).toBe('cancelled');
+  });
+});
+
+describe('RunSupervisor concurrency cap (AO-6)', () => {
+  it('refuses the (N+1)th run once N are already executing, and allows a new one once a slot frees', async () => {
+    // WHAT THIS PREVENTS: `startRun` used to accept every request
+    // unconditionally and start `executeRun` in the background — no ceiling
+    // on how many could be going at once. Each run spawns real, billed
+    // provider child processes, several per phase, so on a loopback server
+    // with no user boundary that is an unbounded-cost primitive: anything
+    // that could reach the port could keep starting runs forever.
+    // `--max-budget-usd` caps what ONE run spends; nothing capped how many
+    // could be spending it simultaneously.
+    const store = new MemoryRunStore();
+    const supervisor = new RunSupervisor({
+      registry: testRegistry(),
+      store,
+      // Hung so both slots stay occupied until the test releases one on
+      // purpose, rather than the scripted provider finishing before the
+      // assertions below get a chance to run.
+      makeProvider: testProviderFactory({ lead: { hang: true } }),
+      onWarning: () => undefined,
+      produceDeliverable: stubDeliverable(),
+      maxConcurrentRuns: 2,
+    });
+
+    const first = await supervisor.startRun({ task: 'first' });
+    const second = await supervisor.startRun({ task: 'second' });
+    await waitFor(() => supervisor.liveRunIds().length === 2, 'both runs to be live');
+
+    await expect(supervisor.startRun({ task: 'one too many' })).rejects.toThrow(RunConcurrencyLimitError);
+    // The refusal happens before a run is ever created for it — `startRun`
+    // checks the cap before touching the provider or the store at all.
+    expect((await store.listRuns()).map((run) => run.task)).not.toContain('one too many');
+    expect(supervisor.liveRunIds()).toHaveLength(2);
+
+    // Free a slot the way a real run ends, then confirm the cap actually
+    // tracks live count rather than a total-ever-started counter.
+    supervisor.cancelRun(first);
+    await waitForTerminal(supervisor, first);
+
+    const third = await supervisor.startRun({ task: 'now there is room' });
+    expect(supervisor.liveRunIds()).toContain(third);
+
+    supervisor.cancelRun(second);
+    supervisor.cancelRun(third);
+    await waitForTerminal(supervisor, second);
+    await waitForTerminal(supervisor, third);
+  });
+
+  it('counts a run parked at awaiting_approval against the cap', async () => {
+    // A parked run is still `live` from the supervisor's point of view (see
+    // `shutdown`'s doc comment for the same point made about cancellation),
+    // and it has already spent one planning call's worth of provider cost to
+    // get there — this pins that the cap agrees, rather than quietly only
+    // counting runs mid-dispatch.
+    const store = new MemoryRunStore();
+    const supervisor = new RunSupervisor({
+      registry: testRegistry(),
+      store,
+      makeProvider: testProviderFactory(),
+      onWarning: () => undefined,
+      produceDeliverable: stubDeliverable(),
+      maxConcurrentRuns: 1,
+    });
+
+    const parked = await supervisor.startRun({ task: 'first', reviewTeam: true });
+    await waitFor(
+      async () => (await supervisor.getRunState(parked)).status === 'awaiting_approval',
+      'the run to park for team approval',
+    );
+
+    await expect(supervisor.startRun({ task: 'blocked' })).rejects.toThrow(RunConcurrencyLimitError);
+
+    supervisor.cancelRun(parked);
+    await waitForTerminal(supervisor, parked);
+  });
+
+  it('defaults to DEFAULT_MAX_CONCURRENT_RUNS when the deps do not override it', async () => {
+    const { supervisor } = makeSupervisor({ lead: { hang: true } });
+
+    const ids: string[] = [];
+    for (let i = 0; i < DEFAULT_MAX_CONCURRENT_RUNS; i += 1) {
+      ids.push(await supervisor.startRun({ task: `run ${i}` }));
+    }
+    await waitFor(
+      () => supervisor.liveRunIds().length === DEFAULT_MAX_CONCURRENT_RUNS,
+      'every run up to the default cap to be live',
+    );
+
+    await expect(supervisor.startRun({ task: 'past the default cap' })).rejects.toThrow(
+      RunConcurrencyLimitError,
+    );
+
+    for (const id of ids) supervisor.cancelRun(id);
+    for (const id of ids) await waitForTerminal(supervisor, id);
   });
 });
 

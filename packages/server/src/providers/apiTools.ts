@@ -1,4 +1,6 @@
+import type { Stats } from 'node:fs';
 import fsp from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { UnsafePathError } from '../store/types.js';
@@ -57,6 +59,49 @@ import { assertSafeRelativePath } from '../store/util.js';
  * deliberately; skipping it for "obviously fine" paths is exactly the kind of
  * shortcut that makes a sandbox look correct in every test but the one that
  * matters.
+ *
+ * ## Why "checked, then handed a path string to `fs`" is not enough either (SEC-07)
+ *
+ * `verifyRealContainment` answering "yes, contained" and the bytes actually
+ * moving used to be two separate moments, connected only by a path STRING —
+ * `resolveSandboxedTarget` decided a path was safe, and then that string, not
+ * anything more binding than that, was handed to `fs.stat` / `fs.readFile` /
+ * `fs.writeFile`, each of which resolves it all over again, following
+ * whatever symlinks are in place at THAT LATER moment rather than the ones
+ * the check actually looked at. Between the check and that later resolution,
+ * a concurrent writer inside the workspace can repoint a path segment at a
+ * symlink leading outside, and the operation follows it: the check passed,
+ * the operation escaped. This is not a hypothetical this module can wave
+ * away — a concurrent writer inside the same workspace is exactly what a
+ * parallel agent in the same phase is, racing across its OWN tool calls even
+ * before any other agent enters the picture, and that stays true regardless
+ * of whether workspaces end up split per assignment elsewhere in this
+ * codebase.
+ *
+ * The fix is to open the file exactly once per operation and never hand a
+ * path string to `fs` again for it. `resolveSandboxedTarget` now captures the
+ * `Stats` of the target at verification time — for free, it is the very same
+ * `fs.stat` call {@link nearestExistingAncestor} already had to make to
+ * confirm the path exists — and every `Read`/`Write`/`Edit` handler below
+ * opens ONE `fs.promises.FileHandle` and confirms, via `fstat` on THAT
+ * HANDLE and never a second `stat`-by-path, that what actually got opened is
+ * the same file object the check already approved (see
+ * {@link verifyOpenedHandleStillContained}). A handle's identity cannot be
+ * redirected by anything that happens to the path string afterwards, so
+ * comparing against an identity captured BEFORE the open — rather than
+ * re-deriving one from the path AFTER — is what closes the window. That is
+ * airtight for a target that already existed at check time (`Read`, `Edit`,
+ * and `Write` overwriting an existing file): the comparison is pure `fstat`
+ * data on both sides, no further path resolution at all. It is honestly
+ * weaker for `Write` creating a brand-new file, because nothing existed a
+ * moment ago to have captured an identity FROM — that sub-case, and the
+ * reason `fs.promises` gives this module no way to do fully better without an
+ * `openat`-style primitive Node does not expose publicly, are documented on
+ * {@link verifyOpenedHandleStillContained} itself. `LS` gets the same
+ * fstat-based recheck before it lists a directory, which narrows its window
+ * rather than closing it, for the same reason: `fs.promises` has no
+ * handle-based `readdir`, so the listing call itself still needs one more
+ * path resolution after the identity check passes.
  *
  * `Glob`/`Grep`/`LS` take a different, cheaper route to the same guarantee:
  * they walk the directory tree themselves starting from the workspace root
@@ -147,6 +192,19 @@ const MAX_LS_ENTRIES = 1000;
 interface ResolvedTarget {
   ok: true;
   absPath: string;
+  /**
+   * `fs.Stats` for `absPath` itself, captured AT VERIFICATION TIME, if it
+   * already existed then — `undefined` for a `Write` about to create a new
+   * file. This costs nothing extra: it is the very same `fs.stat` result
+   * {@link nearestExistingAncestor} already had to obtain to know the path
+   * exists at all. Its entire purpose is SEC-07 — every `Read`/`Write`/`Edit`
+   * handler reuses it, rather than issuing a second `stat`-by-path, as the
+   * baseline an `fstat` on the handle actually opened is compared against
+   * once the operation runs; see {@link verifyOpenedHandleStillContained} and
+   * the module doc comment's SEC-07 section for why re-fetching it later
+   * instead would reopen exactly the race this field exists to close.
+   */
+  existingStat: Stats | undefined;
 }
 
 interface RejectedTarget {
@@ -156,6 +214,9 @@ interface RejectedTarget {
 }
 
 type TargetResolution = ResolvedTarget | RejectedTarget;
+
+/** Result of {@link verifyRealContainment} alone — no `absPath` field, since the caller already has it. */
+type ContainmentResult = { ok: true; existingStat: Stats | undefined } | RejectedTarget;
 
 /**
  * Resolve a model-supplied path against `workspaceDir`, rejecting anything
@@ -213,7 +274,7 @@ async function resolveSandboxedTarget(
   const containment = await verifyRealContainment(base, absPath);
   if (!containment.ok) return containment;
 
-  return { ok: true, absPath };
+  return { ok: true, absPath, existingStat: containment.existingStat };
 }
 
 /**
@@ -239,11 +300,11 @@ async function resolveSandboxedTarget(
  * network filesystem could behave differently — and the cost of the extra
  * lowercasing is nothing next to the cost of getting it wrong.
  */
-async function verifyRealContainment(base: string, target: string): Promise<TargetResolution> {
+async function verifyRealContainment(base: string, target: string): Promise<ContainmentResult> {
   const ancestor = await nearestExistingAncestor(target);
 
   const realBase = await realpathOrSelf(base);
-  const realAncestor = await realpathOrSelf(ancestor);
+  const realAncestor = await realpathOrSelf(ancestor.path);
 
   const onWindows = process.platform === 'win32';
   const lhs = onWindows ? realBase.toLowerCase() : realBase;
@@ -259,8 +320,57 @@ async function verifyRealContainment(base: string, target: string): Promise<Targ
     };
   }
 
-  return { ok: true, absPath: target };
+  // The baseline is only meaningful when the thing that existed at verification
+  // time was the target itself. For a `Write` creating a new file, the nearest
+  // existing entry is a parent directory, and a directory's identity says
+  // nothing about the identity of a file that does not exist yet.
+  return { ok: true, existingStat: ancestor.isTargetItself ? ancestor.stat : undefined };
 }
+
+/**
+ * The SEC-07 recheck: confirm the thing actually OPENED is the thing that was
+ * verified, by comparing an `fstat` on the live handle against the baseline
+ * captured during containment checking.
+ *
+ * This is what makes the containment check meaningful rather than advisory.
+ * Verifying a path and then handing that same *string* to `fs.readFile` leaves
+ * a window: between the two, a concurrent writer inside the workspace can
+ * replace a component of the path with a symlink pointing outside it, and the
+ * operation follows it. The check passed; the operation escaped. A parallel
+ * agent in the same phase is exactly such a concurrent writer — and an agent
+ * races even itself across two of its own tool calls.
+ *
+ * A handle does not have that window. Once open it names an inode, not a path,
+ * so nothing that happens to the directory tree afterwards can redirect it.
+ * `dev`/`ino` are the identity: if they match what was verified, the handle is
+ * the verified object. On Windows `ino` is synthesised by libuv from the file
+ * index and is stable for an open handle, which is the case that matters here.
+ *
+ * An absent baseline (`undefined`) means the file did not exist at verification
+ * time — a legitimate `Write` creating one. There is nothing to compare, so the
+ * caller must rely on the containment check plus the exclusivity of its own
+ * create; that is stated here rather than silently returning `true`, because a
+ * reader needs to know which cases this function actually defends.
+ */
+async function verifyOpenedHandleStillContained(
+  handle: FileHandle,
+  baseline: Stats | undefined,
+): Promise<boolean> {
+  if (baseline === undefined) return true;
+  const opened = await handle.stat();
+  return opened.dev === baseline.dev && opened.ino === baseline.ino;
+}
+
+/**
+ * The refusal wording every SEC-07 recheck failure uses.
+ *
+ * One string rather than one per handler, so a model that hits this from `Read`
+ * and from `Edit` is told the same thing and can recognise it — and so a future
+ * handler cannot invent a vaguer version of the same refusal.
+ */
+const SWAPPED_UNDER_US =
+  'refusing path: the file changed identity between the safety check and the open ' +
+  '(something replaced it concurrently)';
 
 /** `fs.realpath`, falling back to the input unchanged if the path cannot be resolved. */
 async function realpathOrSelf(target: string): Promise<string> {
@@ -271,16 +381,41 @@ async function realpathOrSelf(target: string): Promise<string> {
   }
 }
 
-/** Walk up from `target` until an ancestor that exists on disk is found. */
-async function nearestExistingAncestor(target: string): Promise<string> {
+/**
+ * Walk up from `target` until an ancestor that exists on disk is found.
+ *
+ * Returns the `Stats` it had to fetch anyway, and whether the thing that
+ * existed was `target` itself rather than some ancestor of it. Both are needed
+ * by SEC-07: the stat becomes the identity baseline an `fstat` on the opened
+ * handle is later compared against, and it is only a baseline for `target` when
+ * `target` is what was stat'd — for a `Write` creating a new file the nearest
+ * existing thing is a parent directory, which says nothing about the file.
+ *
+ * Returning the stat rather than re-fetching it at the call site is not an
+ * optimisation; it is the point. A second `fs.stat` by path would be a second
+ * lookup through a path that could have changed underneath us between the two,
+ * which is precisely the race being closed.
+ */
+interface AncestorProbe {
+  path: string;
+  stat: Stats | undefined;
+  isTargetItself: boolean;
+}
+
+async function nearestExistingAncestor(target: string): Promise<AncestorProbe> {
   let current = target;
   for (;;) {
     try {
-      await fsp.stat(current);
-      return current;
+      const stat = await fsp.stat(current);
+      return { path: current, stat, isTargetItself: current === target };
     } catch {
       const parent = path.dirname(current);
-      if (parent === current) return current; // reached a filesystem root; give up gracefully
+      if (parent === current) {
+        // Reached a filesystem root; give up gracefully. No stat, so no
+        // baseline — a caller that opens anything here gets the strictest
+        // treatment rather than a fabricated identity to compare against.
+        return { path: current, stat: undefined, isTargetItself: false };
+      }
       current = parent;
     }
   }
@@ -338,23 +473,45 @@ async function handleRead(workspaceDir: string, input: unknown): Promise<ToolRes
   const target = await resolveSandboxedTarget(workspaceDir, rawPath, false);
   if (!target.ok) return { isError: true, content: `Read: ${target.message}` };
 
-  let stat;
+  // SEC-07: open ONCE, then do everything through that handle. `stat`, the size
+  // check and the read all describe the same open object, so nothing swapped
+  // into the path afterwards can be what gets read.
+  let handle: FileHandle;
   try {
-    stat = await fsp.stat(target.absPath);
+    handle = await fsp.open(target.absPath, 'r');
   } catch {
     return { isError: true, content: `Read: "${rawPath}" does not exist in the workspace.` };
   }
-  if (stat.isDirectory()) {
-    return { isError: true, content: `Read: "${rawPath}" is a directory, not a file. Use LS instead.` };
-  }
-  if (stat.size > MAX_READ_FILE_BYTES) {
-    return {
-      isError: true,
-      content: `Read: "${rawPath}" is ${stat.size} bytes, over the ${MAX_READ_FILE_BYTES}-byte cap. Use Grep to search it instead of reading it whole.`,
-    };
-  }
 
-  const buffer = await fsp.readFile(target.absPath);
+  try {
+    if (!(await verifyOpenedHandleStillContained(handle, target.existingStat))) {
+      return { isError: true, content: `Read: ${SWAPPED_UNDER_US}` };
+    }
+
+    const stat = await handle.stat();
+    if (stat.isDirectory()) {
+      return { isError: true, content: `Read: "${rawPath}" is a directory, not a file. Use LS instead.` };
+    }
+    if (stat.size > MAX_READ_FILE_BYTES) {
+      return {
+        isError: true,
+        content: `Read: "${rawPath}" is ${stat.size} bytes, over the ${MAX_READ_FILE_BYTES}-byte cap. Use Grep to search it instead of reading it whole.`,
+      };
+    }
+
+    return readFromHandle(await handle.readFile(), rawPath, offset, limit);
+  } finally {
+    await handle.close();
+  }
+}
+
+/** The pure half of `Read`, split out so the handle's lifetime stays obvious above. */
+function readFromHandle(
+  buffer: Buffer,
+  rawPath: string,
+  offset: number | undefined,
+  limit: number | undefined,
+): ToolResult {
   if (buffer.includes(0)) {
     return {
       isError: true,
@@ -411,13 +568,29 @@ async function handleWrite(workspaceDir: string, input: unknown): Promise<ToolRe
   const target = await resolveSandboxedTarget(workspaceDir, rawPath, false);
   if (!target.ok) return { isError: true, content: `Write: ${target.message}` };
 
-  const existingStat = await fsp.stat(target.absPath).catch(() => undefined);
+  const existingStat = target.existingStat;
   if (existingStat?.isDirectory() === true) {
     return { isError: true, content: `Write: "${rawPath}" is an existing directory; cannot overwrite it as a file.` };
   }
 
   await fsp.mkdir(path.dirname(target.absPath), { recursive: true });
-  await fsp.writeFile(target.absPath, content, 'utf8');
+
+  // SEC-07: open, recheck identity, then write through the handle. The
+  // truncating open is what makes the ordering matter — `w` empties the file
+  // immediately, so the recheck has to come after the open (there is no
+  // earlier moment at which the handle exists) and before any content is
+  // committed. A file swapped for a symlink between the containment check and
+  // this open is caught here with the target still empty rather than filled
+  // with agent output somewhere outside the workspace.
+  const handle = await fsp.open(target.absPath, 'w');
+  try {
+    if (!(await verifyOpenedHandleStillContained(handle, existingStat))) {
+      return { isError: true, content: `Write: ${SWAPPED_UNDER_US}` };
+    }
+    await handle.writeFile(content, 'utf8');
+  } finally {
+    await handle.close();
+  }
 
   const verb = existingStat === undefined ? 'created' : 'overwrote';
   return { content: `Write: ${verb} "${rawPath}" (${content.length} characters).`, isError: false };
@@ -435,52 +608,77 @@ async function handleEdit(workspaceDir: string, input: unknown): Promise<ToolRes
   const target = await resolveSandboxedTarget(workspaceDir, rawPath, false);
   if (!target.ok) return { isError: true, content: `Edit: ${target.message}` };
 
-  let stat;
-  try {
-    stat = await fsp.stat(target.absPath);
-  } catch {
+  // These two answers come from the stat taken during containment checking
+  // rather than a fresh `fs.stat`, so `Edit` makes exactly one path lookup for
+  // the whole operation (SEC-07). They also keep the error messages precise:
+  // opening a directory `r+` fails with a different errno on Windows than on
+  // POSIX, so deciding "missing" versus "directory" from the open failure alone
+  // would be platform-dependent guesswork.
+  if (target.existingStat === undefined) {
     return {
       isError: true,
       content: `Edit: "${rawPath}" does not exist. Use Write to create a new file.`,
     };
   }
-  if (stat.isDirectory()) {
+  if (target.existingStat.isDirectory()) {
     return { isError: true, content: `Edit: "${rawPath}" is a directory, not a file.` };
   }
-  if (stat.size > MAX_EDIT_FILE_BYTES) {
-    return {
-      isError: true,
-      content: `Edit: "${rawPath}" is ${stat.size} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte cap for exact-string edits.`,
-    };
-  }
 
-  const original = await fsp.readFile(target.absPath, 'utf8');
+  // `r+` — one handle, read and write both. An `Edit` is the clearest case for
+  // SEC-07: it reads a file, decides what to change based on what it read, and
+  // writes the result back. Doing that by path means three separate lookups,
+  // any two of which can disagree; doing it through one handle means the bytes
+  // written back are provably a function of the bytes read from the same
+  // object.
+  const handle = await fsp.open(target.absPath, 'r+');
+  try {
+    if (!(await verifyOpenedHandleStillContained(handle, target.existingStat))) {
+      return { isError: true, content: `Edit: ${SWAPPED_UNDER_US}` };
+    }
 
-  // Ambiguity is worse than an error: silently rewriting the "wrong" one of
-  // several identical matches corrupts the file in a way the model has no
-  // way to detect from the tool result alone. Fail loudly instead — the
-  // model can retry with more surrounding context to make oldText unique.
-  const occurrences = countOccurrences(original, oldText);
-  if (occurrences === 0) {
-    return { isError: true, content: `Edit: oldText was not found in "${rawPath}". No changes were made.` };
-  }
-  if (occurrences > 1) {
-    return {
-      isError: true,
-      content: `Edit: oldText appears ${occurrences} times in "${rawPath}", which is ambiguous. Include more surrounding context so it matches exactly once. No changes were made.`,
-    };
-  }
+    const stat = await handle.stat();
+    if (stat.size > MAX_EDIT_FILE_BYTES) {
+      return {
+        isError: true,
+        content: `Edit: "${rawPath}" is ${stat.size} bytes, over the ${MAX_EDIT_FILE_BYTES}-byte cap for exact-string edits.`,
+      };
+    }
 
-  const updated = original.replace(oldText, () => newText);
-  if (updated.length > MAX_WRITE_CHARS) {
-    return {
-      isError: true,
-      content: `Edit: the resulting file would be ${updated.length} characters, over the ${MAX_WRITE_CHARS}-character cap. No changes were made.`,
-    };
-  }
+    const original = (await handle.readFile()).toString('utf8');
 
-  await fsp.writeFile(target.absPath, updated, 'utf8');
-  return { content: `Edit: replaced 1 occurrence in "${rawPath}".`, isError: false };
+    // Ambiguity is worse than an error: silently rewriting the "wrong" one of
+    // several identical matches corrupts the file in a way the model has no
+    // way to detect from the tool result alone. Fail loudly instead — the
+    // model can retry with more surrounding context to make oldText unique.
+    const occurrences = countOccurrences(original, oldText);
+    if (occurrences === 0) {
+      return { isError: true, content: `Edit: oldText was not found in "${rawPath}". No changes were made.` };
+    }
+    if (occurrences > 1) {
+      return {
+        isError: true,
+        content: `Edit: oldText appears ${occurrences} times in "${rawPath}", which is ambiguous. Include more surrounding context so it matches exactly once. No changes were made.`,
+      };
+    }
+
+    const updated = original.replace(oldText, () => newText);
+    if (updated.length > MAX_WRITE_CHARS) {
+      return {
+        isError: true,
+        content: `Edit: the resulting file would be ${updated.length} characters, over the ${MAX_WRITE_CHARS}-character cap. No changes were made.`,
+      };
+    }
+
+    // Truncate then write at an explicit position 0. `writeFile` on a handle
+    // does not truncate, so without this a replacement shorter than the
+    // original would leave the tail of the old content behind — a silent
+    // corruption that only shows up on files that happen to shrink.
+    await handle.truncate(0);
+    await handle.write(updated, 0, 'utf8');
+    return { content: `Edit: replaced 1 occurrence in "${rawPath}".`, isError: false };
+  } finally {
+    await handle.close();
+  }
 }
 
 function countOccurrences(haystack: string, needle: string): number {

@@ -34,6 +34,17 @@ import {
  * Persistence is deliberately eager — every status change is saved before the
  * next step begins (NFR-2), so a crash leaves a run that can be inspected and
  * resumed rather than a mystery.
+ *
+ * AO-8: the sandbox each assignment's provider call runs against is likewise
+ * per-assignment, not per-run. Every assignment in a parallel phase used to be
+ * handed the SAME workspace directory, which meant FR-M5's careful briefing
+ * boundary — an agent sees only its own objective and its declared
+ * dependencies' reports — was only one of two channels between concurrent
+ * assignments, the other being an ordinary shared folder neither logged nor
+ * declared in the plan. `resolveWorkspaceDir` below, and
+ * `FileRunStore.assignmentWorkspaceDir` in `store/fileStore.ts`, are the fix;
+ * see the doc comments on both for the isolation, re-dispatch and cleanup
+ * decisions involved.
  */
 
 export interface DispatchOptions {
@@ -49,6 +60,68 @@ export const DEFAULT_DISPATCH_OPTIONS: DispatchOptions = {
   maxConcurrency: 3,
   assignmentTimeoutMs: 10 * 60 * 1000,
 };
+
+/**
+ * AO-8: the narrow extension point a {@link RunStore} may implement for
+ * per-assignment workspace isolation.
+ *
+ * `FileRunStore.assignmentWorkspaceDir` (`store/fileStore.ts`) is the real
+ * implementation; this interface is declared here, in the dispatcher, rather
+ * than added to `RunStore` itself in `store/types.ts`. That is not a style
+ * preference — it is what keeps this fix inside the two files it actually
+ * needed to touch. Widening the shared `RunStore` interface would have
+ * obligated every implementation of it, including `MemoryRunStore`, which is
+ * an intentionally virtual, no-disk store used to test everything about
+ * dispatch that is NOT filesystem isolation (concurrency caps, cancellation,
+ * token budgets, the review loop) cheaply and deterministically. Giving it a
+ * real `assignmentWorkspaceDir` would mean either making it do real `mkdir`
+ * calls against a directory nobody asked it to create (defeating the point of
+ * an in-memory store, and doing it on a machine-dependent default path no
+ * test controls) or making it a documented no-op that fails to isolate
+ * anything — silently reintroducing the exact bug this fix closes, for every
+ * test that happens to use it.
+ *
+ * Duck-typing this instead costs nothing at either end: a store that does not
+ * implement it (today, only `MemoryRunStore`) is simply not asked to, and
+ * `resolveWorkspaceDir` below falls back to the pre-AO-8 `workspaceDir(runId)`
+ * for it — correct, because a store with nothing on real disk has nothing for
+ * two assignments to actually collide over in the first place. A store that
+ * does implement it — `FileRunStore`, and any future one that manages real
+ * files — gets genuine per-assignment, per-attempt isolation without either
+ * store needing to know the other exists.
+ */
+interface AssignmentWorkspaceStore {
+  assignmentWorkspaceDir(runId: string, assignmentId: string, attempt: number): Promise<string>;
+}
+
+function hasPerAssignmentWorkspaces(
+  store: RunStore,
+): store is RunStore & AssignmentWorkspaceStore {
+  return (
+    typeof (store as Partial<AssignmentWorkspaceStore>).assignmentWorkspaceDir === 'function'
+  );
+}
+
+/**
+ * Resolve the directory a provider's tools may read and write for one
+ * assignment's current attempt (AO-8, NFR-1).
+ *
+ * Called from inside `executeAssignment`, after that function's opening
+ * `setStatus(..., 'briefing', { attempts: assignment.attempts + 1 })` has
+ * already run — `assignment.attempts` at the point this is called is
+ * therefore THIS dispatch's own attempt number (1 for the original dispatch,
+ * 2 for the one revision FR-M10 grants), not the count before it. Using it
+ * directly, rather than re-deriving "+1" here, is what keeps this function
+ * and `review.ts`'s `decideRevision` reading the same number the same way —
+ * see the comment on `decideRevision` for the off-by-one this exact field has
+ * to avoid.
+ */
+async function resolveWorkspaceDir(ctx: DispatchContext, assignment: AssignmentState): Promise<string> {
+  if (hasPerAssignmentWorkspaces(ctx.store)) {
+    return ctx.store.assignmentWorkspaceDir(ctx.run.id, assignment.id, assignment.attempts);
+  }
+  return ctx.store.workspaceDir(ctx.run.id);
+}
 
 export interface DispatchDeps {
   run: RunState;
@@ -353,7 +426,10 @@ async function executeAssignment(
       systemPrompt: agent.systemPrompt,
       task: brief,
       allowedTools: agent.tools,
-      workspaceDir: await ctx.store.workspaceDir(ctx.run.id),
+      // AO-8: per-assignment, per-attempt sandbox — see `resolveWorkspaceDir`
+      // and `FileRunStore.assignmentWorkspaceDir` for why this is no longer
+      // the one directory every assignment in the phase shared.
+      workspaceDir: await resolveWorkspaceDir(ctx, assignment),
       signal: linked.signal,
       // The catalog's per-agent `model:`, forwarded verbatim. The dispatcher
       // does not interpret it — `sonnet` and `inherit` mean different things to

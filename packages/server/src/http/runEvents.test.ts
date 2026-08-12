@@ -2,12 +2,16 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions } from 'fastify';
 import { API, type LoggedAgentEvent } from '@agent-office/shared';
 import { FileRunStore } from '../store/fileStore.js';
+import { AUTH_TOKEN_HEADER } from './authToken.js';
 import { buildServer } from './server.js';
 import { RunSupervisor } from './supervisor.js';
 import { testProviderFactory, testRegistry } from './fixtures.js';
+
+/** Not a real secret — a fixed value so these tests need not care what it is. */
+const TEST_TOKEN = 'test-suite-token-not-a-real-secret';
 
 /**
  * `GET /api/runs/:id/events` (NFR-7 replay).
@@ -45,8 +49,21 @@ async function setup(): Promise<{ app: FastifyInstance; supervisor: RunSuperviso
     makeProvider: testProviderFactory(),
     onWarning: () => undefined,
   });
-  const app = await buildServer({ registry, store, supervisor });
+  const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
   await app.ready();
+  // AO-6 put a token in front of every `/api` route. These tests are about the
+  // event-log route's own behaviour, so rather than adding the header to each
+  // of the ~8 `.inject()` calls below — a mechanical change that would make
+  // every one of them slightly less about what it is testing — the token is
+  // attached once here, at the seam.
+  const rawInject = app.inject.bind(app);
+  app.inject = ((optsOrUrl: InjectOptions | string) => {
+    const options: InjectOptions = typeof optsOrUrl === 'string' ? { url: optsOrUrl } : optsOrUrl;
+    return rawInject({
+      ...options,
+      headers: { [AUTH_TOKEN_HEADER]: TEST_TOKEN, ...options.headers },
+    });
+  }) as unknown as FastifyInstance['inject'];
 
   started.push({ app, supervisor });
   return { app, supervisor };

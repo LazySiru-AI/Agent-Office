@@ -161,13 +161,17 @@ describe('applyTeamOperations — purity and totality', () => {
 });
 
 describe('applyTeamOperations — swap', () => {
-  it('replaces only the agent, leaving objective, dependsOn and deliverable untouched', () => {
-    // This is the whole distinction between `swap` and drop-plus-add per
-    // `TeamOperationSchema`'s doc comment: the work item's identity does not
-    // move. If `swap` touched `dependsOn`, any assignment consuming this
-    // one's report (`loadUpstreamReports` in dispatcher.ts) could silently
-    // lose its upstream data; if it touched `deliverable`, a client that
-    // cached the pre-swap path (or a log line referencing it) would go stale.
+  it('replaces the agent and renames the deliverable to the new agent, leaving objective and dependsOn untouched', () => {
+    // This pins the fix for the hand-found defect: a swap used to leave
+    // `deliverable` pointing at the ORIGINAL agent's filename
+    // (`reports/02-beta.md` staying that even after swapping in `delta`),
+    // which is not cosmetic — it is the run's own artifacts (the reports
+    // directory, the listing, the PDF) misattributing the work to whoever
+    // was swapped OUT. `objective` and `dependsOn` still must not move,
+    // which remains the actual distinction between `swap` and drop-plus-add:
+    // if `swap` touched `dependsOn`, any assignment consuming this one's
+    // report (`loadUpstreamReports` in dispatcher.ts) could silently lose
+    // its upstream data.
     const plan = basePlan();
     const result = expectOk(
       applyTeamOperations(plan, [{ op: 'swap', assignmentId: 'review-1', agentName: 'delta' }], KNOWN_AGENTS),
@@ -177,11 +181,93 @@ describe('applyTeamOperations — swap', () => {
     expect(swapped?.agentName).toBe('delta');
     expect(swapped?.objective).toBe('Review the analysis.');
     expect(swapped?.dependsOn).toEqual(['lead']);
-    // The documented decision: the deliverable keeps the ORIGINAL agent's
-    // name in its filename. See `applySwap`'s comment in team.ts for why a
-    // stale-looking filename was chosen over rewriting a path nothing
-    // downstream parses.
-    expect(swapped?.deliverable).toBe('reports/02-beta.md');
+    // The NN prefix ("02") is preserved — it encodes the assignment's
+    // position in the plan, which a swap does not change — while the agent
+    // name portion is replaced to match who now actually does the work. See
+    // `deriveSwapDeliverable`'s comment in team.ts.
+    expect(swapped?.deliverable).toBe('reports/02-delta.md');
+  });
+
+  it('renames the deliverable to a unique path when the naive rename would collide with an existing one (SEC-08)', () => {
+    // The exact risk `applySwap`'s old comment cited for never renaming at
+    // all: `plan.ts`'s `RunPlanSchema.superRefine` (SEC-08) now refuses two
+    // assignments sharing a deliverable, so a naive rename that landed on a
+    // path already claimed elsewhere in the plan would turn a cosmetic fix
+    // into a plan the schema rejects outright — or, if nothing enforced
+    // uniqueness at all, two assignments racing to write the same file
+    // (`store.writeReport`'s own failure mode). Engineer that collision
+    // directly: give `review-2` the exact path `review-1`'s naive,
+    // NN-preserving rename to "delta" would also want
+    // (`reports/02-delta.md`, `review-1`'s own NN with the new agent's
+    // name), so the fallback path this test pins is unavoidable rather than
+    // coincidental.
+    const plan = basePlan();
+    const collidingPlan: RunPlan = {
+      ...plan,
+      phases: plan.phases.map((phase) =>
+        phase.id === 'review'
+          ? {
+              ...phase,
+              assignments: phase.assignments.map((a) =>
+                a.id === 'review-2' ? { ...a, deliverable: 'reports/02-delta.md' } : a,
+              ),
+            }
+          : phase,
+      ),
+    };
+    const result = expectOk(
+      applyTeamOperations(
+        collidingPlan,
+        [{ op: 'swap', assignmentId: 'review-1', agentName: 'delta' }],
+        KNOWN_AGENTS,
+      ),
+    );
+
+    const swapped = result.phases[1]?.assignments.find((a) => a.id === 'review-1');
+    const untouched = result.phases[1]?.assignments.find((a) => a.id === 'review-2');
+    // The naive rename (`reports/02-delta.md`) is exactly what `review-2` now
+    // occupies, so the swap must fall back to a disambiguated path instead —
+    // not the same string, and still following the documented suffix scheme.
+    expect(swapped?.deliverable).not.toBe('reports/02-delta.md');
+    expect(swapped?.deliverable).toBe('reports/02-delta-2.md');
+    expect(untouched?.deliverable).toBe('reports/02-delta.md');
+    // The two deliverables in the resulting plan must be unique — this is
+    // the actual guarantee SEC-08's schema will enforce; asserting it here
+    // pins the fix independent of that schema also being exercised.
+    const allDeliverables = result.phases.flatMap((p) => p.assignments.map((a) => a.deliverable));
+    expect(new Set(allDeliverables).size).toBe(allDeliverables.length);
+  });
+
+  it('falls back to the planner numbering scheme when the old deliverable has no recoverable NN prefix', () => {
+    // `deriveSwapDeliverable` reads a runtime `RunPlan`, which — like
+    // `deriveDeliverable`'s own doc comment stresses for `add` — is
+    // untrusted in the FR-M3 sense: it can be a hand-built fixture or an
+    // LLM's plan that does not actually follow the `NN-agent.md` convention
+    // it was instructed to use. If the swap's rename logic could not handle
+    // that, the fix for the original defect would trade a stale filename for
+    // a thrown exception, which is strictly worse for `applyTeamOperations`'s
+    // documented TOTAL guarantee.
+    const plan = basePlan();
+    const noPrefixPlan: RunPlan = {
+      ...plan,
+      phases: plan.phases.map((phase) =>
+        phase.id === 'review'
+          ? {
+              ...phase,
+              assignments: phase.assignments.map((a) =>
+                a.id === 'review-1' ? { ...a, deliverable: 'reports/notes.md' } : a,
+              ),
+            }
+          : phase,
+      ),
+    };
+    const result = expectOk(
+      applyTeamOperations(noPrefixPlan, [{ op: 'swap', assignmentId: 'review-1', agentName: 'delta' }], KNOWN_AGENTS),
+    );
+    const swapped = result.phases[1]?.assignments.find((a) => a.id === 'review-1');
+    // Falls back to `deriveDeliverable`'s own numbering: 3 assignments exist
+    // already (lead, review-1, review-2), so the next number is 04.
+    expect(swapped?.deliverable).toBe('reports/04-delta.md');
   });
 
   it('refuses to swap in an agent the registry does not know (FR-M3)', () => {

@@ -2,11 +2,12 @@
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, InjectOptions } from 'fastify';
 import { API, ServerMessageSchema, type ServerMessage } from '@agent-office/shared';
 import { FileRunStore } from '../store/fileStore.js';
 import { MemoryRunStore } from '../store/memoryStore.js';
 import type { RunStore } from '../store/types.js';
+import { AUTH_TOKEN_HEADER, AUTH_TOKEN_QUERY_PARAM } from './authToken.js';
 import { buildServer, isLoopbackHost } from './server.js';
 import { RunSupervisor } from './supervisor.js';
 import {
@@ -28,6 +29,14 @@ import {
  * directory. Each of those has to fail as a 400 with the contract's error shape,
  * not as a stack trace or a 500.
  */
+
+/**
+ * Not a real secret — a fixed value so every test in this file that is not
+ * itself about the token can assert on ordinary 200/400/403/404 outcomes
+ * without also having to know or care what the token is. Real deployments
+ * never see this value; `serve.ts` always calls `resolveAuthToken`.
+ */
+const TEST_TOKEN = 'test-suite-token-not-a-real-secret';
 
 const started: Array<{ app: FastifyInstance; supervisor: RunSupervisor }> = [];
 
@@ -51,6 +60,48 @@ afterEach(async () => {
   // module evaluation order.
 }, SLOW_RUN_TIMEOUT_MS);
 
+/**
+ * Attach `TEST_TOKEN` to every `.inject()`/`.injectWS()` call this `app`
+ * instance makes from here on, so the ~60 call sites in this file written
+ * before AO-6 existed keep exercising exactly what they were written to test
+ * — routing, `Host`/`Origin`, handler logic — rather than every one of them
+ * needing a mechanical, unrelated header added. A test whose whole point IS
+ * the token (see the "startup token (AO-6)" describe block below) does not
+ * call this: it builds its own app and calls `.inject()`/`.injectWS()`
+ * directly, so it controls the header (or the query parameter, or neither)
+ * itself.
+ *
+ * The override still respects an explicit header a caller supplies (spread
+ * order: the default goes in first, the caller's own `headers` are spread
+ * after), which is what lets the `Host`/`Origin` tests below keep overriding
+ * `host`/`origin` without losing the token this wrapper adds.
+ *
+ * The casts are the price of monkey-patching a method Fastify's own types
+ * declare as a set of call-signature overloads (a bare options object, a
+ * callback form, a chainable zero-argument form) rather than one function
+ * type — this file only ever uses the options-object, awaited-promise form,
+ * so the replacement only needs to implement that one, and `unknown` is the
+ * honest way to say "this satisfies less than the full overloaded type".
+ */
+function authenticateInjections(app: FastifyInstance, token: string): void {
+  const rawInject = app.inject.bind(app);
+  app.inject = ((optsOrUrl: InjectOptions | string) => {
+    const opts: InjectOptions = typeof optsOrUrl === 'string' ? { url: optsOrUrl } : optsOrUrl;
+    return rawInject({ ...opts, headers: { [AUTH_TOKEN_HEADER]: token, ...opts.headers } });
+  }) as unknown as FastifyInstance['inject'];
+
+  const rawInjectWS = app.injectWS.bind(app);
+  type InjectWSArgs = Parameters<FastifyInstance['injectWS']>;
+  app.injectWS = ((path?: InjectWSArgs[0], upgradeContext?: unknown, options?: InjectWSArgs[2]) => {
+    const context = (upgradeContext ?? {}) as { headers?: Record<string, string> };
+    return rawInjectWS(
+      path,
+      { ...context, headers: { [AUTH_TOKEN_HEADER]: token, ...context.headers } },
+      options,
+    );
+  }) as unknown as FastifyInstance['injectWS'];
+}
+
 async function setup(
   overrides: Parameters<typeof testProviderFactory>[0] = {},
 ): Promise<{ app: FastifyInstance; supervisor: RunSupervisor; store: RunStore }> {
@@ -63,11 +114,37 @@ async function setup(
     onWarning: () => undefined,
     produceDeliverable: stubDeliverable(),
   });
-  const app = await buildServer({ registry, store, supervisor });
+  const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
   await app.ready();
+  authenticateInjections(app, TEST_TOKEN);
 
   started.push({ app, supervisor });
   return { app, supervisor, store };
+}
+
+/**
+ * Like `setup()`, but deliberately WITHOUT `authenticateInjections` — used
+ * only by the "startup token (AO-6)" tests below, which are specifically
+ * about what happens when a caller does not go through that convenience.
+ * Every other test in this file wants the token attached automatically so it
+ * can get on with testing something else; these tests want full control over
+ * whether it is present, correct, wrong, or supplied a different way.
+ */
+async function setupUnauthenticated(): Promise<{ app: FastifyInstance; supervisor: RunSupervisor }> {
+  const registry = testRegistry();
+  const store = new MemoryRunStore();
+  const supervisor = new RunSupervisor({
+    registry,
+    store,
+    makeProvider: testProviderFactory(),
+    onWarning: () => undefined,
+    produceDeliverable: stubDeliverable(),
+  });
+  const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
+  await app.ready();
+
+  started.push({ app, supervisor });
+  return { app, supervisor };
 }
 
 /** Every error body must be `{ error: string }`, whatever produced it. */
@@ -205,8 +282,9 @@ describe('POST /api/runs', () => {
     const registry = testRegistry();
     const store = new MemoryRunStore();
     const supervisor = new RunSupervisor({ registry, store, onWarning: () => undefined });
-    const app = await buildServer({ registry, store, supervisor });
+    const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
     await app.ready();
+    authenticateInjections(app, TEST_TOKEN);
     started.push({ app, supervisor });
 
     const response = await app.inject({
@@ -254,8 +332,9 @@ describe('POST /api/runs', () => {
       onWarning: () => undefined,
       produceDeliverable: stubDeliverable(),
     });
-    const app = await buildServer({ registry, store, supervisor });
+    const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
     await app.ready();
+    authenticateInjections(app, TEST_TOKEN);
     started.push({ app, supervisor });
 
     const response = await app.inject({
@@ -266,6 +345,72 @@ describe('POST /api/runs', () => {
 
     expect(response.statusCode).toBe(201);
     expect(received).toContainEqual(expect.objectContaining({ maxCostUsd: 3.5 }));
+  });
+});
+
+describe('POST /api/runs concurrency cap (AO-6)', () => {
+  it('refuses the (N+1)th run with 429 while N are executing, and allows a new one once a slot frees', async () => {
+    // WHAT THIS PREVENTS: before this cap, `startRun` accepted every request
+    // that passed the trust-boundary checks unconditionally — no limit on how
+    // many were executing at once. Each run spawns real, billed provider
+    // child processes, so on a loopback server with no user boundary (the
+    // rest of AO-6) that was an unbounded-cost primitive: anything that could
+    // reach this port could keep POSTing runs forever. `--max-budget-usd`
+    // caps what ONE run can spend; nothing capped how many could be spending
+    // it at the same time.
+    const registry = testRegistry();
+    const store = new MemoryRunStore();
+    const supervisor = new RunSupervisor({
+      registry,
+      store,
+      // Every run hangs, so both cap slots stay occupied for as long as the
+      // test needs them to before the assertions below release one.
+      makeProvider: testProviderFactory({ lead: { hang: true } }),
+      onWarning: () => undefined,
+      produceDeliverable: stubDeliverable(),
+      maxConcurrentRuns: 2,
+    });
+    const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
+    await app.ready();
+    authenticateInjections(app, TEST_TOKEN);
+    started.push({ app, supervisor });
+
+    // Return type inferred rather than written as `ReturnType<typeof
+    // app.inject>`: `inject` is declared as a set of overloads (options object,
+    // callback, chainable), so that expression resolves to the chainable
+    // `Chain` form, not the promise this call actually returns.
+    const post = async (task: string) =>
+      app.inject({ method: 'POST', url: API.runs(), payload: { task } });
+
+    const first = await post('first run');
+    const second = await post('second run');
+    expect(first.statusCode).toBe(201);
+    expect(second.statusCode).toBe(201);
+    const firstId = (JSON.parse(first.body) as { runId: string }).runId;
+    await waitFor(() => supervisor.liveRunIds().length === 2, 'both runs to be live');
+
+    const third = await post('one too many');
+
+    expect(third.statusCode).toBe(429);
+    expect(expectApiError(third.body)).toMatch(/already executing/);
+    // The refusal happened before a run was ever created for it — a 429 that
+    // still allocated a run id would be a supervisor lying about its own cap.
+    expect((await store.listRuns()).map((run) => run.task)).not.toContain('one too many');
+
+    // Free a slot, exactly the way a real run ends: cancel it and wait for
+    // the supervisor to actually stop counting it as live.
+    await app.inject({ method: 'POST', url: API.cancelRun(firstId) });
+    await waitFor(() => supervisor.liveRunIds().length === 1, 'the cancelled run to free its slot');
+
+    const fourth = await post('now there is room');
+    expect(fourth.statusCode).toBe(201);
+
+    // Clean up the two runs still hanging so the suite's teardown is not left
+    // draining a supervisor that will never finish on its own.
+    for (const response of [second, fourth]) {
+      const { runId } = JSON.parse(response.body) as { runId: string };
+      await app.inject({ method: 'POST', url: API.cancelRun(runId) });
+    }
   });
 });
 
@@ -326,8 +471,9 @@ describe('GET /api/runs and /api/runs/:runId', () => {
         onWarning: () => undefined,
         produceDeliverable: stubDeliverable(),
       });
-      const app = await buildServer({ registry, store, supervisor });
+      const app = await buildServer({ registry, store, supervisor, token: TEST_TOKEN });
       await app.ready();
+      authenticateInjections(app, TEST_TOKEN);
       started.push({ app, supervisor });
 
       const response = await app.inject({ method: 'GET', url: API.run('20260101-000000-zzzz') });
@@ -1041,6 +1187,188 @@ describe('Host header allowlist (DNS rebinding)', () => {
     // catch it: `undefined` must reject exactly like `attacker.example` does,
     // never fail open.
     expect(isLoopbackHost(undefined)).toBe(false);
+  });
+});
+
+describe('the startup token (AO-6)', () => {
+  // Same register as the "Host header allowlist" block above, deliberately:
+  // this is the other half of the same trust boundary. `Host`/`Origin` prove
+  // a request arrived the way a browser aimed at this origin would send one;
+  // the token proves the caller is someone who was actually handed access to
+  // this process. Neither on its own is NFR-6's full story, which is exactly
+  // why closing only one of them (the state before this change) left a real
+  // gap: loopback is shared by every account and process on the machine, and
+  // nothing about a request's `Host` or `Origin` says who sent it.
+
+  it('refuses a GET route with no token at all', async () => {
+    // WHAT THIS PREVENTS: before AO-6, a well-formed loopback request with a
+    // valid `Host` and no `Origin` (the ordinary curl/script shape) was
+    // simply served — that is precisely the "any other local account" gap
+    // the finding describes. `GET /api/runs` was chosen for this test rather
+    // than `/api/health` because it is the read this gap most directly
+    // exposed: the full run list, to anything on the machine.
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({ method: 'GET', url: API.runs() });
+
+    expect(response.statusCode).toBe(401);
+    expectApiError(response.body);
+  });
+
+  it('refuses a state-changing POST with no token', async () => {
+    // The side-effect case, not just the read case: without this, the same
+    // other-account caller could start real, billed provider processes.
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: API.runs(),
+      payload: { task: 'Analyse the thing.' },
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('refuses the WebSocket upgrade with no token', async () => {
+    // The worst case of all three checks this file covers: WebSocket has no
+    // same-origin policy, so `Host`/`Origin` aside, the token is the ONLY
+    // thing that can still stand between an open `/ws` — run state, log
+    // lines, deliverable content, all of it — and any local process that can
+    // reach this port. This mirrors the "rejects a foreign Origin on the
+    // WebSocket upgrade" test above exactly, with the token as the axis
+    // instead of Origin.
+    const { app } = await setupUnauthenticated();
+
+    await expect(
+      app.injectWS(API.socket(), { headers: { host: 'localhost' } }),
+    ).rejects.toThrow(/401/);
+  });
+
+  it('refuses a wrong token sent as the header', async () => {
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { [AUTH_TOKEN_HEADER]: 'not-the-right-token' },
+    });
+
+    expect(response.statusCode).toBe(401);
+    // Deliberately not asserting on the error message's exact wording beyond
+    // what `expectApiError` already checks (a string) — the route's own
+    // comment explains why "wrong" and "absent" get the identical message.
+  });
+
+  it('refuses a wrong token sent as the query parameter', async () => {
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `${API.health()}?${AUTH_TOKEN_QUERY_PARAM}=not-the-right-token`,
+    });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('still requires the token on /api/health — the one route worth considering an exemption for', async () => {
+    // DECISION (see `server.ts`'s comment on this route for the full
+    // reasoning): not exempted. `liveRunIds` in the health response is
+    // exactly the kind of fact AO-6 is about — which runs this account is
+    // currently spending money to execute — so an unauthenticated health
+    // route would reopen a sliver of the same gap the token exists to close,
+    // for a benefit (an unauthenticated readiness probe) nothing in this
+    // codebase actually needs; the Vite proxy attaches the header to every
+    // `/api/*` path uniformly, `/api/health` included.
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({ method: 'GET', url: API.health() });
+
+    expect(response.statusCode).toBe(401);
+  });
+
+  it('accepts the correct token via the header, the steady-state mechanism', async () => {
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.runs(),
+      headers: { [AUTH_TOKEN_HEADER]: TEST_TOKEN },
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('accepts the correct token via the query parameter — the first-browser-load bootstrap', async () => {
+    // This is the ONE case the query parameter exists for (see
+    // `authToken.ts`'s `extractProvidedToken`): the very first top-level
+    // navigation to the URL `serve.ts` prints, before any client script has
+    // had a chance to attach a header. It is accepted here on any route, not
+    // just a designated "bootstrap" one, because the server has no session
+    // concept to make that distinction with — see the doc comment for why
+    // that is still safe.
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `${API.runs()}?${AUTH_TOKEN_QUERY_PARAM}=${TEST_TOKEN}`,
+    });
+
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('accepts the correct token on the WebSocket upgrade, via the header', async () => {
+    const { app } = await setupUnauthenticated();
+
+    const socket = await app.injectWS(API.socket(), {
+      headers: { host: 'localhost', [AUTH_TOKEN_HEADER]: TEST_TOKEN },
+    });
+
+    // The upgrade actually completing (not merely the promise resolving to
+    // something) is the assertion that matters — `injectWS` only resolves
+    // once the 101 response has been seen (see `@fastify/websocket`'s
+    // implementation), so getting a socket back at all is already proof, but
+    // closing it cleanly rules out a half-open connection the test would
+    // otherwise leak into the next one.
+    socket.close();
+  });
+
+  it('checks Host and Origin before the token, so a DNS-rebound or cross-origin request gets that refusal, not a token one', async () => {
+    // Ordering matters for what a rebinding or cross-origin attempt learns
+    // from the response: if the token check ran first, a foreign Host would
+    // get a 401 and could conclude "this process wants a token" — one more
+    // bit of reconnaissance than a rejection already known to be hopeless
+    // needs to hand out. Checked here with NO token supplied at all, so a 403
+    // (not a 401) is proof the Host check is what actually fired.
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'GET',
+      url: API.health(),
+      headers: { host: 'attacker.example' },
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
+
+  it('exempts the CORS preflight from the token, so the real authenticated request can even be sent', async () => {
+    // A browser cannot attach a custom header to an OPTIONS preflight — that
+    // request exists purely to ask "would this header be allowed?" before any
+    // credential is involved. Requiring the token here would fail every
+    // preflight, and a failed preflight means no browser ever sends the real,
+    // correctly-authenticated request behind it. `access-control-allow-headers`
+    // naming the token header is the other half of this: without it, the
+    // preflight would succeed but the browser would still refuse to attach
+    // the header on the real request that follows.
+    const { app } = await setupUnauthenticated();
+
+    const response = await app.inject({
+      method: 'OPTIONS',
+      url: API.runs(),
+      headers: { origin: 'http://127.0.0.1:5173' },
+    });
+
+    expect(response.statusCode).toBe(204);
+    expect(response.headers['access-control-allow-headers']).toContain(AUTH_TOKEN_HEADER);
   });
 });
 

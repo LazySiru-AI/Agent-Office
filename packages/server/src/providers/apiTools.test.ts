@@ -307,6 +307,28 @@ describe('Edit', () => {
     expect(await fsp.readFile(path.join(dir, 'e.txt'), 'utf8')).toBe('the quick red fox');
   });
 
+  it('leaves no tail behind when the replacement is shorter than the original', async () => {
+    // A regression this file would not otherwise have caught, introduced by
+    // SEC-07's move to handle-based I/O. `fs.writeFile(path, ...)` truncates;
+    // `FileHandle.writeFile` does NOT — it writes from the start and leaves
+    // whatever was longer than the new content in place. So an edit that
+    // shrinks a file would silently keep the tail of the old one, and every
+    // existing Edit test happened to replace text with something the same
+    // length or longer.
+    const dir = newWorkspace();
+    await fsp.writeFile(path.join(dir, 'shrink.txt'), 'aaaaaaaaaaaaaaaaaaaa END');
+    const tools = createSandboxedTools(dir);
+
+    const result = await tools.execute('Edit', {
+      path: 'shrink.txt',
+      oldText: 'aaaaaaaaaaaaaaaaaaaa END',
+      newText: 'b',
+    });
+
+    expect(result.isError).toBe(false);
+    expect(await fsp.readFile(path.join(dir, 'shrink.txt'), 'utf8')).toBe('b');
+  });
+
   it('fails clearly, without modifying the file, when oldText is absent', async () => {
     const dir = newWorkspace();
     await fsp.writeFile(path.join(dir, 'e2.txt'), 'unchanged content');

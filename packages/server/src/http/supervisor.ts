@@ -56,6 +56,48 @@ export type Unsubscribe = () => void;
 export type SupervisorWarning = (message: string, cause?: unknown) => void;
 
 /**
+ * The default concurrency cap (AO-6) — how many runs this process will
+ * execute at once before `startRun` refuses a new one.
+ *
+ * There was no cap at all before this: `POST /api/runs` handed back a `runId`
+ * and started `executeRun` in the background unconditionally, for every
+ * request that passed the trust-boundary checks in `server.ts`. On a server
+ * with no user boundary (see `authToken.ts` for the finding this and the
+ * token both close), that is an unbounded-cost primitive — each run spawns
+ * real provider child processes, several per phase, and `--max-budget-usd`
+ * caps what ONE of them can spend, never how many can be in flight paying
+ * that cap simultaneously. A modest default here is chosen over an unlimited
+ * one for the same reason `--max-budget-usd` exists at all: the safe default
+ * is the one that fails a request loudly rather than the one that lets a
+ * runaway loop (a bug, a misbehaving script, a second local account doing
+ * exactly what AO-6 describes) keep spawning processes until something else
+ * gives out. Four is not a load-tested ceiling, just a number comfortably
+ * above "one interactive user running a couple of things at once" and well
+ * below "this machine's fans spin up" — `serve.ts --max-concurrent-runs`
+ * overrides it for anyone who has measured their own machine and wants a
+ * different number.
+ */
+export const DEFAULT_MAX_CONCURRENT_RUNS = 4;
+
+/**
+ * Thrown by `startRun` when accepting a new run would exceed
+ * `maxConcurrentRuns` (AO-6). `server.ts`'s `statusFor` maps this to 429 —
+ * see its own comment for why 429 and not 503 or 403.
+ */
+export class RunConcurrencyLimitError extends Error {
+  readonly limit: number;
+
+  constructor(limit: number) {
+    super(
+      `refusing to start a new run: ${limit} run(s) are already executing, which is this server's configured limit`,
+    );
+    Object.setPrototypeOf(this, RunConcurrencyLimitError.prototype);
+    this.name = 'RunConcurrencyLimitError';
+    this.limit = limit;
+  }
+}
+
+/**
  * How many finished runs keep their in-memory buffers.
  *
  * Zero would be simpler, but it loses the one case reattach exists for: a run
@@ -106,6 +148,14 @@ export interface SupervisorDeps {
   ) => AgentProvider;
   /** Used when a request omits `provider`. */
   defaultProviderId?: string;
+  /**
+   * The concurrency cap (AO-6). Defaults to {@link DEFAULT_MAX_CONCURRENT_RUNS}.
+   * A run parked at `awaiting_approval` still counts against this — it is
+   * still `live` from the supervisor's point of view (see the doc comment on
+   * `shutdown` for the same point made about cancellation), and it already
+   * spent one planning call's worth of provider cost to get there.
+   */
+  maxConcurrentRuns?: number;
   /**
    * Artificial per-event latency for the scripted provider (see
    * `MakeProviderOptions.stepDelayMs`). Set from `serve.ts --step-delay` so the
@@ -277,6 +327,7 @@ export class RunSupervisor {
       defaultProviderId: deps.defaultProviderId ?? 'scripted',
       onWarning: deps.onWarning ?? ((message, cause) => console.warn(`[supervisor] ${message}`, cause ?? '')),
       now: deps.now ?? Date.now,
+      maxConcurrentRuns: deps.maxConcurrentRuns ?? DEFAULT_MAX_CONCURRENT_RUNS,
       ...(deps.dispatchDefaults === undefined ? {} : { dispatchDefaults: deps.dispatchDefaults }),
     };
     this.knownAgentNames = new Set(deps.registry.agents.map((agent) => agent.name));
@@ -456,8 +507,20 @@ export class RunSupervisor {
    * The provider is built and preflighted *before* returning, so an unusable
    * provider is a failed `POST /api/runs` rather than a run that appears in the
    * list and dies a second later. Everything after that is background work.
+   *
+   * The concurrency cap (AO-6) is checked first, before any of that —
+   * cheaper than a wasted provider preflight, and it means a caller hammering
+   * this past the limit costs this process nothing beyond a `liveRunIds().length`
+   * read. `liveRunIds()` is the same count `GET /api/health` and the run list
+   * already expose, so this is not a second notion of "how many are running";
+   * a run parked at `awaiting_approval` still holds its slot, for the reason
+   * given on `SupervisorDeps.maxConcurrentRuns`.
    */
   async startRun(request: CreateRunRequest): Promise<string> {
+    if (this.liveRunIds().length >= this.deps.maxConcurrentRuns) {
+      throw new RunConcurrencyLimitError(this.deps.maxConcurrentRuns);
+    }
+
     const providerId = request.provider ?? this.deps.defaultProviderId;
     // DEFECT FIXED (FR-M8): this call used to pass no options at all, so
     // `request.maxCostUsd` — validated by `CreateRunRequestSchema`, shown in

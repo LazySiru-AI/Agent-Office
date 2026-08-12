@@ -18,8 +18,9 @@ import { UnknownProviderError, probeProviders } from '../providers/factory.js';
 import { ProviderUnavailableError } from '../providers/types.js';
 import { UnsafePathError, type RunStore } from '../store/types.js';
 import { assertValidRunId } from '../store/util.js';
+import { AUTH_TOKEN_HEADER, AUTH_TOKEN_QUERY_PARAM, extractProvidedToken, tokensMatch } from './authToken.js';
 import { collectRunEvents } from './runEvents.js';
-import type { RunSupervisor } from './supervisor.js';
+import { RunConcurrencyLimitError, type RunSupervisor } from './supervisor.js';
 
 /**
  * The HTTP + WebSocket surface (PLAN.md Phase 3).
@@ -48,6 +49,16 @@ export interface ServerDeps {
   registry: Registry;
   store: RunStore;
   supervisor: RunSupervisor;
+  /**
+   * The startup token every `/api` route and the WebSocket upgrade require
+   * (AO-6, `authToken.ts`). Mandatory rather than defaulted-when-absent on
+   * purpose: an optional field invites a construction site that forgets it,
+   * and "forgot to pass a credential" failing closed (a type error) is a very
+   * different outcome from it failing open (no auth at all). `serve.ts`
+   * resolves one with `resolveAuthToken` before calling this; tests pass a
+   * fixed value from the same helper.
+   */
+  token: string;
   /** Passed straight to Fastify. Tests pass `false` to keep output readable. */
   logger?: FastifyServerOptions['logger'];
 }
@@ -257,15 +268,71 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
       void reply.header('access-control-allow-origin', origin);
       void reply.header('vary', 'origin');
     }
+
+    /**
+     * The startup token (AO-6, NFR-6's other half — see `authToken.ts`'s
+     * header comment for the attack this closes: loopback is not a user
+     * boundary, and everything checked above this line is about the SHAPE of
+     * the request, never about who sent it).
+     *
+     * Deliberately the last check in this hook, not the first. `Host` and
+     * `Origin` are cheap, allocate nothing, and their failure messages are
+     * safe to be specific ("not a loopback address") because they describe
+     * something the caller already sent in plaintext. Token failure is the
+     * one case here worth reaching last: if a foreign `Host` or `Origin`
+     * request also carries a missing/wrong token, the response it gets is the
+     * `Host`/`Origin` 403, not a 401 — one fewer bit of information ("this
+     * process also wants a token") handed to a rebinding attempt that was
+     * always going to fail anyway.
+     *
+     * CORS preflight (`OPTIONS`) is exempt. A browser preflight is generated
+     * by the browser itself, never by page script, and it cannot be made to
+     * carry `AUTH_TOKEN_HEADER` — the whole point of `Access-Control-Request-
+     * Headers` is to ASK whether that header will be allowed on the real
+     * request, before any application code (or credential) is involved.
+     * Requiring the token here would make the preflight itself fail, which
+     * means the real, authenticated request behind it would never be sent by
+     * any browser — a self-inflicted outage, not a security improvement,
+     * since the preflight response carries nothing but CORS headers and an
+     * empty body. The real request that follows is still checked exactly like
+     * every other route.
+     */
+    if (request.method !== 'OPTIONS') {
+      const provided = extractProvidedToken(
+        request.headers[AUTH_TOKEN_HEADER],
+        (request.query as Record<string, unknown> | undefined)?.[AUTH_TOKEN_QUERY_PARAM],
+      );
+      if (!tokensMatch(deps.token, provided)) {
+        // 401, not 403: `Host`/`Origin` failures above are refusals that hold
+        // regardless of who is asking ("this request could not possibly be
+        // legitimate"); a missing/wrong token is the standard "supply a valid
+        // credential" case, and 401 is the code with that specific meaning.
+        // The message says neither which check failed nor what was received —
+        // "invalid" covers "absent" and "wrong" identically, so a caller
+        // fishing for confirmation that a guessed prefix was on the right
+        // track learns nothing from the response shape.
+        void reply.status(401).send({ error: 'missing or invalid token' });
+        return;
+      }
+    }
   });
 
   // Preflight for the same loopback origins. Registered as a wildcard route
   // because the not-found handler would otherwise answer OPTIONS with a 404 and
   // the browser would never send the real request.
+  //
+  // `access-control-allow-headers` has to list `AUTH_TOKEN_HEADER` alongside
+  // `content-type`, and this is not optional decoration: a custom header is
+  // exactly what makes a cross-port request "non-simple" and triggers a
+  // preflight in the first place, so a browser that preflights, sees its
+  // intended header absent from this list, and refuses to send it on the real
+  // request would make every authenticated call from the web client fail —
+  // silently, from this route's point of view, since the preflight itself
+  // still answers 204.
   app.options('/*', async (_request, reply) => {
     void reply
       .header('access-control-allow-methods', 'GET, POST, OPTIONS')
-      .header('access-control-allow-headers', 'content-type')
+      .header('access-control-allow-headers', `content-type, ${AUTH_TOKEN_HEADER}`)
       .status(204)
       .send();
   });
@@ -274,6 +341,18 @@ export async function buildServer(deps: ServerDeps): Promise<FastifyInstance> {
   // Not in the contract's schema set because there is nothing for the client to
   // parse beyond "the server answered". It doubles as the readiness probe the
   // web dev server polls before opening a socket.
+  //
+  // DECISION (AO-6): not exempted from the token check above, even though it
+  // was the one route worth considering for it. The response includes
+  // `liveRunIds` — which runs this account's process is currently spending
+  // money executing — and that is precisely the kind of fact NFR-6's "no
+  // auth" gap let any local process read for free. Exempting the one route
+  // that still leaks something would reopen a sliver of AO-6 for a benefit
+  // that does not exist: nothing in this codebase calls `/api/health` before
+  // it has a token to send (the web client's poller, if and when one exists,
+  // goes through `api.ts`'s wrapper exactly like every other route; the Vite
+  // proxy injects the header for every `/api/*` path uniformly, `/api/health`
+  // included). "Every `/api` route" in the finding is read literally.
   app.get(ROUTES.health, async () => ({
     ok: true,
     serverTime: Date.now(),
@@ -797,6 +876,17 @@ function statusFor(error: unknown): number {
   if (error instanceof UnsafePathError) return 400;
   if (error instanceof UnknownProviderError) return 400;
   if (error instanceof ProviderUnavailableError) return 503;
+  // 429, not 503: the server is not degraded and nothing about it is
+  // unavailable — a slot is simply spoken for by another run right now, which
+  // is exactly what "Too Many Requests" describes and "Service Unavailable"
+  // does not. It is also not a 403: a request that arrives ninety seconds
+  // later, once a run has finished, is expected to succeed with the same
+  // token and the same body, which is what makes this a rate/capacity signal
+  // rather than a refusal of the caller. See `supervisor.ts`'s
+  // `RunConcurrencyLimitError` for what the cap is protecting — every run
+  // spawns real, billed child processes, so unlike most 429s this one is a
+  // cost control, not a throughput nicety.
+  if (error instanceof RunConcurrencyLimitError) return 429;
 
   const statusCode = (error as { statusCode?: unknown } | null)?.statusCode;
   if (typeof statusCode === 'number' && statusCode >= 400 && statusCode <= 599) return statusCode;

@@ -128,6 +128,98 @@ function deriveDeliverable(plan: RunPlan, agentName: string): string {
   return candidate;
 }
 
+/**
+ * Rename a swapped assignment's deliverable so its filename names the agent
+ * who actually wrote it, without colliding with any other assignment's
+ * deliverable.
+ *
+ * This exists to close a real defect, not a hypothetical one: a swap used to
+ * leave `deliverable` untouched, on the reasoning (once recorded on
+ * `applySwap` and on `TeamOperationSchema` in `shared/src/wire.ts`) that
+ * nothing downstream parses the agent name back out of `reports/NN-<agent>.md`,
+ * so a stale filename was "purely cosmetic." Running a real plan through it
+ * showed that reasoning was wrong about who reads the filename: a human
+ * does, directly, by browsing `reports/`, opening the run's PDF, or reading
+ * the report listing — and every one of those surfaces a swapped-in
+ * security-auditor's findings under a name that says `business-analyst`.
+ * That is not a tidiness problem, it is the artifact lying about who
+ * produced it, which is worse than a missing report because nothing about
+ * it LOOKS wrong.
+ *
+ * The NN prefix is preserved rather than recomputed. NN encodes the
+ * assignment's position — "the Nth assignment across the whole plan" per
+ * `deriveDeliverable`'s doc comment above — and a swap does not change that
+ * position, only who fills it; the assignment did not move phases, did not
+ * change what it depends on, and did not change when in the sequence it was
+ * created. Recomputing NN would also have a blast radius past this one
+ * assignment: once one path in the sequence moves, a reader has to ask
+ * whether every OTHER assignment's numbering moved too, which a single swap
+ * has no business raising.
+ *
+ * Collisions are real now that they are refused rather than silently
+ * tolerated: `plan.ts`'s `RunPlanSchema.superRefine` (SEC-08) rejects two
+ * assignments sharing a deliverable, so a naive `reports/${nn}-${agentName}.md`
+ * can turn a cosmetic rename into a plan the schema throws out — for
+ * instance, swapping a second assignment onto an agent another assignment
+ * already uses would otherwise produce two identical filenames. Disambiguate
+ * with a numeric suffix (`-2`, `-3`, ...), the same scheme
+ * `deriveAssignmentId` already uses for id collisions above, so this file has
+ * exactly one collision-avoidance convention rather than two competing ones.
+ * A suffix was chosen over renumbering NN for the same reason NN itself is
+ * preserved: it changes nothing about any assignment other than the one
+ * being swapped.
+ *
+ * Defensive against a plan whose deliverables do not already follow the
+ * `NN-agent.md` convention — this reads a runtime `RunPlan` value, which
+ * `deriveDeliverable`'s own doc comment already treats as untrusted in the
+ * FR-M3 sense (LLM output, or a hand-built test fixture). If the NN prefix
+ * cannot be recovered from `oldDeliverable`, this falls back to
+ * `deriveDeliverable`'s own numbering rather than guessing at a position
+ * that is not there to preserve.
+ */
+function deriveSwapDeliverable(
+  plan: RunPlan,
+  assignmentId: string,
+  oldDeliverable: string,
+  newAgentName: string,
+): string {
+  const others = new Set(
+    allAssignments(plan)
+      .filter((a) => a.id !== assignmentId)
+      .map((a) => a.deliverable),
+  );
+
+  // `oldDeliverable` is always `reports/<stem>.md` per `DeliverablePath` in
+  // `shared/src/plan.ts`; `stem` is conventionally `NN-<old-agent-name>`.
+  // Recover just the NN portion — everything up to the first "-" — so the
+  // renamed path keeps the assignment's position and only replaces who it
+  // names.
+  const stemMatch = /^reports\/([^/]+)\.md$/i.exec(oldDeliverable);
+  const stem = stemMatch?.[1];
+  const dashIndex = stem?.indexOf('-') ?? -1;
+
+  if (stem === undefined || dashIndex <= 0) {
+    // No recognisable NN prefix to preserve — fall back to the planner's own
+    // numbering rule rather than fabricate a position. `others` already
+    // excludes this assignment's own current path, matching
+    // `deriveDeliverable`'s assumption that its collision check runs against
+    // every OTHER assignment in the plan.
+    return deriveDeliverable(plan, newAgentName);
+  }
+
+  const nn = stem.slice(0, dashIndex);
+  const base = `reports/${nn}-${newAgentName}.md`;
+  if (!others.has(base)) return base;
+
+  let suffix = 2;
+  let candidate = `reports/${nn}-${newAgentName}-${suffix}.md`;
+  while (others.has(candidate)) {
+    suffix += 1;
+    candidate = `reports/${nn}-${newAgentName}-${suffix}.md`;
+  }
+  return candidate;
+}
+
 type DropOp = Extract<TeamOperation, { op: 'drop' }>;
 type SwapOp = Extract<TeamOperation, { op: 'swap' }>;
 type AddOp = Extract<TeamOperation, { op: 'add' }>;
@@ -193,29 +285,33 @@ function applyDrop(plan: RunPlan, op: DropOp): OpResult {
  * never reads or writes them, so there is no way for a swap to accidentally
  * rewire what the assignment produces or what it consumes.
  *
- * `deliverable` is untouched too, and that is a decision worth writing down
- * rather than an accident of the implementation being lazy. The filename
- * embeds the *original* agent's name (`reports/03-security-auditor.md`
- * stays exactly that even after swapping in a different reviewer), which
- * looks stale the moment you list the directory. Renaming it to match the
- * new agent was considered and rejected for two reasons. First, the wire
- * contract already settles this: `TeamOperationSchema`'s `swap` variant
- * carries only `assignmentId` and `agentName`, and its doc comment says
- * plainly "keeping its objective, its dependency edges and its deliverable
- * ... that is what makes it a swap rather than a drop plus an add" — a swap
- * that silently changed the deliverable would contradict its own contract.
- * Second, and more concretely: `deliverable` is a stable identity for the
- * *work slot*, not a label for whoever currently fills it — nothing in the
- * dispatcher, the brief builder, or the synthesis step parses an agent name
- * back out of the report path, they all just carry the string through
- * (`materialiseAssignments` copies it verbatim; `loadUpstreamReports` reads
- * `dep.reportPath`, which came from this same field). The only reader who
- * would ever notice a mismatched filename is a human browsing `reports/`
- * directly, and that mismatch is a minor, purely cosmetic paper cut against
- * the alternative: rewriting a path after the fact risks colliding with
- * some other assignment's deliverable (if the new agent's name happens to
- * collide once slotted into the same `NN-` position) for a rename nothing
- * downstream needed.
+ * `deliverable` is NOT left untouched, which reverses this function's
+ * earlier behaviour and is worth explaining precisely because the earlier
+ * choice was made deliberately too. The reasoning at the time was: nothing
+ * downstream parses the agent name back out of `reports/NN-<agent>.md`
+ * (`materialiseAssignments` and `loadUpstreamReports` both just carry the
+ * string through), so a stale filename after a swap was "purely cosmetic."
+ * Running a real plan through this function is what showed that reasoning
+ * to be wrong about who reads the filename: a human does, directly, and the
+ * artifacts a human actually sees — the run directory listing, the report
+ * index, the generated PDF — all name the file after whoever the ORIGINAL
+ * assignment happened to be, not whoever actually wrote it. A security
+ * review that got swapped from `business-analyst` to `security-auditor`
+ * still produced `reports/03-business-analyst.md`, which does not merely
+ * look stale, it tells anyone reading it later that the wrong person did the
+ * work. That is an integrity problem in the output, not a tidiness one, and
+ * it does not become acceptable just because no CODE happens to parse the
+ * name back out.
+ *
+ * The collision risk that justified leaving it alone before is now handled
+ * rather than merely avoided: see {@link deriveSwapDeliverable} for how the
+ * new path is chosen and how it stays unique. `TeamOperationSchema`'s doc
+ * comment in `shared/src/wire.ts` (not owned by this file) still says a swap
+ * keeps "its deliverable" — that prose describes the WORK SLOT staying put
+ * (same phase, same `dependsOn` edges, same objective), which remains true
+ * here; it does not survive this change as a claim about the literal
+ * filename string, and updating it is a follow-up for whoever owns that
+ * file.
  */
 function applySwap(plan: RunPlan, op: SwapOp, knownAgentNames: ReadonlySet<string>): OpResult {
   const location = locateAssignment(plan, op.assignmentId);
@@ -231,12 +327,14 @@ function applySwap(plan: RunPlan, op: SwapOp, knownAgentNames: ReadonlySet<strin
     return { error: `cannot swap "${op.assignmentId}" to unknown agent "${op.agentName}"` };
   }
 
+  const newDeliverable = deriveSwapDeliverable(plan, op.assignmentId, location.assignment.deliverable, op.agentName);
+
   const phases = plan.phases.map((phase, index) => {
     if (index !== location.phaseIndex) return phase;
     return {
       ...phase,
       assignments: phase.assignments.map((a) =>
-        a.id === op.assignmentId ? { ...a, agentName: op.agentName } : a,
+        a.id === op.assignmentId ? { ...a, agentName: op.agentName, deliverable: newDeliverable } : a,
       ),
     };
   });

@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
   canTransitionAssignment,
   RunPlanSchema,
@@ -9,7 +12,9 @@ import {
 } from '@agent-office/shared';
 import { buildRegistry } from '../registry/index.js';
 import { ScriptedProvider, type ScriptedProviderOptions } from '../providers/scripted.js';
+import type { AgentProvider, AgentRunRequest, ProviderAvailability, ProviderId } from '../providers/types.js';
 import { MemoryRunStore } from '../store/memoryStore.js';
+import { FileRunStore } from '../store/fileStore.js';
 import { dispatchRun, materialiseAssignments } from './dispatcher.js';
 
 function makeAgent(name: string): AgentDef {
@@ -1138,5 +1143,187 @@ describe('dispatchRun — per-agent provider selection (Phase 7)', () => {
 
     // Both the original dispatch and the revision went to alpha's provider.
     expect(special.requests.map((r) => r.assignmentId)).toEqual(['a', 'a']);
+  });
+});
+
+describe('dispatchRun — per-assignment workspaces (AO-8)', () => {
+  // These tests use a real `FileRunStore` against a real temp directory, not
+  // `MemoryRunStore` — the whole point of AO-8 is what happens on the actual
+  // filesystem when two assignments run concurrently, and an in-memory store
+  // has no files for either one to leak into the other's. See
+  // `dispatcher.ts`'s `hasPerAssignmentWorkspaces` for why `MemoryRunStore`
+  // deliberately does not implement this at all.
+
+  let tmpRoot: string;
+
+  afterEach(async () => {
+    if (tmpRoot !== undefined) await rm(tmpRoot, { recursive: true, force: true });
+  });
+
+  async function realStore(): Promise<FileRunStore> {
+    tmpRoot = await mkdtemp(path.join(os.tmpdir(), 'agent-office-dispatch-workspace-'));
+    return new FileRunStore(tmpRoot);
+  }
+
+  /**
+   * Records the workspace directory handed to each request and, crucially,
+   * actually writes to it — a test that only compared path strings would
+   * pass even if the underlying directories did not really exist or were not
+   * writable, which is not the guarantee AO-8 makes. Also records the
+   * directory's contents at the moment the "assignment" starts, before it
+   * writes anything itself, which is what proves a re-dispatched attempt
+   * starts from an empty directory rather than one still holding files from
+   * the attempt before it.
+   */
+  class WorkspaceProbeProvider implements AgentProvider {
+    readonly id: ProviderId = 'scripted';
+    readonly calls: Array<{ assignmentId: string; workspaceDir: string; entriesBeforeWrite: string[] }> = [];
+
+    async isAvailable(): Promise<ProviderAvailability> {
+      return { ok: true };
+    }
+
+    async *run(request: AgentRunRequest): AsyncIterable<AgentEvent> {
+      const entriesBeforeWrite = await readdir(request.workspaceDir);
+      this.calls.push({
+        assignmentId: request.assignmentId,
+        workspaceDir: request.workspaceDir,
+        entriesBeforeWrite,
+      });
+
+      await writeFile(
+        path.join(request.workspaceDir, `${request.assignmentId}.marker`),
+        `written by ${request.assignmentId}`,
+        'utf8',
+      );
+
+      yield { t: 'usage', assignmentId: request.assignmentId, inputTokens: 1, outputTokens: 1 };
+      yield { t: 'text', assignmentId: request.assignmentId, chunk: `report from ${request.assignmentId}` };
+    }
+  }
+
+  it('gives two assignments in the same parallel phase different workspace directories, and neither can see the other\'s files', async () => {
+    const store = await realStore();
+    const run = makeRun(twoPhasePlan());
+    await store.saveRun(run);
+    const provider = new WorkspaceProbeProvider();
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const dirFor = (assignmentId: string): string | undefined =>
+      provider.calls.find((c) => c.assignmentId === assignmentId)?.workspaceDir;
+
+    const aDir = dirFor('a');
+    const bDir = dirFor('b');
+    if (aDir === undefined || bDir === undefined) {
+      throw new Error('provider was not called for both assignments');
+    }
+
+    // The AO-8 defect, directly: this used to be the same path for both.
+    expect(aDir).not.toBe(bDir);
+
+    // Each assignment's own directory holds only its own marker — not the
+    // sibling's. Listing after the run (rather than trusting the recorded
+    // `entriesBeforeWrite`, which only proves isolation at start-of-run) is
+    // what proves the isolation held for the whole assignment, not just the
+    // first instant of it.
+    expect(await readdir(aDir)).toEqual(['a.marker']);
+    expect(await readdir(bDir)).toEqual(['b.marker']);
+  });
+
+  it('verifies each assignment workspace really is inside the run directory (NFR-1)', async () => {
+    const store = await realStore();
+    const run = makeRun(twoPhasePlan());
+    await store.saveRun(run);
+    const provider = new WorkspaceProbeProvider();
+
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const runDir = store.runDir(run.id);
+    for (const call of provider.calls) {
+      const relative = path.relative(runDir, call.workspaceDir);
+      // Verified, not merely constructed to look verified: a path built by
+      // simple string concatenation could still satisfy a naive
+      // `startsWith(runDir)` check while actually pointing at a sibling
+      // directory (e.g. `runDir + '-evil'`). `path.relative` is what
+      // `resolveWithin` itself checks with, in `store/util.ts` and again in
+      // `FileRunStore.assignmentWorkspaceDir`'s own defence-in-depth
+      // `dirname` check — this assertion exercises the same property from
+      // the caller's side.
+      expect(relative.startsWith('..')).toBe(false);
+      expect(path.isAbsolute(relative)).toBe(false);
+    }
+  });
+
+  it('gives a re-dispatched (FR-M10) assignment a fresh workspace, without deleting the one its first attempt used', async () => {
+    // The re-dispatch decision this test pins: a revision gets its OWN
+    // workspace directory, distinct from the first attempt's, and the first
+    // attempt's directory is not cleaned up when the second one is created.
+    // Reusing one directory across attempts was the alternative — rejected
+    // because a second attempt reusing the first attempt's directory could
+    // be "confused by a leftover workspace from the first attempt" (the
+    // exact failure mode AO-8's revision requirement warns against), and
+    // wiping it before reuse would destroy the one thing worth keeping for
+    // someone debugging why the first attempt was sent back at all.
+    const REVISION_MARKER = '[[REVIEW_VERDICT: REVISIONS_REQUESTED]]';
+    const store = await realStore();
+    const run = makeRun(twoPhasePlan());
+    await store.saveRun(run);
+
+    const provider = new ScriptedProvider({
+      byAssignment: {
+        c: { text: `Needs work.\n\n${REVISION_MARKER}` },
+      },
+      fallback: { text: 'Findings.' },
+    });
+    const probe = new WorkspaceProbeProvider();
+
+    // Two providers is unnecessary complexity for this test's purpose — swap
+    // in the probe only for the assignment being revised (`a`), so its
+    // workspace directory is recorded across both dispatches, while `b` and
+    // `c` run on the plain scripted provider.
+    await dispatchRun({
+      run,
+      registry: REGISTRY,
+      provider,
+      providerFor: (agentName) => (agentName === 'alpha' ? probe : undefined),
+      store,
+      signal: new AbortController().signal,
+    });
+
+    const target = run.assignments.find((a) => a.id === 'a');
+    expect(target?.attempts).toBe(2); // sanity: the revision actually happened
+
+    const dirsForA = probe.calls.filter((c) => c.assignmentId === 'a').map((c) => c.workspaceDir);
+    expect(dirsForA).toHaveLength(2);
+
+    const [firstAttemptDir, secondAttemptDir] = dirsForA;
+    if (firstAttemptDir === undefined || secondAttemptDir === undefined) {
+      throw new Error('expected two recorded workspace directories');
+    }
+    expect(firstAttemptDir).not.toBe(secondAttemptDir);
+    expect(path.basename(firstAttemptDir)).toBe('attempt-1');
+    expect(path.basename(secondAttemptDir)).toBe('attempt-2');
+
+    // The second attempt started with an empty directory — not confused by
+    // whatever the first attempt wrote.
+    const secondCall = probe.calls.find((c) => c.workspaceDir === secondAttemptDir);
+    expect(secondCall?.entriesBeforeWrite).toEqual([]);
+
+    // The first attempt's directory, and what it wrote, still exist — a
+    // revision does not erase the evidence of what it revised.
+    expect(await readdir(firstAttemptDir)).toEqual(['a.marker']);
   });
 });

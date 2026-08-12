@@ -19,7 +19,11 @@ import { assertValidRunId, newRunId, resolveWithin } from './util.js';
  * ```
  * runs/<runId>/
  *   run.json                 full state, resumable
- *   workspace/               the only directory a code-writing agent may touch
+ *   workspace/                     no longer touched directly by dispatch (AO-8)
+ *     <assignmentId>/
+ *       attempt-1/                 the only directory that assignment's first
+ *                                  dispatch may touch
+ *       attempt-2/                 present only if FR-M10 sent it back once
  *   logs/<assignmentId>.jsonl
  *   reports/NN-<agent>.md
  * ```
@@ -32,6 +36,21 @@ import { assertValidRunId, newRunId, resolveWithin } from './util.js';
  * - **Report paths are LLM-generated.** They arrive from the Manager's
  *   `deliverable` field and are resolved through {@link resolveWithin} against
  *   the run directory before anything touches the filesystem.
+ *
+ * **AO-8: `workspace/` is no longer one shared directory per run.** It used to
+ * be — `workspaceDir(runId)` returned a single path, and every assignment in a
+ * parallel phase was handed that same directory as its `cwd`/sandbox root. FR-M5
+ * spends real effort making sure an assignment sees only its own objective and
+ * its declared dependencies' reports; a shared workspace quietly gave every
+ * assignment in the phase a second, unlogged channel into every other one's
+ * files — one agent could plant a `CLAUDE.md`, or a file that merely looked like
+ * "notes for whoever runs next", and a concurrent sibling with no declared
+ * dependency on it would read and could act on it. `assignmentWorkspaceDir`
+ * below is the fix: each assignment gets its own subtree, keyed by assignment id
+ * and then by attempt number. `workspaceDir(runId)` itself is unchanged and
+ * still exists — other callers (the run's file browser, notably) still want "the
+ * workspace for this run" as a single answer, and this store keeps giving them
+ * one — dispatch is simply no longer among those callers.
  */
 
 /** Filename of the persisted run state inside each run directory. */
@@ -222,11 +241,95 @@ export class FileRunStore implements RunStore {
     return path.join(this.rootDir, assertValidRunId(runId));
   }
 
-  /** NFR-1: the sandbox, created on demand so it always exists before dispatch. */
+  /**
+   * NFR-1: the run-level sandbox, created on demand.
+   *
+   * Kept for callers that legitimately want one answer for "the workspace
+   * directory of this run" — the run's file browser is the one that exists
+   * today. `dispatchRun` (`orchestrator/dispatcher.ts`) does NOT call this any
+   * more; see {@link assignmentWorkspaceDir} and the AO-8 note on this class's
+   * own doc comment for why a shared directory across concurrent assignments
+   * was a defect, not a convenience.
+   */
   async workspaceDir(runId: string): Promise<string> {
     const dir = path.join(this.runDir(runId), 'workspace');
     await mkdir(dir, { recursive: true });
     return dir;
+  }
+
+  /**
+   * AO-8: a sandbox scoped to one assignment's one attempt, not the whole run.
+   *
+   * Not declared on the {@link RunStore} interface — `dispatcher.ts` reaches
+   * this through the small duck-typed extension point defined there
+   * (`hasPerAssignmentWorkspaces`), so that adding per-assignment isolation
+   * did not require widening `RunStore` itself and, with it, every other
+   * implementation of it. A store that does not implement this method (today,
+   * only the in-memory test double) simply falls back to the old run-level
+   * `workspaceDir`, which is the correct behaviour for a store that never
+   * touches real disk in the first place and has nothing for two assignments
+   * to actually collide over.
+   *
+   * **Layout: `workspace/<assignmentId>/attempt-<n>`, one level per attempt,
+   * not one directory reused across attempts.** This is the answer to the
+   * re-dispatch question FR-M10 raises: an assignment can run twice (the
+   * original dispatch, and the one revision a reviewer may request), and the
+   * second run must not be confused by whatever the first run left behind —
+   * a half-written file, an edit that made sense under the since-superseded
+   * objective, anything the agent believed was scratch space and left dirty.
+   * Wiping and reusing `attempt-1` in place was the other option considered
+   * and rejected: it would satisfy "not confused" just as well, but at the
+   * cost of destroying the one thing a human investigating a bad *first*
+   * report would want to open — the workspace that actually produced it. A
+   * fresh `attempt-<n>` directory per dispatch gets both: attempt 2 starts
+   * from nothing (so it cannot be confused by attempt 1's leftovers, and
+   * cannot mix its own files into the report evaluated as the revision's
+   * fault when they were the original attempt's), and attempt 1's directory
+   * survives untouched alongside it, on disk, for exactly as long as the run
+   * itself does.
+   *
+   * **Cleanup: none, here.** More attempt directories is more litter, and this
+   * method does not sweep old ones — the whole point of keeping attempt 1
+   * around is that it stays available for inspection, and a store that
+   * deleted it the moment attempt 2 started would reintroduce the
+   * debuggability loss the per-attempt layout exists to avoid. Litter is
+   * instead bounded by `MAX_REVIEW_REVISIONS` (at most one revision per
+   * assignment today, so at most two attempt directories) and, at the run
+   * level, by the retention policy AO-R07 adds: `scripts/purge.ts` deletes
+   * `runs/<id>/` — workspace, attempts and all — wholesale, once the run
+   * is old enough. Workspace litter is not a problem this method solves; it
+   * is a problem the run's own eventual purge solves, on purpose.
+   *
+   * Containment (NFR-1) mirrors {@link logFile}'s two-step check rather than
+   * trusting `resolveWithin` alone: assignment ids arrive from the Manager's
+   * plan and are schema-restricted to lowercase kebab-case with no
+   * separators, but that restriction lives in `shared/src/plan.ts`, a file
+   * this store does not control and cannot assume will never loosen. An
+   * assignment id containing its own separator (`a/../../escape`) would
+   * still resolve *inside* the run directory under `resolveWithin` alone —
+   * `workspace/../../escape` climbs back out of `workspace/` but not out of
+   * `runDir` if crafted carefully — so the explicit `path.dirname` check
+   * below additionally pins the assignment's own directory to be a direct
+   * child of `workspace/`, not merely somewhere inside the run.
+   */
+  async assignmentWorkspaceDir(runId: string, assignmentId: string, attempt: number): Promise<string> {
+    const runDir = this.runDir(runId);
+    const workspaceRoot = path.join(runDir, 'workspace');
+    const assignmentDir = resolveWithin(runDir, `workspace/${assignmentId}`);
+    if (path.dirname(assignmentDir) !== workspaceRoot) {
+      throw new UnsafePathError(assignmentId);
+    }
+
+    // `attempt` is dispatcher-computed (`AssignmentState.attempts`, itself
+    // bounded by FR-M10's revision budget), never model- or plan-supplied, so
+    // it gets a defensive floor rather than the full untrusted-path treatment
+    // above — there is no attacker-controlled string here to smuggle a
+    // traversal through.
+    const safeAttempt = Math.max(1, Math.trunc(attempt));
+    const attemptDir = path.join(assignmentDir, `attempt-${safeAttempt}`);
+
+    await mkdir(attemptDir, { recursive: true });
+    return attemptDir;
   }
 
   async writeReport(runId: string, relativePath: string, content: string): Promise<void> {

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   cancelRun,
   createRun,
@@ -150,6 +150,132 @@ describe('cancelRun — a fire-and-forget POST with no body to parse', () => {
   it('surfaces a non-2xx response as a readable error naming the run', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(409, { error: 'run already finished' })));
     await expect(cancelRun('run-1')).rejects.toThrow(/run already finished/);
+  });
+});
+
+/**
+ * AO-6: the token bootstrap in `api.ts` runs once, at module load, so these
+ * tests each need a fresh module instance with a purpose-built `window` stub
+ * in place BEFORE that load happens — `vi.resetModules()` plus a dynamic
+ * `import()` per test, rather than the static import at the top of this file
+ * (which was already evaluated, in Node's windowless environment, before any
+ * test body runs). The static-import tests above are unaffected by any of
+ * this: `vi.resetModules()` only changes what a LATER `import()` resolves to,
+ * never a binding a `import … from` already captured.
+ */
+describe('AO-6 token bootstrap', () => {
+  function makeSessionStorage(initial: Record<string, string> = {}): Storage {
+    const store = new Map(Object.entries(initial));
+    return {
+      getItem: (key: string) => store.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        store.set(key, value);
+      },
+      removeItem: (key: string) => {
+        store.delete(key);
+      },
+      clear: () => {
+        store.clear();
+      },
+      key: (index: number) => [...store.keys()][index] ?? null,
+      get length() {
+        return store.size;
+      },
+    } as unknown as Storage;
+  }
+
+  function stubBrowser(href: string, storage: Storage): { replaceState: ReturnType<typeof vi.fn> } {
+    const replaceState = vi.fn();
+    vi.stubGlobal('window', {
+      location: { href },
+      sessionStorage: storage,
+      history: { state: null, replaceState },
+    });
+    return { replaceState };
+  }
+
+  // Reset BEFORE each of these as well as after, and the "before" is the half
+  // that matters. `api.ts` resolves its token once at module load, and this
+  // file imports it statically at the top for every other test — so by the
+  // time the first test in this block runs, the module is already cached with
+  // a token resolved against a world that had no `window` at all. The dynamic
+  // `import()` below would hand back that same instance, `authToken` would be
+  // `undefined`, and `fetch` would be called with no init object: the failure
+  // reads as "the bootstrap does not attach the header" when in fact the
+  // bootstrap never re-ran.
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  it('reads the token off the URL, attaches it to the next request, and scrubs it from the address bar', async () => {
+    // WHAT THIS PREVENTS: without the bootstrap, `serve.ts`'s printed
+    // `?token=...` URL would open the app with no way for `api.ts` to ever
+    // learn the token — every request would 401, and the only escape would
+    // be pasting the token into a header by hand, which is not a workflow
+    // any browser UI here exposes.
+    const { replaceState } = stubBrowser('http://127.0.0.1:5179/?token=abc123&other=kept', makeSessionStorage());
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { agents: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const mod = await import('./api.js');
+    await mod.fetchAgents();
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['x-agent-office-token']).toBe('abc123');
+
+    // Scrubbed, not left sitting in browser history — see `bootstrapAuthToken`'s
+    // doc comment for why a URL is a weaker place for this than a header.
+    expect(replaceState).toHaveBeenCalledTimes(1);
+    const [, , newUrl] = replaceState.mock.calls[0] as [unknown, string, string];
+    expect(newUrl).not.toContain('token=abc123');
+    // Unrelated query parameters survive the rewrite — this is a targeted
+    // deletion, not "replace the whole query string".
+    expect(newUrl).toContain('other=kept');
+  });
+
+  it('persists the token to sessionStorage, so a same-tab reload after the URL is scrubbed still works', async () => {
+    const storage = makeSessionStorage();
+    stubBrowser('http://127.0.0.1:5179/?token=abc123', storage);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(200, { agents: [] })));
+
+    await import('./api.js');
+
+    expect(storage.getItem('agent-office-token')).toBe('abc123');
+  });
+
+  it('falls back to a token already in sessionStorage when the URL carries none', async () => {
+    // The second and every later page view: the query parameter is long gone
+    // (this file scrubbed it on the first), so this is the path that has to
+    // carry the token from here on.
+    stubBrowser('http://127.0.0.1:5179/runs/abc', makeSessionStorage({ 'agent-office-token': 'stored-token' }));
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { agents: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const mod = await import('./api.js');
+    await mod.fetchAgents();
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect((init.headers as Record<string, string>)['x-agent-office-token']).toBe('stored-token');
+  });
+
+  it('sends no second fetch argument at all when there is no token anywhere', async () => {
+    // Not just "no header" — an absent SECOND ARGUMENT. See `getJson`'s own
+    // comment for why: a call recorded as `fetch(url, {})` is a different
+    // call from `fetch(url)` as far as `toHaveBeenCalledWith(url)` is
+    // concerned, and every test above the "AO-6 token bootstrap" block in
+    // this file relies on exactly that exact-arguments shape.
+    stubBrowser('http://127.0.0.1:5179/', makeSessionStorage());
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(200, { agents: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const mod = await import('./api.js');
+    await mod.fetchAgents();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/agents');
   });
 });
 

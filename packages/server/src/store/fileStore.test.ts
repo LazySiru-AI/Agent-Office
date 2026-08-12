@@ -290,6 +290,84 @@ describe('FileRunStore.workspaceDir', () => {
   });
 });
 
+describe('FileRunStore.assignmentWorkspaceDir (AO-8)', () => {
+  it('creates a per-assignment, per-attempt directory nested under workspace/', async () => {
+    const run = await store.createRun('isolate me');
+    const dir = await store.assignmentWorkspaceDir(run.id, 'security-auditor', 1);
+
+    expect(path.isAbsolute(dir)).toBe(true);
+    expect(dir).toBe(
+      path.join(store.runDir(run.id), 'workspace', 'security-auditor', 'attempt-1'),
+    );
+    expect(await isDirectory(dir)).toBe(true);
+  });
+
+  it('gives two assignments in the same run two different directories', async () => {
+    // The AO-8 defect in one sentence: this used to be the same directory for
+    // every assignment in a run. Two distinct, non-overlapping paths is the
+    // whole fix, at the unit level — `dispatcher.test.ts` proves the same
+    // thing end to end, by actually writing files and checking neither
+    // assignment can see the other's.
+    const run = await store.createRun('two agents');
+    const a = await store.assignmentWorkspaceDir(run.id, 'alpha', 1);
+    const b = await store.assignmentWorkspaceDir(run.id, 'beta', 1);
+
+    expect(a).not.toBe(b);
+    expect(path.relative(a, b).startsWith('..')).toBe(true);
+  });
+
+  it('gives the same assignment a different directory on each attempt, and keeps the earlier one', async () => {
+    // FR-M10 re-dispatch: an assignment can run twice (original + one
+    // revision). The fix decided here is "new directory per attempt, nothing
+    // deleted" rather than "wipe and reuse attempt 1" — attempt 2 must not be
+    // confused by whatever attempt 1 left behind, but a human debugging a bad
+    // first report still wants attempt 1's workspace to exist. This test
+    // pins both halves: the paths differ, and the first one is not removed
+    // by asking for the second.
+    const run = await store.createRun('revise me');
+    const first = await store.assignmentWorkspaceDir(run.id, 'reviewer-target', 1);
+    await writeFile(path.join(first, 'draft.txt'), 'attempt one output', 'utf8');
+
+    const second = await store.assignmentWorkspaceDir(run.id, 'reviewer-target', 2);
+
+    expect(second).not.toBe(first);
+    expect(await isDirectory(first)).toBe(true);
+    expect(await exists(path.join(first, 'draft.txt'))).toBe(true);
+    // The second attempt's directory starts empty — not confused by what the
+    // first attempt left behind.
+    expect(await readdir(second)).toEqual([]);
+  });
+
+  it('rejects an assignment id that would escape workspace/ via a separator (NFR-1)', async () => {
+    // Assignment ids are schema-restricted to lowercase kebab-case in
+    // `shared/src/plan.ts`, which this store does not control. Defence in
+    // depth, mirroring `logFile`'s own two-step check: even if that
+    // restriction ever loosened, a crafted id must not be able to resolve a
+    // "workspace" directory outside the run.
+    const run = await store.createRun('untrusted assignment id');
+
+    for (const bad of ['../../escape', 'sub/nested', 'a/../../../escape']) {
+      await expect(store.assignmentWorkspaceDir(run.id, bad, 1)).rejects.toBeInstanceOf(
+        UnsafePathError,
+      );
+    }
+  });
+
+  it('floors a non-positive or fractional attempt number rather than trusting it verbatim', async () => {
+    // `attempt` is dispatcher-computed, not model output, so this is a floor
+    // against a programming mistake rather than an adversarial input — but a
+    // directory name built from a raw `attempt-${attempt}` with no floor
+    // would happily produce `attempt-0` or `attempt-1.5` for one, and this
+    // pins the defensive clamp instead of leaving it unexercised.
+    const run = await store.createRun('clamp me');
+    const zero = await store.assignmentWorkspaceDir(run.id, 'agent', 0);
+    const fractional = await store.assignmentWorkspaceDir(run.id, 'agent', 1.9);
+
+    expect(path.basename(zero)).toBe('attempt-1');
+    expect(path.basename(fractional)).toBe('attempt-1');
+  });
+});
+
 describe('FileRunStore reports', () => {
   it('round-trips a report', async () => {
     const run = await store.createRun('report me');

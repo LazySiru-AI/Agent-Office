@@ -97,6 +97,24 @@ packages/
 runs/<id>/      per-run artifacts — reports, logs, workspace (gitignored)
 ```
 
+## Data retention
+
+Every run keeps a full record in `runs/<id>/`: your task text, the complete
+transcript of every agent's turns, every specialist's report, and the
+rendered HTML/PDF. Nothing in there ever expires on its own — it is gitignored
+(so it never leaves your machine), but it stays on disk indefinitely at your
+normal file permissions until you remove it yourself.
+
+To delete old runs:
+
+```bash
+npx tsx packages/server/src/scripts/purge.ts -- --older-than 30d          # preview only
+npx tsx packages/server/src/scripts/purge.ts -- --older-than 30d --execute # actually delete
+```
+
+Without `--execute` it only reports what it would delete; nothing is touched.
+A run still in progress is never deleted, regardless of age.
+
 ## Getting started
 
 Requires Node.js 20+ (v24.19.0 is installed here — see `SETUP.md`).

@@ -1,0 +1,52 @@
+# AO-11 (security audit, medium): pairs with `.github/workflows/ci.yml`'s
+# `npm audit` job. `npm audit` only catches vulnerabilities that already have
+# a published advisory against whatever's in `package-lock.json` today — it
+# never moves the tree forward on its own. Dependabot is the other half: it
+# opens PRs to bump outdated (and specifically vulnerable) dependencies, which
+# then run through the exact same CI this repo just gained — typecheck, the
+# full test suite, `npm audit`, the catalog manifest check, secret scan — so
+# a version bump is verified the same way any other change is, not merged on
+# faith.
+#
+# One `ecosystem` entry covers the whole tree: this is an npm workspaces
+# monorepo (`packages/*`) with a single root `package-lock.json`, and
+# Dependabot's npm updater is workspace-aware from the root manifest — it does
+# not need one entry per package.
+version: 2
+updates:
+  - package-ecosystem: 'npm'
+    directory: '/'
+    schedule:
+      # Weekly, not daily: this is a small team's project, not a package with
+      # a large surface area churning constantly. Daily would mean a steady
+      # trickle of bump PRs competing for review attention against everything
+      # else; weekly is frequent enough that a fix for a real advisory doesn't
+      # sit for long, without turning into background noise.
+      interval: 'weekly'
+    # Caps how many bump PRs can be open at once, so a bad week upstream (many
+    # packages releasing simultaneously) can't flood the PR list; Dependabot
+    # opens more once earlier ones are merged or closed.
+    open-pull-requests-limit: 10
+    groups:
+      # `typescript`, `vitest`, `@types/*`, `tsx`, and friends bump together
+      # far more often than they conflict — batching them into one PR (per
+      # week) means one CI run and one review instead of five near-duplicate
+      # ones for the same underlying upgrade.
+      dev-dependencies:
+        dependency-type: 'development'
+    commit-message:
+      prefix: 'deps'
+
+  # `.github/workflows/*.yml` itself pins `actions/checkout` and
+  # `actions/setup-node` by major-version tag (`@v4`), not a full SHA — see
+  # the "Actions are pinned to major-version tags" note in `ci.yml`. Letting
+  # Dependabot track this ecosystem is what makes that tag-pinning safe
+  # long-term: it opens a PR (through the same CI gate) whenever a new major
+  # version ships, so the pin moves forward deliberately instead of silently
+  # drifting or silently going stale.
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
+    commit-message:
+      prefix: 'ci'

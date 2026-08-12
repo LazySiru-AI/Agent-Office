@@ -7,9 +7,35 @@ set -euo pipefail
 # --- CONFIG ---
 readonly SUBAGENT_CATALOG_TTL_SECONDS=$((12 * 60 * 60))   # 12 hours
 readonly SUBAGENT_CATALOG_CACHE_FILE="$HOME/.claude/cache/subagent-catalog.md"
-readonly SUBAGENT_CATALOG_REPO_URL="https://raw.githubusercontent.com/VoltAgent/awesome-claude-code-subagents/main"
 
-export SUBAGENT_CATALOG_TTL_SECONDS SUBAGENT_CATALOG_CACHE_FILE SUBAGENT_CATALOG_REPO_URL
+# AO-10 (security audit): this used to point at `.../main`, meaning every
+# fetch trusted whatever the upstream maintainer had pushed most recently, with
+# no way to know what changed since the last time anyone looked. That is a
+# supply-chain hole specific to this tool: the body of every file this fetches
+# is later dropped verbatim into a system prompt, and its `tools:` frontmatter
+# becomes a permission grant. An upstream commit that quietly adds `Bash` to
+# some agent's `tools:` line reads as a one-line diff, not the privilege
+# escalation it is.
+#
+# Pinning to a commit SHA means `curl` always returns the exact bytes that were
+# reviewed when this was last bumped, regardless of what lands on `main`
+# upstream tomorrow. It does cost the live-update behaviour the TTL/cache logic
+# below was built for -- `/subagent-catalog:invalidate --fetch` now re-fetches
+# the *same* pinned content, not whatever is newest -- which is the trade this
+# finding asks for: reproducible over fresh.
+#
+# To move the pin forward: pick the new commit SHA from
+# https://github.com/VoltAgent/awesome-claude-code-subagents/commits/main,
+# update SUBAGENT_CATALOG_COMMIT below, diff the two trees, and — if this
+# project's own vendored copy under `categories/` is being refreshed from the
+# same upstream at the same time — regenerate the manifest (`packages/server/src/scripts/verifyCatalogManifest.ts generate`,
+# see `tools/subagent-catalog/catalog-manifest.yaml`) and read the tool-grant
+# delta it prints before merging. That report is what turns a `tools:` change
+# back into something a reviewer notices.
+readonly SUBAGENT_CATALOG_COMMIT="d483b876c5af958c469fb5bd6ecd732ee2ab0ae0"
+readonly SUBAGENT_CATALOG_REPO_URL="https://raw.githubusercontent.com/VoltAgent/awesome-claude-code-subagents/${SUBAGENT_CATALOG_COMMIT}"
+
+export SUBAGENT_CATALOG_TTL_SECONDS SUBAGENT_CATALOG_CACHE_FILE SUBAGENT_CATALOG_COMMIT SUBAGENT_CATALOG_REPO_URL
 
 # --- HELPERS ---
 
