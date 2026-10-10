@@ -23,9 +23,10 @@ what it is doing, and walking its report over to the Manager when done.
 - **Multi-agent orchestration** — planning, dispatch, a bounded review-and-revise
   loop, report merging and a designer pass, all event-sourced so a run survives a
   browser refresh and can be replayed offline at zero cost.
-- **Provider-agnostic** — the same run can go through the local Claude Code CLI
-  (the default, no API key needed), the Anthropic API, OpenAI, DeepSeek, or a
-  free scripted provider for dry runs.
+- **No per-token bill** — every agent runs through the local Claude Code CLI on
+  an existing Claude subscription, so there is no API key and no pay-per-token
+  spend. A free scripted provider covers dry runs. See
+  [Why Claude Code only](#why-claude-code-only).
 - **Human in the loop** — review and edit the Manager's proposed team before
   dispatch, cap spend per run, cancel at any time.
 - **Live visualisation** — a PixiJS office where 156 agents each get a distinct,
@@ -42,20 +43,19 @@ what it is doing, and walking its report over to the Manager when done.
 ## How it works
 
 ```mermaid
-flowchart LR
-    U[You: task] --> M[Manager agent]
-    M -->|proposes team| R{You review / edit}
-    R -->|dispatch| S1[Specialist 1]
-    R --> S2[Specialist 2]
-    R --> S3[Specialist N]
-    S1 --> RV[Review loop<br/>one revision max]
+flowchart TD
+    U["Your task"] --> M["Manager agent"]
+    M -->|"proposes a team"| R{"You review and edit"}
+    R -->|dispatch| S1["Specialist 1"]
+    R -->|dispatch| S2["Specialist 2"]
+    R -->|dispatch| S3["Specialist N"]
+    S1 --> RV["Review loop, one revision max"]
     S2 --> RV
     S3 --> RV
-    RV --> MG[Manager merges reports]
-    MG --> D[Designer agent<br/>picks a theme]
-    D --> PDF[(HTML + PDF)]
-    M -. events over WebSocket .-> UI[Pixel office UI]
-    S1 -. .-> UI
+    RV --> MG["Manager merges reports"]
+    MG --> D["Designer agent picks a theme"]
+    D --> PDF["HTML and PDF report"]
+    M -.->|"live events over WebSocket"| UI["Pixel office UI"]
 ```
 
 1. **Registry** — the 156 agent definitions in `categories/` are parsed and
@@ -77,7 +77,7 @@ streamed to the browser, which is what makes refresh-mid-run and replay work.
 |---|---|
 | Language | TypeScript (strict), Node.js 20+, npm workspaces monorepo |
 | Server | Fastify, `@fastify/websocket`, zod, `marked`, `yaml` |
-| Agent tooling | Claude Code CLI (stream-json), Anthropic / OpenAI-compatible HTTP adapters, Model Context Protocol SDK |
+| Agent tooling | Claude Code CLI (stream-json), Model Context Protocol SDK |
 | Web client | React, Vite, PixiJS |
 | Testing | Vitest — unit, integration and replayed real-CLI fixtures |
 | CI | GitHub Actions (Windows + Linux matrix), `npm audit`, gitleaks, Dependabot |
@@ -109,27 +109,37 @@ up the token automatically.
 
 ### Using a real model
 
-The default provider is the local **Claude Code CLI**, which uses your existing
-sign-in rather than an API key:
+Agents run through the local **Claude Code CLI**, signed in with your Claude
+subscription. No API key is needed:
 
 ```bash
 claude auth login
 ```
 
-To use an API instead, copy the template and fill in one key:
-
-```bash
-cp .env.example .env
-```
-
-Real runs cost money. Pass `--max-cost` to cap a run, for example:
+Then run a single agent, or start a run from the web app:
 
 ```bash
 npm run agent -- "Review the registry parser for edge cases" --max-cost 0.25
 ```
 
+Runs draw on your subscription's usage limits rather than a per-token bill.
+`--max-cost` still caps a run by the cost the CLI reports.
+
 Windows users whose `claude` binary is not on `PATH` should see
 [SETUP.md](SETUP.md).
+
+## Why Claude Code only
+
+This project is deliberately built to run in **free mode**: on a Claude
+subscription, through the Claude Code CLI, without paying for API tokens.
+Agent Office can fan a single task out to many agents, and on a pay-per-token
+API that multiplies cost quickly. A subscription keeps it free to use.
+
+That is why the other providers are not connected. The groundwork for them
+exists: a provider interface, `ANTHROPIC_*`, `OPENAI_*` and `DEEPSEEK_*` slots
+in [`.env.example`](.env.example), and adapter code. But they are **not
+implemented as working, supported paths** and have never been run against a
+real key. The provider layer is left open so they can be added later.
 
 ## Configuration
 
@@ -139,8 +149,8 @@ commented list.
 
 | Variable | Purpose |
 |---|---|
-| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY` | Enable the matching HTTP provider. Read by the server only — never sent to the browser. |
-| `*_MODEL`, `*_BASE_URL` | Per-provider model and endpoint overrides. |
+| `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `DEEPSEEK_API_KEY` | Reserved for future API providers; not implemented yet (see [Why Claude Code only](#why-claude-code-only)). |
+| `*_MODEL`, `*_BASE_URL` | Reserved, as above. |
 | `AGENT_OFFICE_MAX_OUTPUT_TOKENS` | Cap on a single model response. |
 | `AGENT_OFFICE_TOKEN` | Pin the API access token (CI/scripts only; normally generated per process). |
 | `AGENT_OFFICE_ALLOW_SHELL` | Allow agents to run shell commands. Off by default. |
@@ -159,7 +169,7 @@ with your credentials. It is designed around that:
   156 agents) and MCP servers are withheld until granted by environment variable
   — never per run, since anything that can reach the port could grant itself.
 - **No credential bleed.** Spawned agent processes receive a scrubbed
-  environment; provider keys never reach the browser, logs or run artifacts.
+  environment; credentials never reach the browser, logs or run artifacts.
 - **Prompt-injection aware.** Task and report content is fenced so agent output
   cannot forge instructions to the Manager.
 - **Supply chain.** `npm audit` and a gitleaks scan gate every push; Dependabot
@@ -175,7 +185,7 @@ findings and fixes are recorded in [PROGRESS.md](PROGRESS.md).
 | Agent registry, shared contracts | Done |
 | Orchestrator (plan, dispatch, review loop, merge) | Done |
 | Claude Code CLI provider | Done — verified end to end against a signed-in CLI |
-| Anthropic / OpenAI / DeepSeek adapters | Built and unit-tested against fake servers; not yet run against a live key |
+| Anthropic / OpenAI / DeepSeek APIs | Not implemented: interface and config slots only, kept open for later (free-mode by design) |
 | Web app, pixel office, replay, team override | Done |
 | Designer step + PDF export | Done |
 | MCP tool support | Done; not yet exercised by a live model |
