@@ -1,0 +1,40 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Per-run artifacts: workspaces, logs, reports, generated PDFs.
+runs/
+
+# Audit and review write-ups produced by tooling against this checkout. Distinct
+# from the `reports/` a run writes inside `runs/<id>/` above: these are about the
+# repository rather than produced by it, and they are a snapshot of one moment in
+# a working tree, so committing them would date immediately and conflict on every
+# regeneration.
+#
+# LEADING SLASH, and it is load-bearing. Written bare as `reports/`, this rule
+# matched a directory of that name at ANY depth — including
+# `packages/server/src/reports/`, which is SOURCE: the whole markdown/HTML/PDF
+# deliverable layer. The files already there stayed visible only because they
+# were tracked before the rule existed, so nothing looked wrong; but every NEW
+# file added to that directory was silently untracked and would have been lost
+# by any `git add`. Found when four new source files in it failed to appear in
+# `git status` at all. `/reports/` anchors the rule to the repository root,
+# which is the only place the write-ups it was written for are produced.
+/reports/
+
+# Local Claude Code state: `launch.json` (dev-server command and port for THIS
+# machine) and `worktrees/` (checkouts an agent made, each a full second copy of
+# the repo). Both are machine-specific, and the second is enormous.
+#
+# Note this ignores the whole directory. If a `.claude/` file ever needs sharing
+# — a project-level agent definition, a committed settings file — it will be
+# silently skipped rather than refused, so un-ignore it explicitly with a `!`
+# rule below rather than wondering why `git add` did nothing.
+.claude/
+
+# Secrets. NFR-4: keys never land in the repo or in run artifacts.
+.env
+.env.*
+!.env.example
+
+.DS_Store

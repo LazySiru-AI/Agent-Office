@@ -1,0 +1,8 @@
+{"type":"system","subtype":"init","session_id":"deadbeef","tools":["Read"],"claude_code_version":"2.1.222"}
+
+not json at all
+{"type":"assistant","message":{"content":[{"type":"text","text":"partial work survives"}],"usage":{"input_tokens":10,"output_tokens":5}}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"truncated line follows and never closes"
+{"type":"unknown_future_frame","payload":{"anything":true}}
+{"type":"assistant","message":{"content":[{"type":"text"}]}}
+{"type":"result","is_error":true,"subtype":"success","result":"stream ended badly","terminal_reason":"error"}

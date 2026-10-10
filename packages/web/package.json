@@ -1,0 +1,27 @@
+{
+  "name": "@agent-office/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent Office web client: task input, run list, live assignment table and report viewer.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@agent-office/shared": "*",
+    "pixi.js": "^8.19.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.0",
+    "vite": "^6.4.3"
+  }
+}

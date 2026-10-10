@@ -1,0 +1,234 @@
+# AO-11 (security audit, medium): closing "there is no CI at all". Before this
+# workflow existed, ~1,600 tests, a clean three-workspace typecheck, and
+# several QA passes ran only on whoever happened to run them locally — nothing
+# enforced that a PR actually passed any of it, there was no lockfile
+# enforcement (a fresh `npm install` can resolve a different dependency tree
+# than the one anyone tested — caret ranges throughout, and `marked` sits
+# directly on the untrusted-input path), no dependency-vulnerability check,
+# and no secret scanning. This is that enforcement.
+#
+# Every job below runs `npm ci`, never `npm install`: `ci` installs exactly
+# what `package-lock.json` records and fails if the lockfile and
+# `package.json` disagree, which is the entire point — `install` would happily
+# re-resolve carets against whatever the registry serves that day.
+name: CI
+
+on:
+  push:
+    # Only the long-lived branches, deliberately: a feature branch's own pushes
+    # are covered by the `pull_request` trigger below once a PR exists, so
+    # `push` covering every branch would just run the same commit through CI
+    # twice (once as `push`, once as `pull_request`) for the lifetime of a PR.
+    # `beta` is where work lands first; `main`/`master` is the released line.
+    branches: [main, master, beta]
+  pull_request:
+    branches: [main, master, beta]
+  workflow_dispatch: {}
+
+# A new push to a PR branch supersedes CI still running for the previous push
+# on that branch — no point finishing it.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # `package.json`'s `engines.node` is ">=20.0.0" (checked in every workspace
+  # package.json too) and there is no `.nvmrc` pinning anything narrower, so
+  # 20 is the floor this project actually commits to supporting. CI runs that
+  # floor, not whatever is newest, on the usual "if it works on the minimum
+  # supported version it works on everything newer" logic. `@types/node` is
+  # `^22.x` in devDependencies, which is ahead of `engines` — that gap is
+  # pre-existing and not this workflow's to close; widening this to also test
+  # a Node 22 leg is a reasonable follow-up if the team wants to track it, but
+  # is a second axis this change doesn't add on top of the OS matrix below.
+  NODE_VERSION: '20'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Typecheck: `tsc --noEmit` compiles the same way regardless of OS (it never
+  # touches a shell, a symlink, or a child process), so this runs once, on the
+  # cheaper Linux runner, rather than being duplicated across the test matrix.
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  # ---------------------------------------------------------------------------
+  # Test: the OS matrix that actually matters here, and the reason this
+  # workflow does not just run on Linux.
+  #
+  # This is a Windows-primary project with specific, deliberate defences for
+  # Windows child-process behaviour: `providers/claude-code/windowsSpawn.ts`
+  # (argv quoting for `cmd.exe`) and its `taskkill`-based process-tree
+  # teardown, both exercised by tests gated on `process.platform === 'win32'`
+  # (see e.g. `pdf.test.ts`'s `it.skipIf(process.platform !== 'win32')` and
+  # `windowsSpawn.test.ts`). A Linux-only CI would report green while never
+  # once running that code path — the exact failure mode this finding warns
+  # about ("a Linux-only CI would silently stop exercising the Windows spawn
+  # quoting and taskkill paths"). So `windows-latest` is not optional here.
+  #
+  # `ubuntu-latest` stays in the matrix alongside it, not instead of it,
+  # because: (a) it is materially cheaper and faster, so it is the one to
+  # scale up if this suite grows; (b) the symlink-escape tests in
+  # `apiTools.test.ts` need real symlink creation, which needs either Windows
+  # Developer Mode or an elevated process — neither is guaranteed on a
+  # hosted `windows-latest` runner, and the tests are written to detect that
+  # at runtime and skip with a loud `console.warn` (`probeSymlinkSupport` in
+  # `apiTools.test.ts`) rather than silently reporting a false pass, but
+  # Linux gives those tests a second, normally-unprivileged chance to actually
+  # run; (c) it catches path-separator and case-sensitivity bugs that a
+  # Windows-only matrix would never see. Both legs also cover the real
+  # headless-Chrome PDF render test in `pdf.test.ts` — it resolves whatever
+  # Chromium-family browser it finds (`chrome.exe`/`msedge.exe` on Windows,
+  # `google-chrome` on Linux) and both GitHub-hosted runner images ship one,
+  # so neither leg silently skips it; if neither is found, that one test
+  # degrades to a single explicit `it.skip` rather than failing the job.
+  #
+  # `fail-fast: false`: a Windows-specific failure and a Linux-specific one
+  # are different bugs. Cancelling the second leg the moment the first fails
+  # would hide whichever failure didn't happen to schedule first.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # ---------------------------------------------------------------------------
+  # `npm audit`. Both tiers are hard gates.
+  #
+  # This job was written with the second tier soft (`continue-on-error: true`),
+  # because at that moment the lockfile carried five advisories — the
+  # high-severity Vite `server.fs.deny` bypass on Windows
+  # (GHSA-fx2h-pf6j-xcff), a critical vitest UI-server advisory
+  # (GHSA-5xrq-8626-4rwp), and three moderate — and a check that is red from
+  # the day it merges is a check people learn to ignore.
+  #
+  # That upgrade has since landed (`vite@6.4.3`, `vitest@3.2.7`), and
+  # `npm audit` now reports **0 vulnerabilities** at every level, so the trade
+  # has stopped being worth making and the exemption is gone.
+  #
+  # The two tiers are still run separately, because they answer different
+  # questions and the distinction is useful in triage rather than decorative:
+  #
+  #   1. Production dependencies (`--omit=dev`) — the tree that actually ships
+  #      and runs wherever this server is deployed. It is where `marked` lives,
+  #      and `marked` sitting directly on the untrusted-input path is the
+  #      motivating example in the finding this job closes.
+  #   2. The full tree, including build and test tooling that never ships. Dev
+  #      tooling is not exempt from mattering here: the Vite dev server is the
+  #      only way to run this product's UI, which is exactly why that advisory
+  #      was reachable in normal use rather than theoretical.
+  #
+  # Running them in this order means a failure in step 1 says "this is in code
+  # that ships" before step 2 can say "this is somewhere in the tree" — same
+  # verdict, more information, at the cost of one extra `npm audit` invocation
+  # against an already-installed tree.
+  #
+  # A consequence worth stating plainly, since it is the price of a hard gate:
+  # a newly published advisory against an unchanged lockfile will turn this red
+  # with no code change. That is the intended behaviour, not a flaw — the
+  # Dependabot config beside this file is what turns that signal into a bump —
+  # but it does mean a red build here is sometimes a message about the world
+  # rather than about the commit under test.
+  # ---------------------------------------------------------------------------
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit full tree, including dev tooling
+        run: npm audit --audit-level=high
+
+  # ---------------------------------------------------------------------------
+  # AO-10: the vendored subagent catalog under `categories/` is loaded
+  # verbatim into running prompts and tool grants (`registry/index.ts`), so an
+  # unreviewed change to it is a supply-chain risk, not a docs change. See
+  # `tools/subagent-catalog/catalog-manifest.yaml` (the manifest) and
+  # `packages/server/src/scripts/verifyCatalogManifest.ts` (generator +
+  # verifier) for the full design. This step is the CI-enforced half of that
+  # design: it fails the build if any vendored file's hash no longer matches
+  # the manifest, and — the part that actually addresses the finding, not
+  # just the hashes — it prints a `tools:` grant delta between what the
+  # manifest recorded and what's in the working tree right now, labelled
+  # `PRIVILEGE ADDED` when a file gained a tool, so that shows up as its own
+  # readable section in the CI log instead of requiring someone to go read a
+  # 150-line prose diff to notice a one-word frontmatter change.
+  # ---------------------------------------------------------------------------
+  catalog-manifest:
+    name: Catalog manifest (AO-10)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx tsx packages/server/src/scripts/verifyCatalogManifest.ts verify
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning via gitleaks (MIT/AGPL-free OSS binary, not the
+  # `gitleaks-action` GitHub Action — that action requires a paid license for
+  # private repositories as of v2, and this repo's visibility isn't something
+  # this workflow should have to assume). The binary is downloaded from a
+  # pinned release tag and its SHA-256 verified against gitleaks' own
+  # published checksums file before it's ever executed — the same
+  # download-then-verify shape as the AO-10 fix elsewhere in this change,
+  # applied here to a CI-tooling binary instead of a markdown catalog.
+  #
+  # `fetch-depth: 0`: gitleaks scans git history by default, not just the
+  # working tree, and this is the first time this repo has ever had a secret
+  # scan — worth checking history once, not only new commits. If this job's
+  # runtime becomes a problem as history grows, narrowing to
+  # `--log-opts=<merge-base>..HEAD` on `pull_request` runs is the standard
+  # follow-up; not done here since the full-history scan is still fast today.
+  # ---------------------------------------------------------------------------
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: '8.30.1'
+      # From gitleaks' published `gitleaks_8.30.1_checksums.txt` for the
+      # linux_x64 asset. Bump both together when GITLEAKS_VERSION changes.
+      GITLEAKS_SHA256: '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download and verify gitleaks
+        run: |
+          set -euo pipefail
+          asset="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSL -o "$asset" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${asset}"
+          echo "${GITLEAKS_SHA256}  ${asset}" | sha256sum -c -
+          tar -xzf "$asset" gitleaks
+          chmod +x gitleaks
+      - name: Run gitleaks
+        run: ./gitleaks detect --source . --redact --verbose --exit-code 1

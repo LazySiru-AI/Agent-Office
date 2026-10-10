@@ -1,0 +1,228 @@
+import { z } from 'zod';
+
+/**
+ * The Manager's structured output (PLAN.md §1.4, FR-M2).
+ *
+ * This schema is the contract that makes the whole app drivable: the office sim
+ * lays out desks from it, the dispatcher executes it, and the report assembles
+ * from it. An LLM producing free-form prose here would sink the product, so
+ * invalid output is repaired-and-retried rather than tolerated.
+ */
+
+const idPattern = /^[a-z0-9][a-z0-9-]*$/;
+
+const Id = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(idPattern, 'ids must be lowercase kebab-case');
+
+/**
+ * A deliverable is a markdown file directly inside `reports/`, and nothing else.
+ *
+ * This used to be `z.string().min(1)`, with the `reports/NN-agent.md` shape
+ * living only in the prompt that asks the Manager for a plan — which is to say,
+ * as a request rather than a rule. The dispatcher hands the value to
+ * `store.writeReport`, and the store's own check is "does this stay inside the
+ * run directory", which the run's own state file satisfies: a plan naming
+ * `run.json` as a deliverable overwrote it with markdown, and one naming
+ * `logs/<id>.jsonl` would destroy that assignment's replay log. Both were
+ * demonstrated, not theorised.
+ *
+ * The plan is a language model's output, so it is untrusted input in the
+ * ordinary sense, and the fix belongs here at the boundary where it enters
+ * rather than at each place it is later used. FR-M2 already repairs and retries
+ * an invalid plan, so a Manager that ignores the instruction now gets corrected
+ * instead of obeyed.
+ *
+ * Deliberately narrow — one directory deep, no nesting, `.md` only. Nothing has
+ * ever needed more, a report that is not markdown would break the synthesis and
+ * the PDF alike, and every character allowed here is a character that has to be
+ * safe on Windows, in a URL query, and inside a markdown link.
+ */
+const DeliverablePath = z
+  .string()
+  .min(1)
+  .max(200)
+  .regex(
+    /^reports\/[a-z0-9][a-z0-9._-]*\.md$/i,
+    'deliverable must be a markdown file directly inside reports/, e.g. "reports/03-security-auditor.md"',
+  );
+
+export const AssignmentSpecSchema = z.object({
+  id: Id,
+  /** Must resolve against the registry — enforced by validatePlanAgainstRegistry. */
+  agentName: z.string().min(1),
+  /** What this specific agent must produce. Not the overall task. */
+  objective: z.string().min(1),
+  /** Where this agent's report is written. See {@link DeliverablePath}. */
+  deliverable: DeliverablePath,
+  /** Assignment ids this one consumes the reports of. Earlier phases only. */
+  dependsOn: z.array(Id).default([]),
+});
+
+export type AssignmentSpec = z.infer<typeof AssignmentSpecSchema>;
+
+export const PhaseSpecSchema = z.object({
+  id: Id,
+  name: z.string().min(1),
+  /** Whether assignments in this phase may run concurrently. */
+  parallel: z.boolean().default(true),
+  assignments: z.array(AssignmentSpecSchema).min(1),
+});
+
+export type PhaseSpec = z.infer<typeof PhaseSpecSchema>;
+
+export const RunPlanSchema = z
+  .object({
+    /** The Manager's restatement of the task, shown back to the user. */
+    summary: z.string().min(1),
+    /** Free-form, but drives report theming: "software", "legal", "tax", ... */
+    domain: z.string().min(1),
+    phases: z.array(PhaseSpecSchema).min(1),
+    /** Hint carried into the designer step (FR-P2). */
+    reportStyle: z.string().min(1),
+  })
+  .superRefine((plan, ctx) => {
+    const seenPhaseIds = new Set<string>();
+    const seenAssignmentIds = new Set<string>();
+    // Assignment id -> index of the phase it lives in.
+    const phaseOfAssignment = new Map<string, number>();
+    // deliverable path -> assignment id that first claimed it (SEC-08).
+    const seenDeliverables = new Map<string, string>();
+
+    plan.phases.forEach((phase, phaseIndex) => {
+      if (seenPhaseIds.has(phase.id)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['phases', phaseIndex, 'id'],
+          message: `duplicate phase id "${phase.id}"`,
+        });
+      }
+      seenPhaseIds.add(phase.id);
+
+      phase.assignments.forEach((assignment, assignmentIndex) => {
+        if (seenAssignmentIds.has(assignment.id)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['phases', phaseIndex, 'assignments', assignmentIndex, 'id'],
+            message: `duplicate assignment id "${assignment.id}"`,
+          });
+        }
+        seenAssignmentIds.add(assignment.id);
+        phaseOfAssignment.set(assignment.id, phaseIndex);
+
+        // SEC-08: two assignments targeting the same `reports/*.md` path is
+        // not merely untidy, it is silent data loss with a false
+        // attribution attached. The dispatcher writes each assignment's
+        // report with `store.writeReport(deliverable, ...)`, and two writes
+        // to the same path are last-writer-wins — whichever assignment
+        // finishes second overwrites the first's file on disk with no error
+        // from either side. The synthesis step then reads that one
+        // surviving file and presents it, under the *first* assignment's
+        // name and objective in the merged report, as if it were that
+        // assignment's own findings. The earlier assignment's actual work
+        // is not merely missing, it is invisibly replaced by someone else's
+        // — worse than a hole in the report, because nothing shows a hole
+        // exists. This check is the only backstop for that: it lives on the
+        // schema, not in the planner, because FR-M11's team-override path
+        // (`orchestrator/team.ts`) constructs deliverables of its own
+        // outside the normal planning turn, and a check placed only in the
+        // Manager's plan-generation prompt would never see plans built that
+        // way.
+        const existingOwner = seenDeliverables.get(assignment.deliverable);
+        if (existingOwner !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['phases', phaseIndex, 'assignments', assignmentIndex, 'deliverable'],
+            message: `deliverable "${assignment.deliverable}" is already claimed by assignment "${existingOwner}" — each assignment must write to its own file`,
+          });
+        } else {
+          seenDeliverables.set(assignment.deliverable, assignment.id);
+        }
+      });
+    });
+
+    // Dependencies must point backwards, to a strictly earlier phase. This is
+    // what guarantees the dispatcher can execute phase-by-phase without
+    // deadlocking, and it makes cycles structurally impossible.
+    plan.phases.forEach((phase, phaseIndex) => {
+      phase.assignments.forEach((assignment, assignmentIndex) => {
+        assignment.dependsOn.forEach((dep, depIndex) => {
+          const path = [
+            'phases',
+            phaseIndex,
+            'assignments',
+            assignmentIndex,
+            'dependsOn',
+            depIndex,
+          ];
+
+          if (dep === assignment.id) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path,
+              message: `assignment "${assignment.id}" depends on itself`,
+            });
+            return;
+          }
+
+          const depPhase = phaseOfAssignment.get(dep);
+          if (depPhase === undefined) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path,
+              message: `unknown assignment id "${dep}"`,
+            });
+            return;
+          }
+
+          if (depPhase >= phaseIndex) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path,
+              message: `"${assignment.id}" depends on "${dep}", which is not in an earlier phase`,
+            });
+          }
+        });
+      });
+    });
+  });
+
+export type RunPlan = z.infer<typeof RunPlanSchema>;
+
+/** Every assignment across every phase, in execution order. */
+export function allAssignments(plan: RunPlan): AssignmentSpec[] {
+  return plan.phases.flatMap((phase) => phase.assignments);
+}
+
+/** Distinct agent names the plan calls for, in first-appearance order. */
+export function assignedAgentNames(plan: RunPlan): string[] {
+  return [...new Set(allAssignments(plan).map((a) => a.agentName))];
+}
+
+export interface PlanRegistryIssue {
+  assignmentId: string;
+  agentName: string;
+  message: string;
+}
+
+/**
+ * FR-M3: schema validity is not enough — every `agentName` must exist in the
+ * registry. A hallucinated specialist is the most likely Manager failure mode,
+ * so this returns structured issues suitable for feeding back into a repair
+ * retry rather than throwing.
+ */
+export function validatePlanAgainstRegistry(
+  plan: RunPlan,
+  knownAgentNames: Iterable<string>,
+): PlanRegistryIssue[] {
+  const known = new Set(knownAgentNames);
+  return allAssignments(plan)
+    .filter((a) => !known.has(a.agentName))
+    .map((a) => ({
+      assignmentId: a.id,
+      agentName: a.agentName,
+      message: `no agent named "${a.agentName}" exists in the registry`,
+    }));
+}

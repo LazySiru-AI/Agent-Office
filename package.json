@@ -1,0 +1,32 @@
+{
+  "name": "agent-office",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Watch a team of subagents work: a manager distributes your task, specialists report back, you download the PDF.",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "registry:dump": "npm run registry:dump --workspace @agent-office/server",
+    "run": "npm run run --workspace @agent-office/server --",
+    "agent": "npm run agent --workspace @agent-office/server --",
+    "serve": "npm run serve --workspace @agent-office/server --",
+    "web": "npm run dev --workspace @agent-office/web",
+    "build:web": "npm run build --workspace @agent-office/web",
+    "start": "npm run build:web && npm run serve",
+    "test": "vitest run",
+    "runs:purge": "npm run runs:purge --workspace @agent-office/server --",
+    "diagnostics": "npm run diagnostics --workspace @agent-office/server --silent --",
+    "traceability": "npm run traceability --workspace @agent-office/server --silent --",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.7"
+  }
+}

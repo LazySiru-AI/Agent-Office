@@ -1,0 +1,1140 @@
+import { describe, expect, it, vi } from 'vitest';
+import type { AgentEvent } from '@agent-office/shared';
+import type { SandboxedTools, ToolResult, ToolSchema } from '../apiTools.js';
+import { ProviderUnavailableError, type AgentRunRequest } from '../types.js';
+import { chunkLine, DONE_LINE, startFakeOpenAi, type FakeOpenAiServer, type FakeStep } from './fakeServer.js';
+import { DEFAULT_MAX_TOOL_ROUNDS, OpenAiCompatibleProvider } from './provider.js';
+
+/**
+ * The OpenAI/DeepSeek Chat Completions adapter (Phase 7).
+ *
+ * Every test here runs the adapter against `fakeServer.ts`, a local HTTP
+ * double — never a real endpoint (see `provider.ts`'s top comment for why
+ * that is, and for the verified/assumed split that follows from it). Tools
+ * are a hand-written stub matching `apiTools.ts`'s `SandboxedTools`
+ * interface rather than the real filesystem-backed implementation: what this
+ * file tests is the adapter's own SSE parsing, tool-call reassembly and
+ * loop/error/cancellation behaviour, not the sandbox's filesystem
+ * containment, which is `apiTools.ts`'s own test file's job.
+ */
+
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
+
+function makeRequest(overrides: Partial<AgentRunRequest> = {}): AgentRunRequest {
+  return {
+    assignmentId: 'asg-1',
+    systemPrompt: 'You are a careful assistant.',
+    task: 'Summarise the workspace.',
+    allowedTools: [],
+    workspaceDir: 'C:\\fake\\workspace',
+    signal: new AbortController().signal,
+    ...overrides,
+  };
+}
+
+async function collect(iterable: AsyncIterable<AgentEvent>): Promise<AgentEvent[]> {
+  const events: AgentEvent[] = [];
+  for await (const event of iterable) events.push(event);
+  return events;
+}
+
+interface StubToolsHandle extends SandboxedTools {
+  calls: Array<{ name: string; input: unknown }>;
+}
+
+/**
+ * A minimal `SandboxedTools` stub. `catalog` names the tools this stub knows
+ * about (default: `Read`, `Grep`); `schemas` filters that catalog down to
+ * whatever `allowedTools` requests, exactly as `apiTools.ts`'s real
+ * implementation does, so the "never offered a tool outside `allowedTools`"
+ * test is meaningful.
+ */
+function stubTools(options: {
+  catalog?: string[];
+  execute?: (name: string, input: unknown) => Promise<ToolResult>;
+} = {}): StubToolsHandle {
+  const catalog = options.catalog ?? ['Read', 'Grep'];
+  const calls: Array<{ name: string; input: unknown }> = [];
+
+  return {
+    calls,
+    schemas(allowedTools: readonly string[]): ToolSchema[] {
+      const wanted = new Set(allowedTools);
+      return catalog
+        .filter((name) => wanted.has(name))
+        .map((name) => ({
+          name,
+          description: `${name} tool (stub).`,
+          inputSchema: { type: 'object' },
+        }));
+    },
+    async execute(name: string, input: unknown): Promise<ToolResult> {
+      calls.push({ name, input });
+      if (options.execute !== undefined) return options.execute(name, input);
+      return { content: `${name} executed`, isError: false };
+    },
+  };
+}
+
+async function withServer(
+  steps: FakeStep[],
+  run: (server: FakeOpenAiServer) => Promise<void>,
+): Promise<void> {
+  const server = await startFakeOpenAi(steps);
+  try {
+    await run(server);
+  } finally {
+    await server.close();
+  }
+}
+
+function makeProvider(
+  server: FakeOpenAiServer,
+  overrides: {
+    id?: 'openai' | 'deepseek';
+    tools?: SandboxedTools;
+    onDiagnostic?: (message: string) => void;
+    maxToolRounds?: number;
+  } = {},
+): OpenAiCompatibleProvider {
+  const id = overrides.id ?? 'openai';
+  const envPrefix = id.toUpperCase();
+  return new OpenAiCompatibleProvider(id, {
+    ...(overrides.maxToolRounds === undefined ? {} : { maxToolRounds: overrides.maxToolRounds }),
+    ...(overrides.onDiagnostic === undefined ? {} : { onDiagnostic: overrides.onDiagnostic }),
+    deps: {
+      env: {
+        [`${envPrefix}_API_KEY`]: `test-${id}-key`,
+        [`${envPrefix}_BASE_URL`]: server.url,
+      },
+      tools: () => overrides.tools ?? stubTools({ catalog: [] }),
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// isAvailable
+// ---------------------------------------------------------------------------
+
+describe('OpenAiCompatibleProvider.isAvailable', () => {
+  it('reports unavailable and names OPENAI_API_KEY when no key is configured, without making a network call', async () => {
+    const fetchSpy = vi.fn();
+    const provider = new OpenAiCompatibleProvider('openai', {
+      deps: { env: {}, fetch: fetchSpy as unknown as typeof fetch },
+    });
+
+    const result = await provider.isAvailable();
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('OPENAI_API_KEY');
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('reports unavailable and names DEEPSEEK_API_KEY for a DeepSeek instance', async () => {
+    const provider = new OpenAiCompatibleProvider('deepseek', { deps: { env: {} } });
+    const result = await provider.isAvailable();
+    expect(result.ok).toBe(false);
+    expect(result.reason).toContain('DEEPSEEK_API_KEY');
+  });
+
+  it('reports available once the key is present', async () => {
+    const provider = new OpenAiCompatibleProvider('openai', {
+      deps: { env: { OPENAI_API_KEY: 'sk-present' } },
+    });
+    await expect(provider.isAvailable()).resolves.toEqual({ ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A plain turn
+// ---------------------------------------------------------------------------
+
+describe('a plain text turn', () => {
+  it('yields the streamed text and the usage reported in the trailing chunk', async () => {
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }] }),
+          chunkLine({ choices: [{ index: 0, delta: { content: 'Hello, ' }, finish_reason: null }] }),
+          chunkLine({ choices: [{ index: 0, delta: { content: 'world.' }, finish_reason: null }] }),
+          chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+          chunkLine({ choices: [], usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 } }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const onDiagnostic = vi.fn();
+      const provider = makeProvider(server, { onDiagnostic });
+      const events = await collect(provider.run(makeRequest()));
+
+      const text = events
+        .filter((e) => e.t === 'text')
+        .map((e) => (e as Extract<AgentEvent, { t: 'text' }>).chunk)
+        .join('');
+      expect(text).toBe('Hello, world.');
+
+      const usage = events.filter((e) => e.t === 'usage');
+      expect(usage).toEqual([{ t: 'usage', assignmentId: 'asg-1', inputTokens: 12, outputTokens: 5 }]);
+
+      expect(events.some((e) => e.t === 'error')).toBe(false);
+      // The literal [DONE] terminator must never reach JSON.parse, and a
+      // clean stream must not produce any diagnostic at all.
+      expect(onDiagnostic).not.toHaveBeenCalled();
+
+      expect(server.requests).toHaveLength(1);
+      const req = server.requests[0]!;
+      expect(req.method).toBe('POST');
+      expect(req.url).toBe('/v1/chat/completions');
+      expect(req.headers.authorization).toBe('Bearer test-openai-key');
+      const body = req.bodyJson as Record<string, unknown>;
+      expect(body['stream']).toBe(true);
+      expect(body['stream_options']).toEqual({ include_usage: true });
+      expect(body['messages']).toEqual([
+        { role: 'system', content: 'You are a careful assistant.' },
+        { role: 'user', content: 'Summarise the workspace.' },
+      ]);
+      // No tools were allowed, so no `tools` field at all rather than `[]` —
+      // an empty array can still make some models "think" about tool use.
+      expect(body['tools']).toBeUndefined();
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Usage — must be reported once, not once per chunk that carries it
+// ---------------------------------------------------------------------------
+
+describe('usage reporting', () => {
+  it('yields exactly one usage event with the true totals when a stream repeats the same cumulative usage across two chunks', async () => {
+    // The defect this reproduces: some deployments attach the same running
+    // total to more than one chunk in a stream (here, the finish-reason
+    // chunk and the trailing empty-choices chunk that follows it). A naive
+    // per-chunk yield handed both copies downstream, and both the dispatcher
+    // and the web replay fold usage events with `+=`, turning a true 100/50
+    // into a reported 200/100.
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'hi' }, finish_reason: null }] }),
+          chunkLine({
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          }),
+          chunkLine({
+            choices: [],
+            usage: { prompt_tokens: 100, completion_tokens: 50, total_tokens: 150 },
+          }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProvider(server);
+      const events = await collect(provider.run(makeRequest()));
+
+      const usage = events.filter((e) => e.t === 'usage');
+      expect(usage).toEqual([{ t: 'usage', assignmentId: 'asg-1', inputTokens: 100, outputTokens: 50 }]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool-call fragment reassembly — the test that matters most
+// ---------------------------------------------------------------------------
+
+describe('streamed tool-call reassembly', () => {
+  it('reassembles id, name and arguments fragments split across many deltas — including a split falling mid-JSON-string — into one correct call', async () => {
+    // arguments, assembled in order, must equal exactly:
+    //   {"path":"notes/plan.md"}
+    // Piece boundaries are chosen to fall inside a string literal's
+    // characters ("note|s/pl|an.md"), which is exactly the case a naive
+    // per-fragment JSON.parse would corrupt.
+    const round1: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: { role: 'assistant', tool_calls: [{ index: 0, id: 'call_abc', type: 'function', function: { name: 'Re' } }] },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({
+          choices: [
+            { index: 0, delta: { tool_calls: [{ index: 0, function: { name: 'ad', arguments: '{"pa' } }] }, finish_reason: null },
+          ],
+        }),
+        chunkLine({
+          choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 'th":"note' } }] }, finish_reason: null }],
+        }),
+        chunkLine({
+          choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 's/pl' } }] }, finish_reason: null }],
+        }),
+        chunkLine({
+          choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: 'an.md"}' } }] }, finish_reason: null }],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        DONE_LINE,
+      ],
+    };
+    const round2: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({ choices: [{ index: 0, delta: { content: 'Done reading.' }, finish_reason: null }] }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }),
+        DONE_LINE,
+      ],
+    };
+
+    await withServer([round1, round2], async (server) => {
+      const tools = stubTools({ catalog: ['Read'] });
+      const provider = makeProvider(server, { tools });
+      const events = await collect(provider.run(makeRequest({ allowedTools: ['Read'] })));
+
+      expect(tools.calls).toEqual([{ name: 'Read', input: { path: 'notes/plan.md' } }]);
+
+      const toolEvents = events.filter((e) => e.t === 'tool');
+      expect(toolEvents).toHaveLength(1);
+      expect((toolEvents[0] as Extract<AgentEvent, { t: 'tool' }>).name).toBe('Read');
+
+      expect(events.some((e) => e.t === 'error')).toBe(false);
+
+      // Round 2's request must echo the assistant's tool-call turn and the
+      // tool's result before the next user-visible turn.
+      expect(server.requests).toHaveLength(2);
+      const round2Body = server.requests[1]!.bodyJson as { messages: unknown[] };
+      expect(round2Body.messages[2]).toEqual({
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'call_abc', type: 'function', function: { name: 'Read', arguments: '{"path":"notes/plan.md"}' } },
+        ],
+      });
+      expect(round2Body.messages[3]).toEqual({
+        role: 'tool',
+        tool_call_id: 'call_abc',
+        content: 'Read executed',
+      });
+    });
+  });
+
+  it('reassembles two tool calls interleaved by index in the same round, and executes both', async () => {
+    const round1: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, id: 'call_0', type: 'function', function: { name: 'Read' } },
+                  { index: 1, id: 'call_1', type: 'function', function: { name: 'Gre' } },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 1, function: { name: 'p' } },
+                  { index: 0, function: { arguments: '{"pa' } },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, function: { arguments: 'th":"a.txt"}' } },
+                  { index: 1, function: { arguments: '{"pattern":"foo"}' } },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        DONE_LINE,
+      ],
+    };
+    const round2: FakeStep = {
+      kind: 'stream',
+      parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'Both done.' }, finish_reason: null }] }), DONE_LINE],
+    };
+
+    await withServer([round1, round2], async (server) => {
+      const tools = stubTools({ catalog: ['Read', 'Grep'] });
+      const provider = makeProvider(server, { tools });
+      const events = await collect(provider.run(makeRequest({ allowedTools: ['Read', 'Grep'] })));
+
+      expect(tools.calls).toEqual([
+        { name: 'Read', input: { path: 'a.txt' } },
+        { name: 'Grep', input: { pattern: 'foo' } },
+      ]);
+      expect(events.filter((e) => e.t === 'tool')).toHaveLength(2);
+      expect(events.some((e) => e.t === 'error')).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reporting a run-wide model override (defect 6 coverage — resolveAgentModel
+// itself is covered exhaustively in apiConfig.test.ts; this proves the
+// adapter actually surfaces what that function returns).
+// ---------------------------------------------------------------------------
+
+describe('reporting a run-wide model override', () => {
+  it('yields exactly one non-fatal error event when a run-wide model overrides the agent catalog model, and still completes the run normally', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = new OpenAiCompatibleProvider('openai', {
+        model: 'gpt-4o-mini',
+        deps: {
+          env: { OPENAI_API_KEY: 'test-openai-key', OPENAI_BASE_URL: server.url },
+          tools: () => stubTools({ catalog: [] }),
+        },
+      });
+      const events = await collect(provider.run(makeRequest({ model: 'sonnet' })));
+
+      const warnings = events.filter((e) => e.t === 'error' && !e.fatal);
+      expect(warnings).toHaveLength(1);
+      const message = warnings[0]?.t === 'error' ? warnings[0].message : '';
+      expect(message).toContain('sonnet');
+      expect(message).toContain('gpt-4o-mini');
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'ok')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+
+      const body = server.requests[0]!.bodyJson as { model: string };
+      expect(body.model).toBe('gpt-4o-mini');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tool allowlisting
+// ---------------------------------------------------------------------------
+
+describe('tool allowlisting', () => {
+  it('never offers Write to a model whose allowedTools is only Read', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const tools = stubTools({ catalog: ['Read', 'Write'] });
+      const provider = makeProvider(server, { tools });
+      await collect(provider.run(makeRequest({ allowedTools: ['Read'] })));
+
+      const body = server.requests[0]!.bodyJson as { tools: Array<{ function: { name: string } }> };
+      expect(body.tools).toHaveLength(1);
+      expect(body.tools[0]!.function.name).toBe('Read');
+      expect(JSON.stringify(body.tools)).not.toContain('Write');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Malformed frames
+// ---------------------------------------------------------------------------
+
+describe('a malformed SSE frame', () => {
+  it('is skipped as a non-fatal diagnostic, and surrounding frames still stream correctly', async () => {
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'before ' }, finish_reason: null }] }),
+          // Deliberately broken JSON — an unterminated object.
+          'data: {"choices": [{"index": 0, "delta": {"content": "oops"\n\n',
+          chunkLine({ choices: [{ index: 0, delta: { content: 'after' }, finish_reason: null }] }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const onDiagnostic = vi.fn();
+      const provider = makeProvider(server, { onDiagnostic });
+      const events = await collect(provider.run(makeRequest()));
+
+      const text = events
+        .filter((e) => e.t === 'text')
+        .map((e) => (e as Extract<AgentEvent, { t: 'text' }>).chunk)
+        .join('');
+      expect(text).toBe('before after');
+      expect(events.some((e) => e.t === 'error')).toBe(false);
+      expect(onDiagnostic).toHaveBeenCalledTimes(1);
+      expect(onDiagnostic.mock.calls[0]![0]).toContain('unparseable');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Chunk boundary mid `data:` line
+// ---------------------------------------------------------------------------
+
+describe('a transport chunk boundary landing mid data: line', () => {
+  it('does not drop or corrupt the frame', async () => {
+    const whole = chunkLine({ choices: [{ index: 0, delta: { content: 'split me' }, finish_reason: null }] }) + DONE_LINE;
+    // Cut in the middle of the word "data:" itself, well before any line
+    // boundary — the most awkward split available.
+    const cut = whole.indexOf('content') + 3;
+    const parts = [whole.slice(0, cut), whole.slice(cut)];
+
+    await withServer([{ kind: 'stream', parts }], async (server) => {
+      const provider = makeProvider(server);
+      const events = await collect(provider.run(makeRequest()));
+
+      const text = events
+        .filter((e) => e.t === 'text')
+        .map((e) => (e as Extract<AgentEvent, { t: 'text' }>).chunk)
+        .join('');
+      expect(text).toBe('split me');
+      expect(events.some((e) => e.t === 'error')).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// HTTP errors
+// ---------------------------------------------------------------------------
+
+describe('non-2xx responses', () => {
+  it('a 401 produces a fatal error naming OPENAI_API_KEY and never contains the key', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'json', status: 401, body: { error: { message: 'Incorrect API key provided.' } } },
+    ];
+    const secretKey = 'sk-THE-SECRET-VALUE-DO-NOT-LEAK';
+
+    await withServer(steps, async (server) => {
+      const provider = new OpenAiCompatibleProvider('openai', {
+        deps: {
+          env: { OPENAI_API_KEY: secretKey, OPENAI_BASE_URL: server.url },
+          tools: () => stubTools({ catalog: [] }),
+        },
+      });
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events).toHaveLength(1);
+      const [event] = events;
+      expect(event).toMatchObject({ t: 'error', fatal: true });
+      const message = (event as Extract<AgentEvent, { t: 'error' }>).message;
+      expect(message).toContain('OPENAI_API_KEY');
+      expect(message).toContain('Incorrect API key provided.');
+      expect(message).not.toContain(secretKey);
+    });
+  });
+
+  it('a 429 produces a fatal error with rate-limit wording', async () => {
+    const steps: FakeStep[] = [{ kind: 'json', status: 429, body: { error: { message: 'Rate limit reached.' } } }];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProvider(server);
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events).toHaveLength(1);
+      const message = (events[0] as Extract<AgentEvent, { t: 'error' }>).message;
+      expect(message).toContain('429');
+      expect(message.toLowerCase()).toContain('rate');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cancellation
+// ---------------------------------------------------------------------------
+
+describe('cancellation (FR-M9)', () => {
+  it('aborting mid-stream terminates the run without emitting a spurious error event', async () => {
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'partial' }, finish_reason: null }] })],
+        hangAfter: true,
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProvider(server);
+      const controller = new AbortController();
+      const events: AgentEvent[] = [];
+
+      const iterator = provider.run(makeRequest({ signal: controller.signal }))[Symbol.asyncIterator]();
+
+      const first = await iterator.next();
+      expect(first.done).toBe(false);
+      events.push(first.value as AgentEvent);
+
+      controller.abort();
+
+      const second = await iterator.next();
+      expect(second.done).toBe(true);
+
+      expect(events).toEqual([{ t: 'text', assignmentId: 'asg-1', chunk: 'partial' }]);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The tool-loop bound
+// ---------------------------------------------------------------------------
+
+describe('the tool-call loop bound', () => {
+  it('stops with a fatal error after the configured number of rounds rather than looping forever', async () => {
+    const bound = 3;
+    const loopingRound = (): FakeStep => ({
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: { tool_calls: [{ index: 0, id: 'call_x', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        DONE_LINE,
+      ],
+    });
+    const steps = Array.from({ length: bound }, loopingRound);
+
+    await withServer(steps, async (server) => {
+      const tools = stubTools({ catalog: ['Read'] });
+      const provider = makeProvider(server, { tools, maxToolRounds: bound });
+      const events = await collect(provider.run(makeRequest({ allowedTools: ['Read'] })));
+
+      expect(server.requests).toHaveLength(bound);
+      const last = events[events.length - 1] as Extract<AgentEvent, { t: 'error' }>;
+      expect(last.t).toBe('error');
+      expect(last.fatal).toBe(true);
+      expect(last.message).toContain(String(bound));
+      expect(tools.calls).toHaveLength(bound);
+    });
+  });
+
+  it('the exported default bound is a small, sane constant, not effectively unbounded', () => {
+    expect(DEFAULT_MAX_TOOL_ROUNDS).toBeGreaterThan(0);
+    expect(DEFAULT_MAX_TOOL_ROUNDS).toBeLessThan(1000);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DeepSeek, through the same class
+// ---------------------------------------------------------------------------
+
+describe('the DeepSeek adapter is the same class, constructed differently', () => {
+  it('reports id "deepseek" and sends the request to the DeepSeek base URL', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: null }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = new OpenAiCompatibleProvider('deepseek', {
+        deps: {
+          env: { DEEPSEEK_API_KEY: 'sk-deepseek-test', DEEPSEEK_BASE_URL: server.url },
+          tools: () => stubTools({ catalog: [] }),
+        },
+      });
+
+      expect(provider.id).toBe('deepseek');
+
+      const events = await collect(provider.run(makeRequest()));
+      expect(events.some((e) => e.t === 'error')).toBe(false);
+      expect(server.requests).toHaveLength(1);
+      expect(server.requests[0]!.headers.authorization).toBe('Bearer sk-deepseek-test');
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ProviderUnavailableError
+// ---------------------------------------------------------------------------
+
+describe('run() when no key is configured', () => {
+  it('throws ProviderUnavailableError rather than making a request', async () => {
+    const provider = new OpenAiCompatibleProvider('openai', {
+      deps: { env: {}, tools: () => stubTools({ catalog: [] }) },
+    });
+
+    await expect(collect(provider.run(makeRequest()))).rejects.toThrow(ProviderUnavailableError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The cost cap (FR-M8, `maxCostUsd`) — see `pricing.ts` for the tier join and
+// `OpenAiProviderOptions.maxCostUsd` for what precision this can promise.
+//
+// No real OpenAI or DeepSeek model id is ever priced (`pricing.ts`'s
+// `priceFor` only recognises Anthropic's tier words) — that is the whole
+// point of the "unpriced + cap => unavailable" case below. To exercise the
+// cap *machinery* this adapter shares with the Anthropic one (accumulate
+// between rounds, stop on overshoot), the "cap not reached" and "cap
+// exceeded" tests configure `model` to an id that happens to contain a
+// recognised tier word. That proves the shared mechanism works identically
+// in this adapter; it claims nothing about real OpenAI/DeepSeek pricing.
+// ---------------------------------------------------------------------------
+
+describe('OpenAiCompatibleProvider — the cost cap (maxCostUsd)', () => {
+  function providerWithCap(
+    server: FakeOpenAiServer,
+    overrides: { model?: string; maxCostUsd?: number; tools?: SandboxedTools } = {},
+  ): OpenAiCompatibleProvider {
+    return new OpenAiCompatibleProvider('openai', {
+      model: overrides.model ?? 'claude-sonnet-5-compatible-proxy',
+      ...(overrides.maxCostUsd === undefined ? {} : { maxCostUsd: overrides.maxCostUsd }),
+      deps: {
+        env: { OPENAI_API_KEY: 'test-openai-key', OPENAI_BASE_URL: server.url },
+        tools: () => overrides.tools ?? stubTools({ catalog: [] }),
+      },
+    });
+  }
+
+  it('lets a run finish normally when the estimated spend stays under the cap', async () => {
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'well within budget' }, finish_reason: 'stop' }] }),
+          chunkLine({ choices: [], usage: { prompt_tokens: 1000, completion_tokens: 500 } }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = providerWithCap(server, { maxCostUsd: 10 });
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'well within budget')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+      expect(server.requests).toHaveLength(1);
+    });
+  });
+
+  it('produces exactly one fatal error naming the cap and the estimate, after the text already streamed', async () => {
+    // Priced (via the tier word in `model`) at sonnet's $3/$15 per million
+    // input/output tokens, so this round's 1M+1M tokens cost an estimated
+    // $18 — comfortably over the $1 cap.
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [
+          chunkLine({ choices: [{ index: 0, delta: { content: 'spent' }, finish_reason: 'stop' }] }),
+          chunkLine({ choices: [], usage: { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 } }),
+          DONE_LINE,
+        ],
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = providerWithCap(server, { maxCostUsd: 1 });
+      const events = await collect(provider.run(makeRequest()));
+
+      const textIndex = events.findIndex((e) => e.t === 'text' && e.chunk === 'spent');
+      expect(textIndex).toBeGreaterThanOrEqual(0);
+
+      const fatal = events.filter((e) => e.t === 'error' && e.fatal);
+      expect(fatal).toHaveLength(1);
+      // The text this round produced reached the caller before the cap
+      // check ran — FR-M8's "fails cleanly with partial results preserved".
+      expect(events.indexOf(fatal[0]!)).toBeGreaterThan(textIndex);
+
+      const message = fatal[0]?.t === 'error' ? fatal[0].message : '';
+      expect(message).toContain('$1.00');
+      expect(message).toContain('$18.00');
+    });
+  });
+
+  it('stops before starting a further tool-call round it would otherwise have made, once the cap would be exceeded', async () => {
+    const round1: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: { tool_calls: [{ index: 0, id: 'call_x', type: 'function', function: { name: 'Read', arguments: '{}' } }] },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        chunkLine({ choices: [], usage: { prompt_tokens: 1_000_000, completion_tokens: 1_000_000 } }),
+        DONE_LINE,
+      ],
+    };
+
+    // Exactly one scripted round: if the adapter ever asked for a second
+    // round after the cap tripped, the fake server's own "no scripted step"
+    // guard would fail the request loudly rather than let it pass.
+    await withServer([round1], async (server) => {
+      const tools = stubTools({ catalog: ['Read'] });
+      const provider = providerWithCap(server, { maxCostUsd: 1, tools });
+      const events = await collect(provider.run(makeRequest({ allowedTools: ['Read'] })));
+
+      const fatal = events.filter((e) => e.t === 'error' && e.fatal);
+      expect(fatal).toHaveLength(1);
+      expect(server.requests).toHaveLength(1);
+      // The cap check runs before this round's tool calls are dispatched, so
+      // this round's tool was never executed or reported.
+      expect(tools.calls).toHaveLength(0);
+    });
+  });
+
+  it('reports unavailable, naming the model, when a cost cap is requested for a model with no known price', async () => {
+    const provider = new OpenAiCompatibleProvider('openai', {
+      maxCostUsd: 5, // the default OpenAI model (gpt-4o) is never priced
+      deps: { env: { OPENAI_API_KEY: 'test-openai-key' } },
+    });
+
+    const availability = await provider.isAvailable();
+    expect(availability.ok).toBe(false);
+    expect(availability.reason).toContain('gpt-4o');
+    expect(availability.reason?.toLowerCase()).toContain('price');
+
+    await expect(collect(provider.run(makeRequest()))).rejects.toBeInstanceOf(ProviderUnavailableError);
+  });
+
+  it('runs normally against an unpriced model when no cost cap is set at all', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'fine' }, finish_reason: 'stop' }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProvider(server); // default gpt-4o, no cap
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'fine')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP tools (Stage 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * A hand-made `McpTools` stand-in — `mcpTools.ts`'s contract is
+ * `SandboxedTools` plus `close()` and `serverDiagnostics` — used the same way
+ * `stubTools` above stands in for `apiTools.ts`. These tests prove THIS
+ * ADAPTER wires the contract correctly (composition, routing, and above all
+ * the `close()` guarantee); whether a real MCP server connection behaves
+ * correctly is `mcpTools.ts`'s own test suite's job, not this file's.
+ */
+function stubMcpTools(
+  catalog: string[],
+  execute?: (name: string, input: unknown) => Promise<ToolResult>,
+): {
+  factory: (configPath: string | undefined) => Promise<{
+    schemas: (allowed: readonly string[]) => ToolSchema[];
+    execute: (name: string, input: unknown) => Promise<ToolResult>;
+    close: () => Promise<void>;
+    serverDiagnostics: ReadonlyMap<string, string>;
+  }>;
+  calls: Array<{ name: string; input: unknown }>;
+  closeCount: () => number;
+  configPathSeen: () => string | undefined;
+  allowedToolsSeen: () => readonly string[] | undefined;
+} {
+  const calls: Array<{ name: string; input: unknown }> = [];
+  let closes = 0;
+  let seenConfigPath: string | undefined;
+  let seenAllowedTools: readonly string[] | undefined;
+  const factory = async (configPath: string | undefined, options?: { allowedTools?: readonly string[] }) => {
+    seenConfigPath = configPath;
+    seenAllowedTools = options?.allowedTools;
+    return {
+      schemas(allowedTools: readonly string[]): ToolSchema[] {
+        const wanted = new Set(allowedTools);
+        return catalog
+          .filter((name) => wanted.has(name))
+          .map((name) => ({ name, description: `${name} (mcp stub).`, inputSchema: { type: 'object' } }));
+      },
+      async execute(name: string, input: unknown): Promise<ToolResult> {
+        calls.push({ name, input });
+        if (execute !== undefined) return execute(name, input);
+        return { content: `${name} executed`, isError: false };
+      },
+      async close() {
+        closes += 1;
+      },
+      serverDiagnostics: new Map<string, string>(),
+    };
+  };
+  return {
+    factory,
+    calls,
+    closeCount: () => closes,
+    configPathSeen: () => seenConfigPath,
+    allowedToolsSeen: () => seenAllowedTools,
+  };
+}
+
+/** A minimal `McpRegistry` value — structurally what `loadMcpRegistry` returns, built without importing the type. */
+function fakeMcpRegistry(configPath = 'C:/fake/mcp-config.json'): { configPath: string; serverNames: ReadonlySet<string> } {
+  return { configPath, serverNames: new Set(['docs']) };
+}
+
+/** Like `makeProvider`, but with MCP deps wired in — kept separate so the common-path helper stays simple. */
+function makeProviderWithMcp(
+  server: FakeOpenAiServer,
+  mcpDeps: {
+    loadMcpRegistry?: () => { configPath: string; serverNames: ReadonlySet<string> } | undefined;
+    createMcpTools?: (configPath: string | undefined) => Promise<{
+      schemas: (allowed: readonly string[]) => ToolSchema[];
+      execute: (name: string, input: unknown) => Promise<ToolResult>;
+      close: () => Promise<void>;
+      serverDiagnostics: ReadonlyMap<string, string>;
+    }>;
+  },
+  overrides: { tools?: SandboxedTools } = {},
+): OpenAiCompatibleProvider {
+  return new OpenAiCompatibleProvider('openai', {
+    deps: {
+      env: { OPENAI_API_KEY: 'test-openai-key', OPENAI_BASE_URL: server.url },
+      tools: () => overrides.tools ?? stubTools({ catalog: [] }),
+      ...(mcpDeps.loadMcpRegistry === undefined ? {} : { loadMcpRegistry: mcpDeps.loadMcpRegistry }),
+      ...(mcpDeps.createMcpTools === undefined ? {} : { createMcpTools: mcpDeps.createMcpTools }),
+    },
+  });
+}
+
+describe('OpenAiCompatibleProvider — MCP tools (Stage 4)', () => {
+  it('advertises MCP schemas alongside sandboxed ones and routes each call to the layer that declares it', async () => {
+    const sandboxTools = stubTools({ catalog: ['Read'] });
+    const { factory: mcpFactory, calls: mcpCalls, closeCount } = stubMcpTools(['mcp__docs__search'], () =>
+      Promise.resolve({ content: 'search results', isError: false }),
+    );
+
+    const round1: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: { tool_calls: [{ index: 0, id: 'call_0', type: 'function', function: { name: 'Read', arguments: '{"path":"a.txt"}' } }] },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        DONE_LINE,
+      ],
+    };
+    const round2: FakeStep = {
+      kind: 'stream',
+      parts: [
+        chunkLine({
+          choices: [
+            {
+              index: 0,
+              delta: {
+                tool_calls: [
+                  { index: 0, id: 'call_1', type: 'function', function: { name: 'mcp__docs__search', arguments: '{"q":"tax"}' } },
+                ],
+              },
+              finish_reason: null,
+            },
+          ],
+        }),
+        chunkLine({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }),
+        DONE_LINE,
+      ],
+    };
+    const round3: FakeStep = {
+      kind: 'stream',
+      parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'Done.' }, finish_reason: 'stop' }] }), DONE_LINE],
+    };
+
+    await withServer([round1, round2, round3], async (server) => {
+      const provider = makeProviderWithMcp(
+        server,
+        { loadMcpRegistry: () => fakeMcpRegistry(), createMcpTools: mcpFactory },
+        { tools: sandboxTools },
+      );
+      const events = await collect(provider.run(makeRequest({ allowedTools: ['Read', 'mcp__docs__search'] })));
+
+      // Both names were offered on the very first request — the schema list
+      // is the union of both layers, not just the sandboxed one.
+      const firstBody = server.requests[0]!.bodyJson as { tools?: Array<{ function: { name: string } }> };
+      const toolNames = (firstBody.tools ?? []).map((t) => t.function.name);
+      expect(toolNames).toEqual(['Read', 'mcp__docs__search']);
+
+      // Each call reached exactly the layer that declared it.
+      expect(sandboxTools.calls).toEqual([{ name: 'Read', input: { path: 'a.txt' } }]);
+      expect(mcpCalls).toEqual([{ name: 'mcp__docs__search', input: { q: 'tax' } }]);
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'Done.')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+
+      // FR-M9: success is an exit path too, not only the failure/abort ones
+      // covered below — the handle must still be closed exactly once.
+      expect(closeCount()).toBe(1);
+    });
+  });
+
+  it('passes the registry\'s configPath straight through to createMcpTools', async () => {
+    const { factory: mcpFactory, configPathSeen } = stubMcpTools([]);
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProviderWithMcp(server, {
+        loadMcpRegistry: () => fakeMcpRegistry('Z:/operator/mcp.json'),
+        createMcpTools: mcpFactory,
+      });
+      await collect(provider.run(makeRequest()));
+      expect(configPathSeen()).toBe('Z:/operator/mcp.json');
+    });
+  });
+
+  it('hands the assignment\'s allowedTools to the MCP handle, not only to schemas() (FR-M5)', async () => {
+    // See `anthropic/provider.test.ts`'s identical test and `mcpTools.ts`'s "allowedTools boundary"
+    // section: an allowlist used only to pick which schemas get advertised shapes what the model is
+    // told about and constrains nothing. The handle has to hold it to refuse a call for a name that
+    // was never offered — which the `claude-code` adapter gets from `--allowedTools`.
+    const { factory: mcpFactory, allowedToolsSeen } = stubMcpTools([]);
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'ok' }, finish_reason: 'stop' }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProviderWithMcp(server, {
+        loadMcpRegistry: () => fakeMcpRegistry(),
+        createMcpTools: mcpFactory,
+      });
+      await collect(provider.run(makeRequest({ allowedTools: ['Read', 'mcp__docs__search'] })));
+      expect(allowedToolsSeen()).toEqual(['Read', 'mcp__docs__search']);
+    });
+  });
+
+  it('closes the MCP handle even when the run ends in a fatal HTTP error', async () => {
+    const { factory: mcpFactory, closeCount } = stubMcpTools([]);
+    const steps: FakeStep[] = [{ kind: 'json', status: 500, body: { error: { message: 'internal error' } } }];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProviderWithMcp(server, { loadMcpRegistry: () => fakeMcpRegistry(), createMcpTools: mcpFactory });
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(true);
+      // The defect this proves does not happen: an early `return` from deep
+      // inside the tool-call loop (here, the HTTP-error branch) skipping a
+      // cleanup that only lived at the bottom of a successful run.
+      expect(closeCount()).toBe(1);
+    });
+  });
+
+  it('closes the MCP handle on abort (FR-M9)', async () => {
+    const { factory: mcpFactory, closeCount } = stubMcpTools([]);
+    const steps: FakeStep[] = [
+      {
+        kind: 'stream',
+        parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'partial' }, finish_reason: null }] })],
+        hangAfter: true,
+      },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProviderWithMcp(server, { loadMcpRegistry: () => fakeMcpRegistry(), createMcpTools: mcpFactory });
+      const controller = new AbortController();
+      const iterator = provider.run(makeRequest({ signal: controller.signal }))[Symbol.asyncIterator]();
+
+      const first = await iterator.next();
+      expect(first.done).toBe(false);
+
+      controller.abort();
+      const second = await iterator.next();
+      expect(second.done).toBe(true);
+
+      expect(closeCount()).toBe(1);
+    });
+  });
+
+  it('with no registry configured, never touches MCP at all and behaves exactly as before Stage 4', async () => {
+    // The regression this guards: composing in an (empty) MCP layer whenever
+    // this code path runs, "for uniformity", even with MCP disabled — which
+    // would change execute()'s unknown-tool wording (composeTools.ts's own,
+    // not this adapter's usual "not available to this agent" wording) on the
+    // single most common configuration this adapter runs under today.
+    let mcpFactoryCalls = 0;
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'fine' }, finish_reason: 'stop' }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = new OpenAiCompatibleProvider('openai', {
+        deps: {
+          // No `AGENT_OFFICE_MCP_CONFIG` here — the real `loadMcpRegistry`
+          // (not stubbed) must see that and return `undefined`, exactly as
+          // it does for every other test in this file.
+          env: { OPENAI_API_KEY: 'test-openai-key', OPENAI_BASE_URL: server.url },
+          tools: () => stubTools({ catalog: [] }),
+          createMcpTools: async (configPath: string | undefined) => {
+            mcpFactoryCalls += 1;
+            return stubMcpTools([]).factory(configPath);
+          },
+        },
+      });
+      const events = await collect(provider.run(makeRequest()));
+
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'fine')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+      // The strongest form of "unchanged": the MCP factory was never even
+      // invoked, so there is no MCP layer of any kind (empty or otherwise)
+      // in the composed tools for this run.
+      expect(mcpFactoryCalls).toBe(0);
+    });
+  });
+
+  it('degrades to sandbox-only tools with a non-fatal event when MCP tools fail to start (NFR-8)', async () => {
+    const steps: FakeStep[] = [
+      { kind: 'stream', parts: [chunkLine({ choices: [{ index: 0, delta: { content: 'still works' }, finish_reason: 'stop' }] }), DONE_LINE] },
+    ];
+
+    await withServer(steps, async (server) => {
+      const provider = makeProviderWithMcp(server, {
+        loadMcpRegistry: () => fakeMcpRegistry(),
+        createMcpTools: () => Promise.reject(new Error('mcp server executable not found')),
+      });
+      const events = await collect(provider.run(makeRequest()));
+
+      const warnings = events.filter((e) => e.t === 'error' && !e.fatal);
+      expect(warnings.some((w) => w.t === 'error' && w.message.includes('mcp server executable not found'))).toBe(
+        true,
+      );
+      // NFR-8: a roster problem degrades this run, it does not fail it — the
+      // assignment never actually depended on MCP being reachable.
+      expect(events.some((e) => e.t === 'text' && e.chunk === 'still works')).toBe(true);
+      expect(events.some((e) => e.t === 'error' && e.fatal)).toBe(false);
+    });
+  });
+});
