@@ -25,7 +25,7 @@
   "dependencies": {
     "@agent-office/shared": "*",
     "@fastify/websocket": "^11.0.1",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/sdk": "^1.32.1",
     "fastify": "^5.1.0",
     "marked": "^18.0.9",
     "yaml": "^2.5.0",
